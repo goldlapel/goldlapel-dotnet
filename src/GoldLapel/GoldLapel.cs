@@ -305,12 +305,14 @@ namespace GoldLapel
             string rid;
             if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
             {
-                rid = RuntimeInformation.OSArchitecture == Architecture.Arm64
-                    ? "linux-arm64" : "linux-x64";
+                var arch = RuntimeInformation.OSArchitecture == Architecture.Arm64 ? "arm64" : "x64";
+                var musl = File.Exists("/lib/ld-musl-" + (arch == "arm64" ? "aarch64" : "x86_64") + ".so.1");
+                rid = musl ? "linux-musl-" + arch : "linux-" + arch;
             }
             else if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
             {
-                rid = "osx-arm64";
+                rid = RuntimeInformation.OSArchitecture == Architecture.Arm64
+                    ? "osx-arm64" : "osx-x64";
             }
             else if (isWindows)
             {
