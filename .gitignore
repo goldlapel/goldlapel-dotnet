@@ -1,0 +1,13 @@
+bin/
+obj/
+*.nupkg
+*.snupkg
+.vs/
+*.user
+*.suo
+*.userprefs
+.idea/
+*.DotSettings.user
+
+# Runtime binaries (CI-only)
+src/GoldLapel/runtimes/
