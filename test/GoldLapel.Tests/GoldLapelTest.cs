@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
@@ -253,6 +254,132 @@ namespace GoldLapel.Tests
         {
             GL.Stop();
             Assert.Null(GL.ProxyUrl);
+        }
+    }
+
+    // ── ConfigToArgs ─────────────────────────────────────────
+
+    public class ConfigToArgsTest
+    {
+        [Fact]
+        public void ConfigToArgs_StringValue()
+        {
+            var config = new Dictionary<string, object> { { "mode", "butler" } };
+            var args = GL.ConfigToArgs(config);
+            Assert.Equal(new List<string> { "--mode", "butler" }, args);
+        }
+
+        [Fact]
+        public void ConfigToArgs_NumericValue()
+        {
+            var config = new Dictionary<string, object> { { "poolSize", 20 } };
+            var args = GL.ConfigToArgs(config);
+            Assert.Equal(new List<string> { "--pool-size", "20" }, args);
+        }
+
+        [Fact]
+        public void ConfigToArgs_BooleanTrue()
+        {
+            var config = new Dictionary<string, object> { { "disablePool", true } };
+            var args = GL.ConfigToArgs(config);
+            Assert.Equal(new List<string> { "--disable-pool" }, args);
+        }
+
+        [Fact]
+        public void ConfigToArgs_BooleanFalse()
+        {
+            var config = new Dictionary<string, object> { { "disablePool", false } };
+            var args = GL.ConfigToArgs(config);
+            Assert.Empty(args);
+        }
+
+        [Fact]
+        public void ConfigToArgs_ListValue()
+        {
+            var config = new Dictionary<string, object>
+            {
+                { "replica", new List<string> { "host1:5432", "host2:5432" } }
+            };
+            var args = GL.ConfigToArgs(config);
+            Assert.Equal(new List<string> { "--replica", "host1:5432", "--replica", "host2:5432" }, args);
+        }
+
+        [Fact]
+        public void ConfigToArgs_ExcludeTablesList()
+        {
+            var config = new Dictionary<string, object>
+            {
+                { "excludeTables", new[] { "logs", "sessions" } }
+            };
+            var args = GL.ConfigToArgs(config);
+            Assert.Equal(
+                new List<string> { "--exclude-tables", "logs", "--exclude-tables", "sessions" },
+                args
+            );
+        }
+
+        [Fact]
+        public void ConfigToArgs_UnknownKeyThrows()
+        {
+            var config = new Dictionary<string, object> { { "notARealKey", "val" } };
+            var ex = Assert.Throws<ArgumentException>(() => GL.ConfigToArgs(config));
+            Assert.Contains("Unknown config key: notARealKey", ex.Message);
+        }
+
+        [Fact]
+        public void ConfigToArgs_MultipleKeys()
+        {
+            var config = new Dictionary<string, object>
+            {
+                { "mode", "butler" },
+                { "poolSize", 10 },
+                { "disableRewrite", true }
+            };
+            var args = GL.ConfigToArgs(config);
+            Assert.Contains("--mode", args);
+            Assert.Contains("butler", args);
+            Assert.Contains("--pool-size", args);
+            Assert.Contains("10", args);
+            Assert.Contains("--disable-rewrite", args);
+            Assert.Equal(5, args.Count);
+        }
+
+        [Fact]
+        public void ConfigToArgs_EmptyConfig()
+        {
+            var config = new Dictionary<string, object>();
+            var args = GL.ConfigToArgs(config);
+            Assert.Empty(args);
+        }
+
+        [Fact]
+        public void ConfigToArgs_NullConfig()
+        {
+            var args = GL.ConfigToArgs(null);
+            Assert.Empty(args);
+        }
+
+        [Fact]
+        public void ConfigToArgs_BooleanNonBoolThrows()
+        {
+            var config = new Dictionary<string, object> { { "disablePool", "yes" } };
+            var ex = Assert.Throws<ArgumentException>(() => GL.ConfigToArgs(config));
+            Assert.Contains("must be a boolean", ex.Message);
+        }
+
+        [Fact]
+        public void ConfigToArgs_OptionsIntegration()
+        {
+            var options = new GoldLapelOptions
+            {
+                Config = new Dictionary<string, object>
+                {
+                    { "mode", "butler" },
+                    { "disablePool", true }
+                }
+            };
+            var gl = new GL("postgresql://localhost:5432/mydb", options);
+            Assert.Equal(7932, gl.Port);
         }
     }
 }

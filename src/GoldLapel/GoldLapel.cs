@@ -1,9 +1,11 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 
@@ -13,6 +15,7 @@ namespace GoldLapel
     {
         public int? Port { get; set; }
         public string[] ExtraArgs { get; set; }
+        public Dictionary<string, object> Config { get; set; }
     }
 
     public class GoldLapel : IDisposable
@@ -21,9 +24,42 @@ namespace GoldLapel
         internal const long StartupTimeoutMs = 10000;
         internal const long StartupPollIntervalMs = 50;
 
+        private static readonly HashSet<string> ValidConfigKeys = new HashSet<string>(new[]
+        {
+            "mode", "minPatternCount", "refreshIntervalSecs", "patternTtlSecs",
+            "maxTablesPerView", "maxColumnsPerView", "deepPaginationThreshold",
+            "reportIntervalSecs", "resultCacheSize", "batchCacheSize",
+            "batchCacheTtlSecs", "redisUrl", "poolSize", "poolTimeoutSecs",
+            "poolMode", "mgmtIdleTimeout", "fallback", "readAfterWriteSecs",
+            "n1Threshold", "n1WindowMs", "n1CrossThreshold",
+            "tlsCert", "tlsKey", "tlsClientCa", "config", "dashboardPort",
+            "disableMatviews", "disableConsolidation", "disableBtreeIndexes",
+            "disableTrigramIndexes", "disableExpressionIndexes",
+            "disablePartialIndexes", "disableRewrite", "disablePreparedCache",
+            "disableResultCache", "disableRedisCache", "disablePool",
+            "disableN1", "disableN1CrossConnection", "disableShadowMode",
+            "enableCoalescing", "replica", "excludeTables"
+        });
+
+        private static readonly HashSet<string> BooleanKeys = new HashSet<string>(new[]
+        {
+            "disableMatviews", "disableConsolidation", "disableBtreeIndexes",
+            "disableTrigramIndexes", "disableExpressionIndexes",
+            "disablePartialIndexes", "disableRewrite", "disablePreparedCache",
+            "disableResultCache", "disableRedisCache", "disablePool",
+            "disableN1", "disableN1CrossConnection", "disableShadowMode",
+            "enableCoalescing"
+        });
+
+        private static readonly HashSet<string> ListKeys = new HashSet<string>(new[]
+        {
+            "replica", "excludeTables"
+        });
+
         private readonly string _upstream;
         private readonly int _port;
         private readonly string[] _extraArgs;
+        private readonly Dictionary<string, object> _config;
         private Process _process;
         private string _proxyUrl;
         private bool _disposed;
@@ -35,6 +71,7 @@ namespace GoldLapel
             _upstream = upstream;
             _port = options?.Port ?? DefaultPort;
             _extraArgs = options?.ExtraArgs ?? Array.Empty<string>();
+            _config = options?.Config;
         }
 
         public string StartProxy()
@@ -44,6 +81,7 @@ namespace GoldLapel
 
             var binary = FindBinary();
             var args = new List<string> { "--upstream", _upstream, "--port", _port.ToString() };
+            args.AddRange(ConfigToArgs(_config));
             args.AddRange(_extraArgs);
 
             var psi = new ProcessStartInfo
@@ -221,6 +259,71 @@ namespace GoldLapel
         }
 
         // ── Internal methods ──────────────────────────────────
+
+        internal static List<string> ConfigToArgs(Dictionary<string, object> config)
+        {
+            var result = new List<string>();
+            if (config == null || config.Count == 0)
+                return result;
+
+            foreach (var kvp in config)
+            {
+                var key = kvp.Key;
+                var value = kvp.Value;
+
+                if (!ValidConfigKeys.Contains(key))
+                    throw new ArgumentException("Unknown config key: " + key);
+
+                var flag = "--" + CamelToKebab(key);
+
+                if (BooleanKeys.Contains(key))
+                {
+                    if (!(value is bool))
+                        throw new ArgumentException(
+                            "Config key '" + key + "' must be a boolean, got " + value.GetType().Name);
+                    if ((bool)value)
+                        result.Add(flag);
+                    continue;
+                }
+
+                if (ListKeys.Contains(key))
+                {
+                    var enumerable = value as IEnumerable;
+                    if (enumerable == null || value is string)
+                        throw new ArgumentException(
+                            "Config key '" + key + "' must be a list/array, got " + value.GetType().Name);
+                    foreach (var item in enumerable)
+                    {
+                        result.Add(flag);
+                        result.Add(item.ToString());
+                    }
+                    continue;
+                }
+
+                result.Add(flag);
+                result.Add(value.ToString());
+            }
+
+            return result;
+        }
+
+        private static string CamelToKebab(string key)
+        {
+            var sb = new StringBuilder();
+            foreach (var c in key)
+            {
+                if (char.IsUpper(c))
+                {
+                    sb.Append('-');
+                    sb.Append(char.ToLower(c));
+                }
+                else
+                {
+                    sb.Append(c);
+                }
+            }
+            return sb.ToString();
+        }
 
         private static readonly Regex WithPort =
             new Regex(@"^(postgres(?:ql)?://(?:.*@)?)([^:/?#]+):(\d+)(.*)$");
