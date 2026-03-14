@@ -59,12 +59,44 @@ var url = proxy.StartProxy();
 // proxy.StopProxy() called automatically via Dispose
 ```
 
+### `GoldLapel.ConfigKeys()`
+
+Returns all valid config key names as an `IReadOnlyCollection<string>`.
+
 ## Configuration
 
-The proxy binary accepts all standard Gold Lapel flags. Pass them via `ExtraArgs`:
+Pass a config dictionary via options:
 
 ```csharp
-var url = GoldLapel.Start(
+using GoldLapel;
+
+var url = GoldLapel.GoldLapel.Start("postgresql://user:pass@localhost/mydb",
+    new GoldLapelOptions
+    {
+        Config = new Dictionary<string, object>
+        {
+            ["mode"] = "butler",
+            ["poolSize"] = 50,
+            ["disableMatviews"] = true,
+            ["replica"] = new List<string> { "postgresql://user:pass@replica1/mydb" },
+        }
+    });
+```
+
+Keys use `camelCase` and map to CLI flags (`poolSize` → `--pool-size`). Boolean keys are flags — `true` enables them. List keys produce repeated flags.
+
+Unknown keys throw `ArgumentException`. To see all valid keys:
+
+```csharp
+GoldLapel.GoldLapel.ConfigKeys()
+```
+
+For the full configuration reference, see the [main documentation](https://github.com/goldlapel/goldlapel#setting-reference).
+
+You can also pass raw CLI flags via `ExtraArgs`:
+
+```csharp
+var url = GoldLapel.GoldLapel.Start(
     "postgresql://user:pass@localhost:5432/mydb",
     new GoldLapelOptions
     {

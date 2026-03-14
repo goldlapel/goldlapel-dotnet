@@ -258,6 +258,11 @@ namespace GoldLapel
             }
         }
 
+        public static IReadOnlyCollection<string> ConfigKeys()
+        {
+            return ValidConfigKeys;
+        }
+
         // ── Internal methods ──────────────────────────────────
 
         internal static List<string> ConfigToArgs(Dictionary<string, object> config)

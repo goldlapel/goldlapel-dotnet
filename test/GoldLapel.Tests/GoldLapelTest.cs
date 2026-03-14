@@ -257,6 +257,43 @@ namespace GoldLapel.Tests
         }
     }
 
+    // ── ConfigKeys ────────────────────────────────────────────
+
+    public class ConfigKeysTest
+    {
+        [Fact]
+        public void ReturnsNonEmptyCollection()
+        {
+            var keys = GL.ConfigKeys();
+            Assert.NotNull(keys);
+            Assert.NotEmpty(keys);
+        }
+
+        [Fact]
+        public void ContainsKnownKeys()
+        {
+            var keys = GL.ConfigKeys();
+            Assert.Contains("mode", keys);
+            Assert.Contains("poolSize", keys);
+            Assert.Contains("disableMatviews", keys);
+            Assert.Contains("replica", keys);
+        }
+
+        [Fact]
+        public void DoesNotContainUnknownKeys()
+        {
+            var keys = GL.ConfigKeys();
+            Assert.DoesNotContain("notARealKey", keys);
+        }
+
+        [Fact]
+        public void HasExpectedCount()
+        {
+            var keys = GL.ConfigKeys();
+            Assert.Equal(43, keys.Count);
+        }
+    }
+
     // ── ConfigToArgs ─────────────────────────────────────────
 
     public class ConfigToArgsTest
