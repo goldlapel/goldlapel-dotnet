@@ -21,6 +21,7 @@ namespace GoldLapel
     public class GoldLapel : IDisposable
     {
         internal const int DefaultPort = 7932;
+        internal const int DefaultDashboardPort = 7933;
         internal const long StartupTimeoutMs = 10000;
         internal const long StartupPollIntervalMs = 50;
 
@@ -58,6 +59,7 @@ namespace GoldLapel
 
         private readonly string _upstream;
         private readonly int _port;
+        private readonly int _dashboardPort;
         private readonly string[] _extraArgs;
         private readonly Dictionary<string, object> _config;
         private Process _process;
@@ -70,6 +72,9 @@ namespace GoldLapel
         {
             _upstream = upstream;
             _port = options?.Port ?? DefaultPort;
+            _dashboardPort = options?.Config != null && options.Config.ContainsKey("dashboardPort")
+                ? Convert.ToInt32(options.Config["dashboardPort"])
+                : DefaultDashboardPort;
             _extraArgs = options?.ExtraArgs ?? Array.Empty<string>();
             _config = options?.Config;
         }
@@ -159,6 +164,12 @@ namespace GoldLapel
             }
 
             _proxyUrl = MakeProxyUrl(_upstream, _port);
+
+            if (_dashboardPort > 0)
+                Console.WriteLine($"goldlapel \u2192 :{_port} (proxy) | http://127.0.0.1:{_dashboardPort} (dashboard)");
+            else
+                Console.WriteLine($"goldlapel \u2192 :{_port} (proxy)");
+
             return _proxyUrl;
         }
 
@@ -179,6 +190,16 @@ namespace GoldLapel
         public int Port => _port;
 
         public bool IsRunning => _process != null && !_process.HasExited;
+
+        public string DashboardUrl
+        {
+            get
+            {
+                if (_dashboardPort > 0 && _process != null && !_process.HasExited)
+                    return $"http://127.0.0.1:{_dashboardPort}";
+                return null;
+            }
+        }
 
         public void Dispose()
         {
@@ -254,6 +275,17 @@ namespace GoldLapel
                 lock (_lock)
                 {
                     return _instance?.Url;
+                }
+            }
+        }
+
+        public static string DashboardProxyUrl
+        {
+            get
+            {
+                lock (_lock)
+                {
+                    return _instance?.DashboardUrl;
                 }
             }
         }

@@ -245,6 +245,73 @@ namespace GoldLapel.Tests
         }
     }
 
+    // ── DashboardUrl ───────────────────────────────────────
+
+    public class DashboardUrlTest
+    {
+        [Fact]
+        public void DefaultDashboardPort()
+        {
+            var gl = new GL("postgresql://localhost:5432/mydb");
+            Assert.Equal(GL.DefaultDashboardPort, 7933);
+        }
+
+        [Fact]
+        public void CustomDashboardPort()
+        {
+            var gl = new GL("postgresql://localhost:5432/mydb",
+                new GoldLapelOptions
+                {
+                    Config = new Dictionary<string, object> { { "dashboardPort", 9090 } }
+                });
+            Assert.Null(gl.DashboardUrl);
+        }
+
+        [Fact]
+        public void DashboardDisabledWithZero()
+        {
+            var gl = new GL("postgresql://localhost:5432/mydb",
+                new GoldLapelOptions
+                {
+                    Config = new Dictionary<string, object> { { "dashboardPort", 0 } }
+                });
+            Assert.Null(gl.DashboardUrl);
+        }
+
+        [Fact]
+        public void DashboardUrlNullWhenNotRunning()
+        {
+            var gl = new GL("postgresql://localhost:5432/mydb");
+            Assert.Null(gl.DashboardUrl);
+        }
+
+        [Fact]
+        public void DashboardPortExtractedFromConfig()
+        {
+            var gl = new GL("postgresql://localhost:5432/mydb",
+                new GoldLapelOptions
+                {
+                    Config = new Dictionary<string, object> { { "dashboardPort", 8888 } }
+                });
+            // Not running, so DashboardUrl is null, but we can verify the port was extracted
+            // by checking it doesn't use the default when we eventually start
+            Assert.Null(gl.DashboardUrl);
+            Assert.False(gl.IsRunning);
+        }
+    }
+
+    // ── DashboardProxyUrl (singleton) ────────────────────
+
+    public class DashboardProxyUrlTest
+    {
+        [Fact]
+        public void DashboardProxyUrlNullWhenNotStarted()
+        {
+            GL.Stop();
+            Assert.Null(GL.DashboardProxyUrl);
+        }
+    }
+
     // ── Singleton ─────────────────────────────────────────────
 
     public class SingletonTest

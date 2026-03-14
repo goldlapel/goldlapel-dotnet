@@ -45,6 +45,10 @@ Stops the proxy. Also called automatically on process exit.
 
 Returns the current proxy URL, or `null` if not running.
 
+### `GoldLapel.DashboardProxyUrl`
+
+Returns the dashboard URL (e.g. `http://127.0.0.1:7933`), or `null` if not running. Default port is 7933. Set `dashboardPort` in config to customize, or `0` to disable.
+
 ### `new GoldLapel(upstream)` / `new GoldLapel(upstream, options)`
 
 Instance API for managing multiple proxies. Implements `IDisposable` for automatic cleanup:
