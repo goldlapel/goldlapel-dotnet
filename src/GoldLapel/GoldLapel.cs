@@ -100,6 +100,8 @@ namespace GoldLapel
                 RedirectStandardError = true,
                 CreateNoWindow = true
             };
+            if (!psi.EnvironmentVariables.ContainsKey("GOLDLAPEL_CLIENT"))
+                psi.EnvironmentVariables["GOLDLAPEL_CLIENT"] = "dotnet";
 
             try
             {
