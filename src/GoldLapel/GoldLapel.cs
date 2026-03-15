@@ -70,6 +70,7 @@ namespace GoldLapel
 
         public GoldLapel(string upstream, GoldLapelOptions options)
         {
+            if (upstream == null) throw new ArgumentNullException(nameof(upstream));
             _upstream = upstream;
             _port = options?.Port ?? DefaultPort;
             _dashboardPort = options?.Config != null && options.Config.ContainsKey("dashboardPort")
@@ -156,6 +157,8 @@ namespace GoldLapel
             {
                 try { _process.Kill(); } catch { }
                 try { _process.WaitForExit(5000); } catch { }
+                try { _process.Dispose(); } catch { }
+                _process = null;
                 try { stderrThread.Join(2000); } catch { }
                 throw new InvalidOperationException(
                     "Gold Lapel failed to start on port " + _port +
@@ -178,10 +181,14 @@ namespace GoldLapel
             var proc = _process;
             _process = null;
             _proxyUrl = null;
-            if (proc != null && !proc.HasExited)
+            if (proc != null)
             {
-                try { proc.Kill(); } catch { }
-                try { proc.WaitForExit(5000); } catch { }
+                if (!proc.HasExited)
+                {
+                    try { proc.Kill(); } catch { }
+                    try { proc.WaitForExit(5000); } catch { }
+                }
+                try { proc.Dispose(); } catch { }
             }
         }
 
@@ -236,6 +243,7 @@ namespace GoldLapel
                     }
                     return _instance.Url;
                 }
+                _instance?.Dispose();
                 _instance = new GoldLapel(upstream, options);
                 if (!_cleanupRegistered)
                 {

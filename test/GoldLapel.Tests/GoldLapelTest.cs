@@ -243,6 +243,18 @@ namespace GoldLapel.Tests
             Assert.False(gl.IsRunning);
             Assert.Null(gl.Url);
         }
+
+        [Fact]
+        public void NullUpstreamThrows()
+        {
+            Assert.Throws<ArgumentNullException>(() => new GL(null));
+        }
+
+        [Fact]
+        public void NullUpstreamWithOptionsThrows()
+        {
+            Assert.Throws<ArgumentNullException>(() => new GL(null, new GoldLapelOptions()));
+        }
     }
 
     // ── DashboardUrl ───────────────────────────────────────
