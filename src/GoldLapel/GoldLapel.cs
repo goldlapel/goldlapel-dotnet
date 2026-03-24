@@ -1,6 +1,7 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Data.Common;
 using System.Diagnostics;
 using System.IO;
 using System.Net.Sockets;
@@ -39,7 +40,8 @@ namespace GoldLapel
             "disablePartialIndexes", "disableRewrite", "disablePreparedCache",
             "disableResultCache", "disablePool",
             "disableN1", "disableN1CrossConnection", "disableShadowMode",
-            "enableCoalescing", "replica", "excludeTables"
+            "enableCoalescing", "replica", "excludeTables",
+            "invalidationPort"
         });
 
         private static readonly HashSet<string> BooleanKeys = new HashSet<string>(new[]
@@ -65,6 +67,7 @@ namespace GoldLapel
         private Process _process;
         private string _proxyUrl;
         private bool _disposed;
+        private DbConnection _wrappedConn;
 
         public GoldLapel(string upstream) : this(upstream, null) { }
 
@@ -263,6 +266,78 @@ namespace GoldLapel
                     _cleanupRegistered = true;
                 }
                 return _instance.StartProxy();
+            }
+        }
+
+        public static DbConnection StartConnection(string upstream)
+        {
+            return StartConnection(upstream, null);
+        }
+
+        public static DbConnection StartConnection(string upstream, GoldLapelOptions options)
+        {
+            lock (_lock)
+            {
+                if (_instance != null && _instance.IsRunning)
+                {
+                    if (_instance._upstream != upstream)
+                    {
+                        throw new InvalidOperationException(
+                            "Gold Lapel is already running for a different upstream. " +
+                            "Call GoldLapel.Stop() before starting with a new upstream."
+                        );
+                    }
+                    if (_instance._wrappedConn != null)
+                        return _instance._wrappedConn;
+                    return TryWrapConnection(_instance);
+                }
+                _instance?.Dispose();
+                _instance = new GoldLapel(upstream, options);
+                if (!_cleanupRegistered)
+                {
+                    AppDomain.CurrentDomain.ProcessExit += (s, e) =>
+                    {
+                        lock (_lock)
+                        {
+                            if (_instance != null)
+                            {
+                                _instance.StopProxy();
+                                _instance = null;
+                            }
+                        }
+                    };
+                    _cleanupRegistered = true;
+                }
+                _instance.StartProxy();
+                return TryWrapConnection(_instance);
+            }
+        }
+
+        private static DbConnection TryWrapConnection(GoldLapel inst)
+        {
+            try
+            {
+                // Try to load Npgsql dynamically
+                var npgsqlAssembly = System.Reflection.Assembly.Load("Npgsql");
+                var connType = npgsqlAssembly.GetType("Npgsql.NpgsqlConnection");
+                if (connType == null) return null;
+
+                var conn = (DbConnection)Activator.CreateInstance(connType, inst._proxyUrl);
+                conn.Open();
+
+                var cache = NativeCache.GetInstance();
+                int invPort = inst._port + 2;
+                if (inst._config != null && inst._config.ContainsKey("invalidationPort"))
+                    invPort = Convert.ToInt32(inst._config["invalidationPort"]);
+                cache.ConnectInvalidation(invPort);
+
+                var wrapped = new CachedConnection(conn, cache);
+                inst._wrappedConn = wrapped;
+                return wrapped;
+            }
+            catch
+            {
+                return null;
             }
         }
 

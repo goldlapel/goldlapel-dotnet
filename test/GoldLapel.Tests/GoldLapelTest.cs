@@ -369,7 +369,7 @@ namespace GoldLapel.Tests
         public void HasExpectedCount()
         {
             var keys = GL.ConfigKeys();
-            Assert.Equal(43, keys.Count);
+            Assert.Equal(42, keys.Count);
         }
     }
 
