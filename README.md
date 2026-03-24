@@ -1,6 +1,6 @@
 # Gold Lapel
 
-Self-optimizing Postgres proxy — automatic materialized views and indexes. Zero code changes required.
+Self-optimizing Postgres proxy — automatic materialized views and indexes, with an L1 native cache that serves repeated reads in microseconds. Zero code changes required.
 
 Gold Lapel sits between your app and Postgres, watches query patterns, and automatically creates materialized views and indexes to make your database faster. Port 7932 (79 = atomic number for gold, 32 from Postgres).
 
@@ -15,23 +15,22 @@ dotnet add package GoldLapel
 ```csharp
 using GoldLapel;
 
-// Start the proxy — returns a connection string pointing at Gold Lapel
-var url = GoldLapel.Start("postgresql://user:pass@localhost:5432/mydb");
+// Start the proxy — returns a database connection with L1 cache built in
+var conn = GoldLapel.Start("postgresql://user:pass@localhost:5432/mydb");
 
-// Use the URL with any Postgres driver
-using var conn = new NpgsqlConnection(url);
-
-// Or Entity Framework, Dapper, ADO.NET — anything that speaks Postgres
+// Use the connection directly — no NpgsqlConnection needed
+var cmd = conn.CreateCommand();
+cmd.CommandText = "SELECT * FROM users WHERE id = @id";
+cmd.Parameters.AddWithValue("id", 42);
+var reader = cmd.ExecuteReader();
 ```
-
-Gold Lapel is driver-agnostic. `Start()` returns a connection string (`postgresql://...@localhost:7932/...`) that works with any Postgres driver or ORM.
 
 ## API
 
 ### `GoldLapel.Start(upstream)`
 ### `GoldLapel.Start(upstream, options)`
 
-Starts the Gold Lapel proxy and returns the proxy connection string.
+Starts the Gold Lapel proxy and returns a database connection with L1 cache.
 
 - `upstream` — your Postgres connection string (e.g. `postgresql://user:pass@localhost:5432/mydb`)
 - `options.Port` — proxy port (default: 7932)
@@ -59,7 +58,7 @@ using GoldLapel;
 using var proxy = new GoldLapel(
     "postgresql://user:pass@localhost:5432/mydb",
     new GoldLapelOptions { Port = 7932 });
-var url = proxy.StartProxy();
+var conn = proxy.StartProxy();
 // proxy.StopProxy() called automatically via Dispose
 ```
 
@@ -74,7 +73,7 @@ Pass a config dictionary via options:
 ```csharp
 using GoldLapel;
 
-var url = GoldLapel.GoldLapel.Start("postgresql://user:pass@localhost/mydb",
+var conn = GoldLapel.GoldLapel.Start("postgresql://user:pass@localhost/mydb",
     new GoldLapelOptions
     {
         Config = new Dictionary<string, object>
@@ -100,7 +99,7 @@ For the full configuration reference, see the [main documentation](https://githu
 You can also pass raw CLI flags via `ExtraArgs`:
 
 ```csharp
-var url = GoldLapel.GoldLapel.Start(
+var conn = GoldLapel.GoldLapel.Start(
     "postgresql://user:pass@localhost:5432/mydb",
     new GoldLapelOptions
     {
@@ -117,7 +116,7 @@ This package bundles the Gold Lapel Rust binary for your platform. When you call
 1. Locates the binary (bundled in NuGet package, on PATH, or via `GOLDLAPEL_BINARY` env var)
 2. Spawns it as a subprocess listening on localhost
 3. Waits for the port to be ready
-4. Returns a connection string pointing at the proxy
+4. Returns a database connection with L1 native cache built in
 5. Cleans up automatically on process exit
 
 The binary does all the work — this wrapper just manages its lifecycle.
