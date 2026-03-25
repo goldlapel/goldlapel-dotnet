@@ -306,7 +306,37 @@ namespace GoldLapel
                 case "CREATE":
                 case "ALTER":
                 case "DROP":
+                case "REFRESH":
+                case "DO":
+                case "CALL":
                     return DdlSentinel;
+                case "MERGE":
+                    if (tokens.Length < 3 || !tokens[1].Equals("INTO", StringComparison.OrdinalIgnoreCase)) return null;
+                    return BareTable(tokens[2]);
+                case "SELECT":
+                    var sawInto = false;
+                    string intoTarget = null;
+                    for (int i = 1; i < tokens.Length; i++)
+                    {
+                        var upper = tokens[i].ToUpper();
+                        if (upper == "INTO" && !sawInto)
+                        {
+                            sawInto = true;
+                            continue;
+                        }
+                        if (sawInto && intoTarget == null)
+                        {
+                            if (upper == "TEMPORARY" || upper == "TEMP" || upper == "UNLOGGED")
+                                continue;
+                            intoTarget = tokens[i];
+                            continue;
+                        }
+                        if (sawInto && intoTarget != null && upper == "FROM")
+                            return DdlSentinel;
+                        if (upper == "FROM")
+                            return null;
+                    }
+                    return null;
                 case "COPY":
                     if (tokens.Length < 2) return null;
                     var raw = tokens[1];
