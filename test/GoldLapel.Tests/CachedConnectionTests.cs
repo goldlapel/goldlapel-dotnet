@@ -320,6 +320,39 @@ namespace GoldLapel.Tests
         }
     }
 
+    // ── CachedCommand.DbConnection setter ─────────────────────
+
+    public class CachedCommandConnectionSetterTest
+    {
+        [Fact]
+        public void SetConnectionThrowsNotSupported()
+        {
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var inner = new FakeConnection();
+            var conn = new CachedConnection(inner, cache);
+            var cmd = conn.CreateCommand();
+
+            // The protected DbConnection setter is exposed via the public Connection property
+            Assert.Throws<NotSupportedException>(() =>
+            {
+                cmd.Connection = new FakeConnection();
+            });
+        }
+
+        [Fact]
+        public void GetConnectionReturnsCachedConnection()
+        {
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var inner = new FakeConnection();
+            var conn = new CachedConnection(inner, cache);
+            var cmd = conn.CreateCommand();
+
+            Assert.Same(conn, cmd.Connection);
+        }
+    }
+
     // ── Fake implementations for testing ─────────────────────
 
     internal class FakeConnection : DbConnection

@@ -373,6 +373,46 @@ namespace GoldLapel.Tests
         }
     }
 
+    // ── GracefulStop ──────────────────────────────────────────
+
+    public class GracefulStopTest
+    {
+        [Fact]
+        public void SendSignalToSelf()
+        {
+            // SIGTERM (15) to our own process should succeed on Unix.
+            // We don't actually send SIGTERM to ourselves — instead verify
+            // that SendSignal returns true for signal 0 (null signal, just checks
+            // that we CAN send a signal to the given pid).
+            if (System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
+                    System.Runtime.InteropServices.OSPlatform.Windows))
+                return; // Skip on Windows
+
+            var pid = System.Diagnostics.Process.GetCurrentProcess().Id;
+            Assert.True(GL.SendSignal(pid, 0)); // signal 0 = existence check
+        }
+
+        [Fact]
+        public void SendSignalToNonexistentPid()
+        {
+            if (System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
+                    System.Runtime.InteropServices.OSPlatform.Windows))
+                return;
+
+            // PID that almost certainly doesn't exist should fail
+            Assert.False(GL.SendSignal(4194304, 0)); // max PID + 1 on most Linux systems
+        }
+
+        [Fact]
+        public void StopProxyIsIdempotent()
+        {
+            var gl = new GL("postgresql://localhost:5432/mydb");
+            // Calling StopProxy when nothing is running should not throw
+            gl.StopProxy();
+            gl.StopProxy();
+        }
+    }
+
     // ── ConfigToArgs ─────────────────────────────────────────
 
     public class ConfigToArgsTest

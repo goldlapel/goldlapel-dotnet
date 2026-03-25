@@ -142,7 +142,9 @@ namespace GoldLapel
         protected override DbConnection DbConnection
         {
             get => _conn;
-            set { }
+            set => throw new NotSupportedException(
+                "Cannot change the connection of a CachedCommand. " +
+                "Create a new command from the desired connection instead.");
         }
 
         protected override DbParameterCollection DbParameterCollection => _inner.Parameters;

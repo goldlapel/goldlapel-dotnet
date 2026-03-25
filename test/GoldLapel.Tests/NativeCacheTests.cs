@@ -322,6 +322,54 @@ namespace GoldLapel.Tests
         }
     }
 
+    // ── Cache capacity (TOCTOU regression) ────────────────────
+
+    public class CacheCapacityTest : IDisposable
+    {
+        public CacheCapacityTest() { NativeCache.Reset(); }
+        public void Dispose() { NativeCache.Reset(); }
+
+        [Fact]
+        public void ConcurrentPutDoesNotExceedMax()
+        {
+            // Set a small cache size via env var
+            var origSize = Environment.GetEnvironmentVariable("GOLDLAPEL_NATIVE_CACHE_SIZE");
+            try
+            {
+                Environment.SetEnvironmentVariable("GOLDLAPEL_NATIVE_CACHE_SIZE", "10");
+                var cache = new NativeCache();
+                cache.SetConnected(true);
+
+                // Use many threads to hammer Put concurrently
+                var threads = new Thread[20];
+                for (int t = 0; t < threads.Length; t++)
+                {
+                    var threadId = t;
+                    threads[t] = new Thread(() =>
+                    {
+                        for (int i = 0; i < 50; i++)
+                        {
+                            var sql = $"SELECT * FROM t{threadId}_{i}";
+                            cache.Put(sql, null,
+                                new[] { new object[] { i } }, new[] { "id" });
+                        }
+                    });
+                }
+
+                foreach (var t in threads) t.Start();
+                foreach (var t in threads) t.Join();
+
+                // Cache size should never exceed the max (10)
+                Assert.True(cache.Size <= 10,
+                    $"Cache size {cache.Size} exceeded max 10");
+            }
+            finally
+            {
+                Environment.SetEnvironmentVariable("GOLDLAPEL_NATIVE_CACHE_SIZE", origSize);
+            }
+        }
+    }
+
     // ── MakeKey ──────────────────────────────────────────────
 
     public class MakeKeyTest

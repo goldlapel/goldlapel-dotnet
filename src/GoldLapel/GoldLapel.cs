@@ -190,11 +190,44 @@ namespace GoldLapel
             {
                 if (!proc.HasExited)
                 {
-                    try { proc.Kill(); } catch { }
-                    try { proc.WaitForExit(5000); } catch { }
+                    GracefulStop(proc);
                 }
                 try { proc.Dispose(); } catch { }
             }
+        }
+
+        private const int GracefulTimeoutMs = 5000;
+
+        private static void GracefulStop(Process proc)
+        {
+            // On Unix/macOS, send SIGTERM first for graceful shutdown (flush data, close
+            // connections, write telemetry). Fall back to SIGKILL if the process doesn't
+            // exit within the timeout. On Windows, there is no SIGTERM equivalent, so
+            // Kill() is the only option.
+            if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            {
+                try
+                {
+                    if (SendSignal(proc.Id, 15)) // SIGTERM = 15
+                    {
+                        if (proc.WaitForExit(GracefulTimeoutMs))
+                            return;
+                    }
+                }
+                catch { }
+            }
+
+            // Fallback: forceful kill
+            try { proc.Kill(); } catch { }
+            try { proc.WaitForExit(GracefulTimeoutMs); } catch { }
+        }
+
+        [DllImport("libc", SetLastError = true, EntryPoint = "kill")]
+        private static extern int sys_kill(int pid, int sig);
+
+        internal static bool SendSignal(int pid, int signal)
+        {
+            return sys_kill(pid, signal) == 0;
         }
 
         public string Url => _proxyUrl;

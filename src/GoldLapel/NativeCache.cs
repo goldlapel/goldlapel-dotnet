@@ -43,6 +43,7 @@ namespace GoldLapel
         private readonly ConcurrentDictionary<string, CacheEntry> _cache = new ConcurrentDictionary<string, CacheEntry>();
         private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, byte>> _tableIndex = new ConcurrentDictionary<string, ConcurrentDictionary<string, byte>>();
         private readonly ConcurrentDictionary<string, long> _accessOrder = new ConcurrentDictionary<string, long>();
+        private readonly object _putLock = new object();
         private long _counter;
         private readonly int _maxEntries;
         private readonly bool _enabled;
@@ -119,16 +120,22 @@ namespace GoldLapel
             var key = MakeKey(sql, parameters);
             if (key == null) return;
             var tables = ExtractTables(sql);
-            if (!_cache.ContainsKey(key) && _cache.Count >= _maxEntries)
+
+            // Lock the put+eviction path to prevent two threads from both seeing
+            // count < max and both adding, which would exceed _maxEntries.
+            lock (_putLock)
             {
-                EvictOne();
-            }
-            _cache[key] = new CacheEntry(rows, columns, tables);
-            _accessOrder[key] = Interlocked.Increment(ref _counter);
-            foreach (var table in tables)
-            {
-                var keys = _tableIndex.GetOrAdd(table, _ => new ConcurrentDictionary<string, byte>());
-                keys[key] = 0;
+                if (!_cache.ContainsKey(key) && _cache.Count >= _maxEntries)
+                {
+                    EvictOne();
+                }
+                _cache[key] = new CacheEntry(rows, columns, tables);
+                _accessOrder[key] = Interlocked.Increment(ref _counter);
+                foreach (var table in tables)
+                {
+                    var keys = _tableIndex.GetOrAdd(table, _ => new ConcurrentDictionary<string, byte>());
+                    keys[key] = 0;
+                }
             }
         }
 
@@ -205,6 +212,8 @@ namespace GoldLapel
 
         private void InvalidationLoop()
         {
+            // TCP-only: the GL proxy's invalidation endpoint always listens on a TCP port,
+            // so Unix domain sockets are not applicable here.
             while (!_invalidationStop)
             {
                 try
