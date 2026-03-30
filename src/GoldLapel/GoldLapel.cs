@@ -322,7 +322,16 @@ namespace GoldLapel
                     }
                     if (_instance._wrappedConn != null)
                         return _instance._wrappedConn;
-                    return TryWrapConnection(_instance);
+                    var existing = TryWrapConnection(_instance);
+                    if (existing == null)
+                    {
+                        throw new InvalidOperationException(
+                            "No supported database driver found. " +
+                            "Add Npgsql to your dependencies (dotnet add package Npgsql) " +
+                            "or use GoldLapel.Start() / GoldLapel.ProxyUrl if you only need the connection string."
+                        );
+                    }
+                    return existing;
                 }
                 _instance?.Dispose();
                 _instance = new GoldLapel(upstream, options);
@@ -342,7 +351,16 @@ namespace GoldLapel
                     _cleanupRegistered = true;
                 }
                 _instance.StartProxy();
-                return TryWrapConnection(_instance);
+                var wrapped = TryWrapConnection(_instance);
+                if (wrapped == null)
+                {
+                    throw new InvalidOperationException(
+                        "No supported database driver found. " +
+                        "Add Npgsql to your dependencies (dotnet add package Npgsql) " +
+                        "or use GoldLapel.Start() / GoldLapel.ProxyUrl if you only need the connection string."
+                    );
+                }
+                return wrapped;
             }
         }
 
