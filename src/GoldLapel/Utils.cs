@@ -157,6 +157,105 @@ namespace GoldLapel
             }
         }
 
+        /// <summary>
+        /// Set a field in a hash. Like redis.hset().
+        /// Creates the hash table if it doesn't exist. Uses JSONB for storage.
+        /// </summary>
+        public static void Hset(DbConnection conn, string table, string key, string field, string valueJson)
+        {
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText =
+                    "CREATE TABLE IF NOT EXISTS " + table + " (" +
+                    "key TEXT PRIMARY KEY, " +
+                    "data JSONB NOT NULL DEFAULT '{}'::jsonb)";
+                cmd.ExecuteNonQuery();
+            }
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText =
+                    "INSERT INTO " + table + " (key, data) VALUES (@key, jsonb_build_object(@field, @val::jsonb)) " +
+                    "ON CONFLICT (key) DO UPDATE SET data = " + table + ".data || jsonb_build_object(@field2, @val2::jsonb)";
+                AddParameter(cmd, "@key", key);
+                AddParameter(cmd, "@field", field);
+                AddParameter(cmd, "@val", valueJson);
+                AddParameter(cmd, "@field2", field);
+                AddParameter(cmd, "@val2", valueJson);
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        /// <summary>
+        /// Get a field from a hash. Like redis.hget().
+        /// Returns the value as a JSON string, or null if key or field doesn't exist.
+        /// </summary>
+        public static string Hget(DbConnection conn, string table, string key, string field)
+        {
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "SELECT data->>@field FROM " + table + " WHERE key = @key";
+                AddParameter(cmd, "@field", field);
+                AddParameter(cmd, "@key", key);
+
+                using (var reader = cmd.ExecuteReader())
+                {
+                    if (reader.Read() && !reader.IsDBNull(0))
+                        return reader.GetString(0);
+                    return null;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Get all fields from a hash. Like redis.hgetall().
+        /// Returns the full JSONB object as a string, or null if key doesn't exist.
+        /// </summary>
+        public static string Hgetall(DbConnection conn, string table, string key)
+        {
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "SELECT data FROM " + table + " WHERE key = @key";
+                AddParameter(cmd, "@key", key);
+
+                using (var reader = cmd.ExecuteReader())
+                {
+                    if (reader.Read() && !reader.IsDBNull(0))
+                        return reader.GetValue(0)?.ToString();
+                    return null;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Remove a field from a hash. Like redis.hdel().
+        /// Returns true if the field existed, false otherwise.
+        /// </summary>
+        public static bool Hdel(DbConnection conn, string table, string key, string field)
+        {
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "SELECT data ? @field AS existed FROM " + table + " WHERE key = @key";
+                AddParameter(cmd, "@field", field);
+                AddParameter(cmd, "@key", key);
+
+                using (var reader = cmd.ExecuteReader())
+                {
+                    if (!reader.Read() || !reader.GetBoolean(0))
+                        return false;
+                }
+            }
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "UPDATE " + table + " SET data = data - @field WHERE key = @key";
+                AddParameter(cmd, "@field", field);
+                AddParameter(cmd, "@key", key);
+                cmd.ExecuteNonQuery();
+            }
+            return true;
+        }
+
         private static void AddParameter(DbCommand cmd, string name, object value)
         {
             var param = cmd.CreateParameter();
