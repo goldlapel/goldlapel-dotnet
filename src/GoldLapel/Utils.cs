@@ -256,6 +256,114 @@ namespace GoldLapel
             return true;
         }
 
+        /// <summary>
+        /// Add a location to a geo table. Like redis.geoadd().
+        /// Creates the table with PostGIS geometry column if it doesn't exist.
+        /// Requires PostGIS extension.
+        /// </summary>
+        public static void Geoadd(DbConnection conn, string table, string nameColumn,
+            string geomColumn, string name, double lon, double lat)
+        {
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "CREATE EXTENSION IF NOT EXISTS postgis";
+                cmd.ExecuteNonQuery();
+            }
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText =
+                    "CREATE TABLE IF NOT EXISTS " + table + " (" +
+                    "id BIGSERIAL PRIMARY KEY, " +
+                    nameColumn + " TEXT NOT NULL, " +
+                    geomColumn + " GEOMETRY(Point, 4326) NOT NULL)";
+                cmd.ExecuteNonQuery();
+            }
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText =
+                    "INSERT INTO " + table + " (" + nameColumn + ", " + geomColumn + ") " +
+                    "VALUES (@name, ST_SetSRID(ST_MakePoint(@lon, @lat), 4326))";
+                AddParameter(cmd, "@name", name);
+                AddParameter(cmd, "@lon", lon);
+                AddParameter(cmd, "@lat", lat);
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        /// <summary>
+        /// Find rows within a radius of a point. Like redis.georadius().
+        /// Requires PostGIS extension. Uses ST_DWithin with geography type
+        /// for accurate distance on the Earth's surface.
+        /// Returns a list of dictionaries with all columns plus a "distance_m" field.
+        /// </summary>
+        public static List<Dictionary<string, object>> Georadius(DbConnection conn, string table,
+            string geomColumn, double lon, double lat, double radiusMeters, int limit = 50)
+        {
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText =
+                    "SELECT *, ST_Distance(" +
+                    geomColumn + "::geography, " +
+                    "ST_SetSRID(ST_MakePoint(@lon1, @lat1), 4326)::geography" +
+                    ") AS distance_m " +
+                    "FROM " + table + " " +
+                    "WHERE ST_DWithin(" +
+                    geomColumn + "::geography, " +
+                    "ST_SetSRID(ST_MakePoint(@lon2, @lat2), 4326)::geography, " +
+                    "@radius) " +
+                    "ORDER BY distance_m " +
+                    "LIMIT @limit";
+                AddParameter(cmd, "@lon1", lon);
+                AddParameter(cmd, "@lat1", lat);
+                AddParameter(cmd, "@lon2", lon);
+                AddParameter(cmd, "@lat2", lat);
+                AddParameter(cmd, "@radius", radiusMeters);
+                AddParameter(cmd, "@limit", limit);
+
+                var results = new List<Dictionary<string, object>>();
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        var row = new Dictionary<string, object>();
+                        for (int i = 0; i < reader.FieldCount; i++)
+                        {
+                            row[reader.GetName(i)] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+                        }
+                        results.Add(row);
+                    }
+                }
+                return results;
+            }
+        }
+
+        /// <summary>
+        /// Get distance between two members in meters. Like redis.geodist().
+        /// Returns the distance in meters, or null if either member doesn't exist.
+        /// </summary>
+        public static double? Geodist(DbConnection conn, string table, string geomColumn,
+            string nameColumn, string nameA, string nameB)
+        {
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText =
+                    "SELECT ST_Distance(a." + geomColumn + "::geography, b." + geomColumn + "::geography) " +
+                    "FROM " + table + " a, " + table + " b " +
+                    "WHERE a." + nameColumn + " = @nameA AND b." + nameColumn + " = @nameB";
+                AddParameter(cmd, "@nameA", nameA);
+                AddParameter(cmd, "@nameB", nameB);
+
+                using (var reader = cmd.ExecuteReader())
+                {
+                    if (reader.Read() && !reader.IsDBNull(0))
+                        return reader.GetDouble(0);
+                    return null;
+                }
+            }
+        }
+
         private static void AddParameter(DbCommand cmd, string name, object value)
         {
             var param = cmd.CreateParameter();
