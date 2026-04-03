@@ -521,6 +521,15 @@ namespace GoldLapel
             }
         }
 
+        public static long CountDistinct(DbConnection conn, string table, string column)
+        {
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "SELECT COUNT(DISTINCT " + column + ") FROM " + table;
+                return (long)cmd.ExecuteScalar();
+            }
+        }
+
         private static void AddParameter(DbCommand cmd, string name, object value)
         {
             var param = cmd.CreateParameter();
