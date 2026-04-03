@@ -1,6 +1,9 @@
 using System;
 using System.Collections.Generic;
 using System.Data.Common;
+using System.Linq.Expressions;
+using System.Reflection;
+using System.Threading;
 
 namespace GoldLapel
 {
@@ -361,6 +364,160 @@ namespace GoldLapel
                         return reader.GetDouble(0);
                     return null;
                 }
+            }
+        }
+
+        public static void Subscribe(DbConnection conn, string channel, Action<string, string> callback, bool blocking = true)
+        {
+            if (blocking)
+            {
+                ListenLoop(conn, channel, callback);
+            }
+            else
+            {
+                var thread = new Thread(() => ListenLoop(conn, channel, callback));
+                thread.IsBackground = true;
+                thread.Start();
+            }
+        }
+
+        private static void ListenLoop(DbConnection conn, string channel, Action<string, string> callback)
+        {
+            var listenConn = CreateListenConnection(conn);
+
+            var notificationEvent = listenConn.GetType().GetEvent("Notification");
+            if (notificationEvent == null)
+                throw new InvalidOperationException(
+                    "Subscribe requires Npgsql. The connection must be an NpgsqlConnection.");
+
+            var handlerType = notificationEvent.EventHandlerType;
+            var invokeParams = handlerType.GetMethod("Invoke").GetParameters();
+            var argsType = invokeParams[1].ParameterType;
+            var channelProp = argsType.GetProperty("Channel");
+            var payloadProp = argsType.GetProperty("Payload");
+
+            var senderParam = Expression.Parameter(invokeParams[0].ParameterType, "sender");
+            var argsParam = Expression.Parameter(argsType, "e");
+            var callbackConst = Expression.Constant(callback);
+            var body = Expression.Invoke(callbackConst,
+                Expression.Property(argsParam, channelProp),
+                Expression.Property(argsParam, payloadProp));
+            var lambda = Expression.Lambda(handlerType, body, senderParam, argsParam);
+            notificationEvent.AddEventHandler(listenConn, lambda.Compile());
+
+            using (var cmd = listenConn.CreateCommand())
+            {
+                cmd.CommandText = "LISTEN " + channel;
+                cmd.ExecuteNonQuery();
+            }
+
+            var waitMethod = listenConn.GetType().GetMethod("Wait",
+                BindingFlags.Public | BindingFlags.Instance, null, Type.EmptyTypes, null);
+
+            if (waitMethod == null)
+                throw new InvalidOperationException(
+                    "Subscribe requires Npgsql with Wait() support.");
+
+            while (true)
+            {
+                waitMethod.Invoke(listenConn, null);
+            }
+        }
+
+        private static DbConnection CreateListenConnection(DbConnection conn)
+        {
+            var inner = conn is CachedConnection cached ? cached.Inner : conn;
+            var connString = inner.ConnectionString;
+            var listenConn = (DbConnection)Activator.CreateInstance(inner.GetType(), connString);
+            listenConn.Open();
+            return listenConn;
+        }
+
+        public static long GetCounter(DbConnection conn, string table, string key)
+        {
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "SELECT value FROM " + table + " WHERE key = @key";
+                AddParameter(cmd, "@key", key);
+
+                using (var reader = cmd.ExecuteReader())
+                {
+                    if (reader.Read() && !reader.IsDBNull(0))
+                        return reader.GetInt64(0);
+                    return 0;
+                }
+            }
+        }
+
+        public static double Zincrby(DbConnection conn, string table, string member, double amount = 1)
+        {
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText =
+                    "CREATE TABLE IF NOT EXISTS " + table + " (" +
+                    "member TEXT PRIMARY KEY, " +
+                    "score DOUBLE PRECISION NOT NULL)";
+                cmd.ExecuteNonQuery();
+            }
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText =
+                    "INSERT INTO " + table + " (member, score) VALUES (@member, @amount) " +
+                    "ON CONFLICT (member) DO UPDATE SET score = " + table + ".score + @incr " +
+                    "RETURNING score";
+                AddParameter(cmd, "@member", member);
+                AddParameter(cmd, "@amount", amount);
+                AddParameter(cmd, "@incr", amount);
+                return (double)cmd.ExecuteScalar();
+            }
+        }
+
+        public static long? Zrank(DbConnection conn, string table, string member, bool desc = true)
+        {
+            var order = desc ? "DESC" : "ASC";
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText =
+                    "SELECT rank FROM (" +
+                    "SELECT member, ROW_NUMBER() OVER (ORDER BY score " + order + ") - 1 AS rank " +
+                    "FROM " + table +
+                    ") ranked WHERE member = @member";
+                AddParameter(cmd, "@member", member);
+
+                using (var reader = cmd.ExecuteReader())
+                {
+                    if (reader.Read() && !reader.IsDBNull(0))
+                        return reader.GetInt64(0);
+                    return null;
+                }
+            }
+        }
+
+        public static double? Zscore(DbConnection conn, string table, string member)
+        {
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "SELECT score FROM " + table + " WHERE member = @member";
+                AddParameter(cmd, "@member", member);
+
+                using (var reader = cmd.ExecuteReader())
+                {
+                    if (reader.Read() && !reader.IsDBNull(0))
+                        return reader.GetDouble(0);
+                    return null;
+                }
+            }
+        }
+
+        public static bool Zrem(DbConnection conn, string table, string member)
+        {
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "DELETE FROM " + table + " WHERE member = @member";
+                AddParameter(cmd, "@member", member);
+                return cmd.ExecuteNonQuery() > 0;
             }
         }
 
