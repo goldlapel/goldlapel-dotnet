@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Data.Common;
+using System.Linq;
 using System.Linq.Expressions;
 using System.Reflection;
 using System.Threading;
@@ -527,6 +528,36 @@ namespace GoldLapel
             {
                 cmd.CommandText = "SELECT COUNT(DISTINCT " + column + ") FROM " + table;
                 return (long)cmd.ExecuteScalar();
+            }
+        }
+
+        public static string Script(DbConnection conn, string luaCode, params string[] args)
+        {
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "CREATE EXTENSION IF NOT EXISTS pllua";
+                cmd.ExecuteNonQuery();
+            }
+
+            var funcName = "_gl_lua_" + Guid.NewGuid().ToString("N").Substring(0, 8);
+            var paramDefs = string.Join(", ", Enumerable.Range(0, args.Length).Select(i => $"p{i + 1} text"));
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = $"CREATE OR REPLACE FUNCTION pg_temp.{funcName}({paramDefs}) RETURNS text LANGUAGE pllua AS $pllua$ {luaCode} $pllua$";
+                cmd.ExecuteNonQuery();
+            }
+
+            using (var cmd = conn.CreateCommand())
+            {
+                var placeholders = string.Join(", ", Enumerable.Range(0, args.Length).Select(i => $"@p{i + 1}"));
+                cmd.CommandText = $"SELECT pg_temp.{funcName}({placeholders})";
+                for (int i = 0; i < args.Length; i++)
+                {
+                    AddParameter(cmd, $"@p{i + 1}", args[i]);
+                }
+                var result = cmd.ExecuteScalar();
+                return result == DBNull.Value ? null : (string)result;
             }
         }
 
