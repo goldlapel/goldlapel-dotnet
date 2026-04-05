@@ -710,16 +710,27 @@ namespace GoldLapel
         public static List<Dictionary<string, object>> Search(DbConnection conn, string table,
             string column, string query, int limit = 50, string lang = "english", bool highlight = false)
         {
-            ValidateIdentifier(table);
-            ValidateIdentifier(column);
+            return Search(conn, table, new[] { column }, query, limit, lang, highlight);
+        }
 
-            var tsv = "to_tsvector(@lang1, coalesce(" + column + ", ''))";
+        public static List<Dictionary<string, object>> Search(DbConnection conn, string table,
+            string[] columns, string query, int limit = 50, string lang = "english", bool highlight = false)
+        {
+            ValidateIdentifier(table);
+            foreach (var col in columns)
+                ValidateIdentifier(col);
+
+            // Build tsvector expression: coalesce(col1, '') || ' ' || coalesce(col2, '')
+            var tsvParts = string.Join(" || ' ' || ", columns.Select(c => "coalesce(" + c + ", '')"));
+            var tsv = "to_tsvector(@lang1, " + tsvParts + ")";
             var tsq = "plainto_tsquery(@lang2, @query)";
+            var highlightCol = columns[0];
 
             string fields;
             if (highlight)
                 fields = "*, ts_rank(" + tsv + ", " + tsq + ") AS _score, " +
-                         "ts_headline(@lang3, coalesce(" + column + ", ''), " + tsq + ") AS _highlight";
+                         "ts_headline(@lang3, coalesce(" + highlightCol + ", ''), " + tsq +
+                         ", 'StartSel=<mark>, StopSel=</mark>, MaxWords=35, MinWords=15') AS _highlight";
             else
                 fields = "*, ts_rank(" + tsv + ", " + tsq + ") AS _score";
 
