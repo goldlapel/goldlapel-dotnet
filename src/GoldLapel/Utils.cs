@@ -928,6 +928,154 @@ namespace GoldLapel
             }
         }
 
+        public static List<Dictionary<string, object>> Facets(DbConnection conn, string table,
+            string column, int limit = 50, string query = null, string queryColumn = null,
+            string lang = "english")
+        {
+            return Facets(conn, table, column, limit, query,
+                queryColumn != null ? new[] { queryColumn } : null, lang);
+        }
+
+        public static List<Dictionary<string, object>> Facets(DbConnection conn, string table,
+            string column, int limit = 50, string query = null, string[] queryColumn = null,
+            string lang = "english")
+        {
+            ValidateIdentifier(table);
+            ValidateIdentifier(column);
+
+            var hasQuery = query != null && queryColumn != null && queryColumn.Length > 0;
+
+            if (hasQuery)
+            {
+                foreach (var col in queryColumn)
+                    ValidateIdentifier(col);
+            }
+
+            using (var cmd = conn.CreateCommand())
+            {
+                if (hasQuery)
+                {
+                    var tsvParts = string.Join(" || ' ' || ",
+                        queryColumn.Select(c => "coalesce(" + c + ", '')"));
+                    var tsv = "to_tsvector(@lang, " + tsvParts + ")";
+
+                    cmd.CommandText =
+                        "SELECT " + column + " AS value, COUNT(*) AS count FROM " + table +
+                        " WHERE " + tsv + " @@ plainto_tsquery(@lang2, @query)" +
+                        " GROUP BY " + column +
+                        " ORDER BY count DESC, " + column +
+                        " LIMIT @limit";
+                    AddParameter(cmd, "@lang", lang);
+                    AddParameter(cmd, "@lang2", lang);
+                    AddParameter(cmd, "@query", query);
+                }
+                else
+                {
+                    cmd.CommandText =
+                        "SELECT " + column + " AS value, COUNT(*) AS count FROM " + table +
+                        " GROUP BY " + column +
+                        " ORDER BY count DESC, " + column +
+                        " LIMIT @limit";
+                }
+                AddParameter(cmd, "@limit", limit);
+
+                var results = new List<Dictionary<string, object>>();
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        var row = new Dictionary<string, object>();
+                        for (int i = 0; i < reader.FieldCount; i++)
+                        {
+                            row[reader.GetName(i)] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+                        }
+                        results.Add(row);
+                    }
+                }
+                return results;
+            }
+        }
+
+        private static readonly string[] AllowedAggregateFuncs = { "count", "sum", "avg", "min", "max" };
+
+        public static List<Dictionary<string, object>> Aggregate(DbConnection conn, string table,
+            string column, string func, string groupBy = null, int limit = 50)
+        {
+            ValidateIdentifier(table);
+            ValidateIdentifier(column);
+
+            var funcLower = func.ToLowerInvariant();
+            if (Array.IndexOf(AllowedAggregateFuncs, funcLower) < 0)
+                throw new ArgumentException(
+                    "func must be one of: count, sum, avg, min, max — got: " + func);
+
+            if (groupBy != null)
+                ValidateIdentifier(groupBy);
+
+            var expr = funcLower == "count"
+                ? "COUNT(*)"
+                : funcLower.ToUpperInvariant() + "(" + column + ")";
+
+            using (var cmd = conn.CreateCommand())
+            {
+                if (groupBy != null)
+                {
+                    cmd.CommandText =
+                        "SELECT " + groupBy + ", " + expr + " AS value FROM " + table +
+                        " GROUP BY " + groupBy +
+                        " ORDER BY value DESC" +
+                        " LIMIT @limit";
+                    AddParameter(cmd, "@limit", limit);
+                }
+                else
+                {
+                    cmd.CommandText = "SELECT " + expr + " AS value FROM " + table;
+                }
+
+                var results = new List<Dictionary<string, object>>();
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        var row = new Dictionary<string, object>();
+                        for (int i = 0; i < reader.FieldCount; i++)
+                        {
+                            row[reader.GetName(i)] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+                        }
+                        results.Add(row);
+                    }
+                }
+                return results;
+            }
+        }
+
+        public static void CreateSearchConfig(DbConnection conn, string name, string copyFrom = "english")
+        {
+            ValidateIdentifier(name);
+            ValidateIdentifier(copyFrom);
+
+            bool exists;
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "SELECT 1 FROM pg_ts_config WHERE cfgname = @name";
+                AddParameter(cmd, "@name", name);
+                using (var reader = cmd.ExecuteReader())
+                {
+                    exists = reader.Read();
+                }
+            }
+
+            if (!exists)
+            {
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.CommandText = "CREATE TEXT SEARCH CONFIGURATION " + name +
+                        " (COPY = " + copyFrom + ")";
+                    cmd.ExecuteNonQuery();
+                }
+            }
+        }
+
         private static readonly Regex IdentifierPattern = new Regex(@"^[a-zA-Z_][a-zA-Z0-9_]*$");
 
         private static void ValidateIdentifier(string name)
