@@ -1,9 +1,11 @@
 using System;
 using System.Collections.Generic;
 using System.Data.Common;
+using System.Globalization;
 using System.Linq;
 using System.Linq.Expressions;
 using System.Reflection;
+using System.Text.RegularExpressions;
 using System.Threading;
 
 namespace GoldLapel
@@ -703,6 +705,226 @@ namespace GoldLapel
                 }
                 return results;
             }
+        }
+
+        public static List<Dictionary<string, object>> Search(DbConnection conn, string table,
+            string column, string query, int limit = 50, string lang = "english", bool highlight = false)
+        {
+            ValidateIdentifier(table);
+            ValidateIdentifier(column);
+
+            var tsv = "to_tsvector(@lang1, coalesce(" + column + ", ''))";
+            var tsq = "plainto_tsquery(@lang2, @query)";
+
+            string fields;
+            if (highlight)
+                fields = "*, ts_rank(" + tsv + ", " + tsq + ") AS _score, " +
+                         "ts_headline(@lang3, coalesce(" + column + ", ''), " + tsq + ") AS _highlight";
+            else
+                fields = "*, ts_rank(" + tsv + ", " + tsq + ") AS _score";
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText =
+                    "SELECT " + fields + " FROM " + table +
+                    " WHERE " + tsv + " @@ " + tsq +
+                    " ORDER BY _score DESC LIMIT @limit";
+                AddParameter(cmd, "@lang1", lang);
+                AddParameter(cmd, "@lang2", lang);
+                AddParameter(cmd, "@query", query);
+                if (highlight)
+                    AddParameter(cmd, "@lang3", lang);
+                AddParameter(cmd, "@limit", limit);
+
+                var results = new List<Dictionary<string, object>>();
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        var row = new Dictionary<string, object>();
+                        for (int i = 0; i < reader.FieldCount; i++)
+                        {
+                            row[reader.GetName(i)] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+                        }
+                        results.Add(row);
+                    }
+                }
+                return results;
+            }
+        }
+
+        public static List<Dictionary<string, object>> SearchFuzzy(DbConnection conn, string table,
+            string column, string query, int limit = 50, double threshold = 0.3)
+        {
+            ValidateIdentifier(table);
+            ValidateIdentifier(column);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "CREATE EXTENSION IF NOT EXISTS pg_trgm";
+                cmd.ExecuteNonQuery();
+            }
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText =
+                    "SELECT *, similarity(" + column + ", @query) AS _score FROM " + table +
+                    " WHERE similarity(" + column + ", @query2) > @threshold" +
+                    " ORDER BY _score DESC LIMIT @limit";
+                AddParameter(cmd, "@query", query);
+                AddParameter(cmd, "@query2", query);
+                AddParameter(cmd, "@threshold", threshold);
+                AddParameter(cmd, "@limit", limit);
+
+                var results = new List<Dictionary<string, object>>();
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        var row = new Dictionary<string, object>();
+                        for (int i = 0; i < reader.FieldCount; i++)
+                        {
+                            row[reader.GetName(i)] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+                        }
+                        results.Add(row);
+                    }
+                }
+                return results;
+            }
+        }
+
+        public static List<Dictionary<string, object>> SearchPhonetic(DbConnection conn, string table,
+            string column, string query, int limit = 50)
+        {
+            ValidateIdentifier(table);
+            ValidateIdentifier(column);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "CREATE EXTENSION IF NOT EXISTS fuzzystrmatch";
+                cmd.ExecuteNonQuery();
+            }
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "CREATE EXTENSION IF NOT EXISTS pg_trgm";
+                cmd.ExecuteNonQuery();
+            }
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText =
+                    "SELECT *, similarity(" + column + ", @query) AS _score FROM " + table +
+                    " WHERE soundex(" + column + ") = soundex(@query2)" +
+                    " ORDER BY _score DESC, " + column + " LIMIT @limit";
+                AddParameter(cmd, "@query", query);
+                AddParameter(cmd, "@query2", query);
+                AddParameter(cmd, "@limit", limit);
+
+                var results = new List<Dictionary<string, object>>();
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        var row = new Dictionary<string, object>();
+                        for (int i = 0; i < reader.FieldCount; i++)
+                        {
+                            row[reader.GetName(i)] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+                        }
+                        results.Add(row);
+                    }
+                }
+                return results;
+            }
+        }
+
+        public static List<Dictionary<string, object>> Similar(DbConnection conn, string table,
+            string column, double[] vector, int limit = 10)
+        {
+            ValidateIdentifier(table);
+            ValidateIdentifier(column);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "CREATE EXTENSION IF NOT EXISTS vector";
+                cmd.ExecuteNonQuery();
+            }
+
+            var vectorLiteral = "[" + string.Join(",",
+                vector.Select(v => v.ToString(CultureInfo.InvariantCulture))) + "]";
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText =
+                    "SELECT *, (" + column + " <=> @vec::vector) AS _score FROM " + table +
+                    " ORDER BY _score LIMIT @limit";
+                AddParameter(cmd, "@vec", vectorLiteral);
+                AddParameter(cmd, "@limit", limit);
+
+                var results = new List<Dictionary<string, object>>();
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        var row = new Dictionary<string, object>();
+                        for (int i = 0; i < reader.FieldCount; i++)
+                        {
+                            row[reader.GetName(i)] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+                        }
+                        results.Add(row);
+                    }
+                }
+                return results;
+            }
+        }
+
+        public static List<Dictionary<string, object>> Suggest(DbConnection conn, string table,
+            string column, string prefix, int limit = 10)
+        {
+            ValidateIdentifier(table);
+            ValidateIdentifier(column);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "CREATE EXTENSION IF NOT EXISTS pg_trgm";
+                cmd.ExecuteNonQuery();
+            }
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText =
+                    "SELECT *, similarity(" + column + ", @prefix) AS _score FROM " + table +
+                    " WHERE " + column + " ILIKE @pattern" +
+                    " ORDER BY _score DESC, " + column + " LIMIT @limit";
+                AddParameter(cmd, "@prefix", prefix);
+                AddParameter(cmd, "@pattern", prefix + "%");
+                AddParameter(cmd, "@limit", limit);
+
+                var results = new List<Dictionary<string, object>>();
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        var row = new Dictionary<string, object>();
+                        for (int i = 0; i < reader.FieldCount; i++)
+                        {
+                            row[reader.GetName(i)] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+                        }
+                        results.Add(row);
+                    }
+                }
+                return results;
+            }
+        }
+
+        private static readonly Regex IdentifierPattern = new Regex(@"^[a-zA-Z_][a-zA-Z0-9_]*$");
+
+        private static void ValidateIdentifier(string name)
+        {
+            if (string.IsNullOrEmpty(name))
+                throw new ArgumentException("Identifier must be a non-empty string");
+            if (!IdentifierPattern.IsMatch(name))
+                throw new ArgumentException("Invalid identifier: " + name);
         }
 
         private static void AddParameter(DbCommand cmd, string name, object value)
