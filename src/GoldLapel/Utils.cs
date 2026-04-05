@@ -1170,6 +1170,81 @@ namespace GoldLapel
             }
         }
 
+        /// <summary>
+        /// Analyze how PostgreSQL text search tokenizes and processes text.
+        /// Returns token details including dictionaries consulted and resulting lexemes.
+        /// Useful for debugging why certain search terms do or don't match.
+        /// </summary>
+        public static List<Dictionary<string, object>> Analyze(DbConnection conn, string text, string lang = "english")
+        {
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText =
+                    "SELECT alias, description, token, dictionaries, dictionary, lexemes " +
+                    "FROM ts_debug(@lang, @text)";
+                AddParameter(cmd, "@lang", lang);
+                AddParameter(cmd, "@text", text);
+
+                var results = new List<Dictionary<string, object>>();
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        var row = new Dictionary<string, object>();
+                        for (int i = 0; i < reader.FieldCount; i++)
+                        {
+                            row[reader.GetName(i)] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+                        }
+                        results.Add(row);
+                    }
+                }
+                return results;
+            }
+        }
+
+        /// <summary>
+        /// Explain the full-text search score for a specific row.
+        /// Returns document text, parsed tokens, match status, rank score, and a highlighted headline.
+        /// Useful for understanding why a particular row ranked the way it did.
+        /// </summary>
+        public static Dictionary<string, object> ExplainScore(DbConnection conn, string table,
+            string column, string query, string idColumn, object idValue, string lang = "english")
+        {
+            ValidateIdentifier(table);
+            ValidateIdentifier(column);
+            ValidateIdentifier(idColumn);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText =
+                    "SELECT " + column + " AS document_text, " +
+                    "to_tsvector(@lang, " + column + ")::text AS document_tokens, " +
+                    "plainto_tsquery(@lang, @query)::text AS query_tokens, " +
+                    "to_tsvector(@lang, " + column + ") @@ plainto_tsquery(@lang, @query) AS matches, " +
+                    "ts_rank(to_tsvector(@lang, " + column + "), plainto_tsquery(@lang, @query)) AS score, " +
+                    "ts_headline(@lang, " + column + ", plainto_tsquery(@lang, @query), " +
+                    "'StartSel=**, StopSel=**, MaxWords=50, MinWords=20') AS headline " +
+                    "FROM " + table + " WHERE " + idColumn + " = @idValue";
+                AddParameter(cmd, "@lang", lang);
+                AddParameter(cmd, "@query", query);
+                AddParameter(cmd, "@idValue", idValue);
+
+                using (var reader = cmd.ExecuteReader())
+                {
+                    if (reader.Read())
+                    {
+                        var row = new Dictionary<string, object>();
+                        for (int i = 0; i < reader.FieldCount; i++)
+                        {
+                            row[reader.GetName(i)] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+                        }
+                        return row;
+                    }
+                    return null;
+                }
+            }
+        }
+
         private static readonly Regex IdentifierPattern = new Regex(@"^[a-zA-Z_][a-zA-Z0-9_]*$");
 
         private static void ValidateIdentifier(string name)
