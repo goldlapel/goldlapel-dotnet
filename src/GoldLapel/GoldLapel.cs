@@ -89,7 +89,7 @@ namespace GoldLapel
                 return _proxyUrl;
 
             var binary = FindBinary();
-            var args = new List<string> { "--upstream", _upstream, "--port", _port.ToString() };
+            var args = new List<string> { "--upstream", _upstream, "--proxy-port", _port.ToString() };
             args.AddRange(ConfigToArgs(_config));
             args.AddRange(_extraArgs);
 
