@@ -849,6 +849,100 @@ namespace GoldLapel
             }
         }
 
+        public static void PercolateAdd(DbConnection conn, string name, string queryId,
+            string query, string lang = "english", string metadataJson = null)
+        {
+            ValidateIdentifier(name);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText =
+                    "CREATE TABLE IF NOT EXISTS " + name + " (" +
+                    "query_id TEXT PRIMARY KEY, " +
+                    "query_text TEXT NOT NULL, " +
+                    "tsquery TSQUERY NOT NULL, " +
+                    "lang TEXT NOT NULL DEFAULT 'english', " +
+                    "metadata JSONB)";
+                cmd.ExecuteNonQuery();
+            }
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText =
+                    "CREATE INDEX IF NOT EXISTS " + name + "_tsquery_idx ON " + name +
+                    " USING GIN (tsquery)";
+                cmd.ExecuteNonQuery();
+            }
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText =
+                    "INSERT INTO " + name + " (query_id, query_text, tsquery, lang, metadata) " +
+                    "VALUES (@queryId, @query, plainto_tsquery(@lang, @query), @lang, @metadata::jsonb) " +
+                    "ON CONFLICT (query_id) DO UPDATE SET " +
+                    "query_text = EXCLUDED.query_text, " +
+                    "tsquery = EXCLUDED.tsquery, " +
+                    "lang = EXCLUDED.lang, " +
+                    "metadata = EXCLUDED.metadata";
+                AddParameter(cmd, "@queryId", queryId);
+                AddParameter(cmd, "@query", query);
+                AddParameter(cmd, "@lang", lang);
+                AddParameter(cmd, "@metadata", (object)metadataJson ?? DBNull.Value);
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        public static List<Dictionary<string, object>> Percolate(DbConnection conn, string name,
+            string text, int limit = 50, string lang = "english")
+        {
+            ValidateIdentifier(name);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText =
+                    "SELECT query_id, query_text, metadata, " +
+                    "ts_rank(to_tsvector(@lang, @text), tsquery) AS _score " +
+                    "FROM " + name +
+                    " WHERE to_tsvector(@lang, @text) @@ tsquery" +
+                    " ORDER BY _score DESC LIMIT @limit";
+                AddParameter(cmd, "@lang", lang);
+                AddParameter(cmd, "@text", text);
+                AddParameter(cmd, "@limit", limit);
+
+                var results = new List<Dictionary<string, object>>();
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        var row = new Dictionary<string, object>();
+                        for (int i = 0; i < reader.FieldCount; i++)
+                        {
+                            row[reader.GetName(i)] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+                        }
+                        results.Add(row);
+                    }
+                }
+                return results;
+            }
+        }
+
+        public static bool PercolateDelete(DbConnection conn, string name, string queryId)
+        {
+            ValidateIdentifier(name);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText =
+                    "DELETE FROM " + name + " WHERE query_id = @queryId RETURNING query_id";
+                AddParameter(cmd, "@queryId", queryId);
+
+                using (var reader = cmd.ExecuteReader())
+                {
+                    return reader.Read();
+                }
+            }
+        }
+
         public static List<Dictionary<string, object>> Similar(DbConnection conn, string table,
             string column, double[] vector, int limit = 10)
         {
