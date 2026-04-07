@@ -78,7 +78,7 @@ var conn = GoldLapel.GoldLapel.Start("postgresql://user:pass@localhost/mydb",
     {
         Config = new Dictionary<string, object>
         {
-            ["mode"] = "butler",
+            ["mode"] = "waiter",
             ["poolSize"] = 50,
             ["disableMatviews"] = true,
             ["replica"] = new List<string> { "postgresql://user:pass@replica1/mydb" },

@@ -420,9 +420,9 @@ namespace GoldLapel.Tests
         [Fact]
         public void ConfigToArgs_StringValue()
         {
-            var config = new Dictionary<string, object> { { "mode", "butler" } };
+            var config = new Dictionary<string, object> { { "mode", "waiter" } };
             var args = GL.ConfigToArgs(config);
-            Assert.Equal(new List<string> { "--mode", "butler" }, args);
+            Assert.Equal(new List<string> { "--mode", "waiter" }, args);
         }
 
         [Fact]
@@ -487,13 +487,13 @@ namespace GoldLapel.Tests
         {
             var config = new Dictionary<string, object>
             {
-                { "mode", "butler" },
+                { "mode", "waiter" },
                 { "poolSize", 10 },
                 { "disableRewrite", true }
             };
             var args = GL.ConfigToArgs(config);
             Assert.Contains("--mode", args);
-            Assert.Contains("butler", args);
+            Assert.Contains("waiter", args);
             Assert.Contains("--pool-size", args);
             Assert.Contains("10", args);
             Assert.Contains("--disable-rewrite", args);
@@ -530,7 +530,7 @@ namespace GoldLapel.Tests
             {
                 Config = new Dictionary<string, object>
                 {
-                    { "mode", "butler" },
+                    { "mode", "waiter" },
                     { "disablePool", true }
                 }
             };
