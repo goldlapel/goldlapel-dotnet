@@ -1401,12 +1401,14 @@ namespace GoldLapel
         public static int DocUpdate(DbConnection conn, string collection, string filterJson, string updateJson)
         {
             ValidateIdentifier(collection);
-            var filter = BuildFilter(filterJson);
+            int paramIdx = 0;
+            var update = BuildUpdate(updateJson, ref paramIdx);
+            var filter = BuildFilter(filterJson, ref paramIdx);
 
             using (var cmd = conn.CreateCommand())
             {
-                var sql = "UPDATE " + collection + " SET data = data || @update::jsonb, updated_at = NOW()";
-                AddParameter(cmd, "@update", updateJson);
+                var sql = "UPDATE " + collection + " SET data = " + update.Expression + ", updated_at = NOW()";
+                ApplyUpdateParams(cmd, update, 0);
 
                 if (!string.IsNullOrEmpty(filter.WhereClause))
                 {
@@ -1422,22 +1424,26 @@ namespace GoldLapel
         public static int DocUpdateOne(DbConnection conn, string collection, string filterJson, string updateJson)
         {
             ValidateIdentifier(collection);
-            var filter = BuildFilter(filterJson);
+            // Filter params come first (used in subquery), then update params
+            int paramIdx = 0;
+            var filter = BuildFilter(filterJson, ref paramIdx);
+            var update = BuildUpdate(updateJson, ref paramIdx);
 
             using (var cmd = conn.CreateCommand())
             {
-                var sql = "UPDATE " + collection + " SET data = data || @update::jsonb, updated_at = NOW() " +
+                var sql = "UPDATE " + collection + " SET data = " + update.Expression + ", updated_at = NOW() " +
                     "WHERE id = (SELECT id FROM " + collection;
+
+                ApplyFilterParams(cmd, filter);
+                ApplyUpdateParams(cmd, update, filter.ParamOffset + filter.Params.Count);
 
                 if (!string.IsNullOrEmpty(filter.WhereClause))
                 {
                     sql += " WHERE " + filter.WhereClause;
-                    ApplyFilterParams(cmd, filter);
                 }
 
                 sql += " LIMIT 1)";
 
-                AddParameter(cmd, "@update", updateJson);
                 cmd.CommandText = sql;
                 return cmd.ExecuteNonQuery();
             }
@@ -1502,6 +1508,103 @@ namespace GoldLapel
 
                 cmd.CommandText = sql;
                 return (long)cmd.ExecuteScalar();
+            }
+        }
+
+        public static Dictionary<string, object> DocFindOneAndUpdate(DbConnection conn, string collection,
+            string filterJson, string updateJson)
+        {
+            ValidateIdentifier(collection);
+            int paramIdx = 0;
+            var filter = BuildFilter(filterJson, ref paramIdx);
+            var update = BuildUpdate(updateJson, ref paramIdx);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                var cteWhere = "";
+                if (!string.IsNullOrEmpty(filter.WhereClause))
+                    cteWhere = " WHERE " + filter.WhereClause;
+
+                var sql = "WITH target AS (SELECT id FROM " + collection + cteWhere + " LIMIT 1) " +
+                    "UPDATE " + collection + " SET data = " + update.Expression + ", updated_at = NOW() " +
+                    "FROM target WHERE " + collection + ".id = target.id " +
+                    "RETURNING " + collection + ".id, " + collection + ".data, " +
+                    collection + ".created_at, " + collection + ".updated_at";
+
+                ApplyFilterParams(cmd, filter);
+                ApplyUpdateParams(cmd, update, filter.ParamOffset + filter.Params.Count);
+
+                cmd.CommandText = sql;
+
+                using (var reader = cmd.ExecuteReader())
+                {
+                    if (reader.Read())
+                        return ReadRow(reader);
+                    return null;
+                }
+            }
+        }
+
+        public static Dictionary<string, object> DocFindOneAndDelete(DbConnection conn, string collection,
+            string filterJson)
+        {
+            ValidateIdentifier(collection);
+            var filter = BuildFilter(filterJson);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                var cteWhere = "";
+                if (!string.IsNullOrEmpty(filter.WhereClause))
+                    cteWhere = " WHERE " + filter.WhereClause;
+
+                var sql = "WITH target AS (SELECT id FROM " + collection + cteWhere + " LIMIT 1) " +
+                    "DELETE FROM " + collection + " USING target " +
+                    "WHERE " + collection + ".id = target.id " +
+                    "RETURNING " + collection + ".id, " + collection + ".data, " +
+                    collection + ".created_at, " + collection + ".updated_at";
+
+                ApplyFilterParams(cmd, filter);
+                cmd.CommandText = sql;
+
+                using (var reader = cmd.ExecuteReader())
+                {
+                    if (reader.Read())
+                        return ReadRow(reader);
+                    return null;
+                }
+            }
+        }
+
+        public static List<string> DocDistinct(DbConnection conn, string collection, string field,
+            string filterJson = null)
+        {
+            ValidateIdentifier(collection);
+            var fieldExpr = FieldPath(field);
+            var filter = BuildFilter(filterJson);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                var sql = "SELECT DISTINCT " + fieldExpr + " FROM " + collection;
+                var whereParts = new List<string> { fieldExpr + " IS NOT NULL" };
+
+                if (!string.IsNullOrEmpty(filter.WhereClause))
+                {
+                    whereParts.Add(filter.WhereClause);
+                    ApplyFilterParams(cmd, filter);
+                }
+
+                sql += " WHERE " + string.Join(" AND ", whereParts);
+                cmd.CommandText = sql;
+
+                var results = new List<string>();
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        results.Add(reader.IsDBNull(0) ? null : reader.GetValue(0).ToString());
+                    }
+                }
+                return results;
             }
         }
 
@@ -2236,15 +2339,27 @@ namespace GoldLapel
             "$gt", "$gte", "$lt", "$lte", "$eq", "$ne", "$in", "$nin", "$exists", "$regex"
         };
 
+        private static readonly HashSet<string> LogicalOps = new HashSet<string>
+        {
+            "$or", "$and", "$not"
+        };
+
+        private static readonly HashSet<string> UpdateOps = new HashSet<string>
+        {
+            "$set", "$unset", "$inc", "$mul", "$rename", "$push", "$pull", "$addToSet"
+        };
+
         internal class FilterResult
         {
             public string WhereClause { get; }
             public List<object> Params { get; }
+            public int ParamOffset { get; }
 
-            public FilterResult(string whereClause, List<object> parameters)
+            public FilterResult(string whereClause, List<object> parameters, int paramOffset = 0)
             {
                 WhereClause = whereClause;
                 Params = parameters;
+                ParamOffset = paramOffset;
             }
         }
 
@@ -2266,10 +2381,299 @@ namespace GoldLapel
             return sb.ToString();
         }
 
+        internal static string FieldPathJson(string key)
+        {
+            var parts = key.Split('.');
+            foreach (var part in parts)
+            {
+                if (!FieldPartPattern.IsMatch(part))
+                    throw new ArgumentException("Invalid field key: " + key);
+            }
+            var sb = new System.Text.StringBuilder("data");
+            for (int i = 0; i < parts.Length; i++)
+                sb.Append("->'").Append(parts[i]).Append("'");
+            return sb.ToString();
+        }
+
+        internal static string JsonbPath(string key)
+        {
+            var parts = key.Split('.');
+            foreach (var part in parts)
+            {
+                if (!FieldPartPattern.IsMatch(part))
+                    throw new ArgumentException("Invalid field key: " + key);
+            }
+            return "{" + string.Join(",", parts) + "}";
+        }
+
+        internal static string ToJsonbExpr(string value, ref int paramIdx)
+        {
+            var trimmed = value.Trim();
+            var pName = "@p" + paramIdx++;
+            if (trimmed == "true" || trimmed == "false")
+                return "to_jsonb(" + pName + "::boolean)";
+            if (IsNumericLiteral(trimmed))
+                return "to_jsonb(" + pName + "::numeric)";
+            if (trimmed.StartsWith("\"") && trimmed.EndsWith("\""))
+                return "to_jsonb(" + pName + "::text)";
+            // JSON object or array
+            return pName + "::jsonb";
+        }
+
+        internal static object ToJsonbValue(string value)
+        {
+            var trimmed = value.Trim();
+            if (trimmed == "true") return true;
+            if (trimmed == "false") return false;
+            if (IsNumericLiteral(trimmed))
+                return double.Parse(trimmed, CultureInfo.InvariantCulture);
+            if (trimmed.StartsWith("\"") && trimmed.EndsWith("\""))
+                return Unquote(trimmed);
+            return trimmed; // raw JSON
+        }
+
+        internal class UpdateResult
+        {
+            public string Expression { get; }
+            public List<object> Params { get; }
+
+            public UpdateResult(string expression, List<object> parameters)
+            {
+                Expression = expression;
+                Params = parameters;
+            }
+        }
+
+        internal static UpdateResult BuildUpdate(string updateJson)
+        {
+            int paramIdx = 0;
+            return BuildUpdate(updateJson, ref paramIdx);
+        }
+
+        internal static UpdateResult BuildUpdate(string updateJson, ref int paramIdx)
+        {
+            if (string.IsNullOrWhiteSpace(updateJson))
+                throw new ArgumentException("Update must be a JSON object");
+
+            var s = updateJson.Trim();
+            if (!s.StartsWith("{") || !s.EndsWith("}"))
+                throw new ArgumentException("Update must be a JSON object");
+
+            var body = s.Substring(1, s.Length - 2).Trim();
+            if (body.Length == 0)
+                throw new ArgumentException("Update must be a non-empty JSON object");
+
+            var pairs = SplitKeyValuePairs(body);
+
+            // Check if any top-level key starts with $
+            bool hasOps = false;
+            foreach (var kv in pairs)
+            {
+                var key = kv[0].Trim().Trim('"');
+                if (key.StartsWith("$")) { hasOps = true; break; }
+            }
+
+            if (!hasOps)
+            {
+                // Plain merge update: data || @pN::jsonb
+                var pName = "@p" + paramIdx++;
+                return new UpdateResult("data || " + pName + "::jsonb", new List<object> { s });
+            }
+
+            var expr = "data";
+            var allParams = new List<object>();
+
+            foreach (var kv in pairs)
+            {
+                var op = kv[0].Trim().Trim('"');
+                var val = kv[1].Trim();
+
+                if (op == "$set")
+                {
+                    var pName = "@p" + paramIdx++;
+                    expr = "(" + expr + " || " + pName + "::jsonb)";
+                    allParams.Add(val);
+                }
+                else if (op == "$unset")
+                {
+                    var unsetBody = val.Substring(1, val.Length - 2).Trim();
+                    var unsetPairs = SplitKeyValuePairs(unsetBody);
+                    foreach (var up in unsetPairs)
+                    {
+                        var field = up[0].Trim().Trim('"');
+                        var parts = field.Split('.');
+                        foreach (var part in parts)
+                        {
+                            if (!FieldPartPattern.IsMatch(part))
+                                throw new ArgumentException("Invalid field key: " + field);
+                        }
+                        if (parts.Length == 1)
+                        {
+                            var pName = "@p" + paramIdx++;
+                            expr = "(" + expr + " - " + pName + ")";
+                            allParams.Add(field);
+                        }
+                        else
+                        {
+                            var path = "{" + string.Join(",", parts) + "}";
+                            var pName = "@p" + paramIdx++;
+                            expr = "(" + expr + " #- " + pName + "::text[])";
+                            allParams.Add(path);
+                        }
+                    }
+                }
+                else if (op == "$inc")
+                {
+                    var incBody = val.Substring(1, val.Length - 2).Trim();
+                    var incPairs = SplitKeyValuePairs(incBody);
+                    foreach (var ip in incPairs)
+                    {
+                        var field = ip[0].Trim().Trim('"');
+                        var amount = ip[1].Trim();
+                        var jp = JsonbPath(field);
+                        var fp = FieldPath(field);
+                        var pJp = "@p" + paramIdx++;
+                        var pAmt = "@p" + paramIdx++;
+                        expr = "jsonb_set(" + expr + ", " + pJp + "::text[], to_jsonb(COALESCE((" + fp + ")::numeric, 0) + " + pAmt + "))";
+                        allParams.Add(jp);
+                        allParams.Add(double.Parse(amount, CultureInfo.InvariantCulture));
+                    }
+                }
+                else if (op == "$mul")
+                {
+                    var mulBody = val.Substring(1, val.Length - 2).Trim();
+                    var mulPairs = SplitKeyValuePairs(mulBody);
+                    foreach (var mp in mulPairs)
+                    {
+                        var field = mp[0].Trim().Trim('"');
+                        var factor = mp[1].Trim();
+                        var jp = JsonbPath(field);
+                        var fp = FieldPath(field);
+                        var pJp = "@p" + paramIdx++;
+                        var pFact = "@p" + paramIdx++;
+                        expr = "jsonb_set(" + expr + ", " + pJp + "::text[], to_jsonb(COALESCE((" + fp + ")::numeric, 0) * " + pFact + "))";
+                        allParams.Add(jp);
+                        allParams.Add(double.Parse(factor, CultureInfo.InvariantCulture));
+                    }
+                }
+                else if (op == "$rename")
+                {
+                    var renBody = val.Substring(1, val.Length - 2).Trim();
+                    var renPairs = SplitKeyValuePairs(renBody);
+                    foreach (var rp in renPairs)
+                    {
+                        var oldName = rp[0].Trim().Trim('"');
+                        var newName = Unquote(rp[1].Trim());
+                        foreach (var part in oldName.Split('.'))
+                        {
+                            if (!FieldPartPattern.IsMatch(part))
+                                throw new ArgumentException("Invalid field key: " + oldName);
+                        }
+                        foreach (var part in newName.Split('.'))
+                        {
+                            if (!FieldPartPattern.IsMatch(part))
+                                throw new ArgumentException("Invalid field key: " + newName);
+                        }
+                        var oldJson = FieldPathJson(oldName);
+                        var newJp = JsonbPath(newName);
+                        if (oldName.Contains("."))
+                        {
+                            var oldPath = "{" + string.Join(",", oldName.Split('.')) + "}";
+                            var pOld = "@p" + paramIdx++;
+                            var pNew = "@p" + paramIdx++;
+                            expr = "jsonb_set((" + expr + " #- " + pOld + "::text[]), " + pNew + "::text[], " + oldJson + ")";
+                            allParams.Add(oldPath);
+                            allParams.Add(newJp);
+                        }
+                        else
+                        {
+                            var pOld = "@p" + paramIdx++;
+                            var pNew = "@p" + paramIdx++;
+                            expr = "jsonb_set((" + expr + " - " + pOld + "), " + pNew + "::text[], " + oldJson + ")";
+                            allParams.Add(oldName);
+                            allParams.Add(newJp);
+                        }
+                    }
+                }
+                else if (op == "$push")
+                {
+                    var pushBody = val.Substring(1, val.Length - 2).Trim();
+                    var pushPairs = SplitKeyValuePairs(pushBody);
+                    foreach (var pp in pushPairs)
+                    {
+                        var field = pp[0].Trim().Trim('"');
+                        var pushVal = pp[1].Trim();
+                        var jp = JsonbPath(field);
+                        var fj = FieldPathJson(field);
+                        var pJp = "@p" + paramIdx++;
+                        var valExpr = ToJsonbExpr(pushVal, ref paramIdx);
+                        expr = "jsonb_set(" + expr + ", " + pJp + "::text[], COALESCE(" + fj + ", '[]'::jsonb) || " + valExpr + ")";
+                        allParams.Add(jp);
+                        allParams.Add(ToJsonbValue(pushVal));
+                    }
+                }
+                else if (op == "$pull")
+                {
+                    var pullBody = val.Substring(1, val.Length - 2).Trim();
+                    var pullPairs = SplitKeyValuePairs(pullBody);
+                    foreach (var pp in pullPairs)
+                    {
+                        var field = pp[0].Trim().Trim('"');
+                        var pullVal = pp[1].Trim();
+                        var jp = JsonbPath(field);
+                        var fj = FieldPathJson(field);
+                        var pJp = "@p" + paramIdx++;
+                        var valExpr = ToJsonbExpr(pullVal, ref paramIdx);
+                        expr = "jsonb_set(" + expr + ", " + pJp + "::text[], " +
+                            "COALESCE((SELECT jsonb_agg(elem) FROM jsonb_array_elements(" + fj + ") AS elem " +
+                            "WHERE elem != " + valExpr + "), '[]'::jsonb))";
+                        allParams.Add(jp);
+                        allParams.Add(ToJsonbValue(pullVal));
+                    }
+                }
+                else if (op == "$addToSet")
+                {
+                    var atsBody = val.Substring(1, val.Length - 2).Trim();
+                    var atsPairs = SplitKeyValuePairs(atsBody);
+                    foreach (var ap in atsPairs)
+                    {
+                        var field = ap[0].Trim().Trim('"');
+                        var atsVal = ap[1].Trim();
+                        var jp = JsonbPath(field);
+                        var fj = FieldPathJson(field);
+                        var pJp = "@p" + paramIdx++;
+                        // $addToSet uses the value param 3 times in the expression
+                        // but we need separate param names for each usage
+                        var valExpr1 = ToJsonbExpr(atsVal, ref paramIdx);
+                        var valExpr2 = ToJsonbExpr(atsVal, ref paramIdx);
+                        var valExpr3 = ToJsonbExpr(atsVal, ref paramIdx);
+                        expr = "jsonb_set(" + expr + ", " + pJp + "::text[], " +
+                            "CASE WHEN COALESCE(" + fj + ", '[]'::jsonb) @> " + valExpr1 + " " +
+                            "THEN " + fj + " " +
+                            "ELSE COALESCE(" + fj + ", '[]'::jsonb) || " + valExpr2 + " END)";
+                        allParams.Add(jp);
+                        var v = ToJsonbValue(atsVal);
+                        allParams.Add(v);
+                        allParams.Add(v);
+                        allParams.Add(v);
+                    }
+                }
+            }
+
+            return new UpdateResult(expr, allParams);
+        }
+
         internal static FilterResult BuildFilter(string filterJson)
         {
+            int paramIdx = 0;
+            return BuildFilter(filterJson, ref paramIdx);
+        }
+
+        internal static FilterResult BuildFilter(string filterJson, ref int paramIdx)
+        {
+            int startIdx = paramIdx;
             if (string.IsNullOrWhiteSpace(filterJson))
-                return new FilterResult("", new List<object>());
+                return new FilterResult("", new List<object>(), startIdx);
 
             var s = filterJson.Trim();
             if (!s.StartsWith("{") || !s.EndsWith("}"))
@@ -2277,22 +2681,29 @@ namespace GoldLapel
 
             var body = s.Substring(1, s.Length - 2).Trim();
             if (body.Length == 0)
-                return new FilterResult("", new List<object>());
+                return new FilterResult("", new List<object>(), startIdx);
 
             var pairs = SplitKeyValuePairs(body);
 
-            // Fast path: no operator keys => pure containment
-            bool hasOperators = false;
+            // Check for logical operators ($or, $and, $not) and field operators
+            bool hasLogicalOps = false;
+            bool hasFieldOperators = false;
             foreach (var kv in pairs)
             {
+                var key = kv[0].Trim().Trim('"');
+                if (LogicalOps.Contains(key))
+                {
+                    hasLogicalOps = true;
+                }
                 var val = kv[1].Trim();
                 if (val.StartsWith("{") && HasOperatorKeys(val))
                 {
-                    hasOperators = true;
-                    break;
+                    hasFieldOperators = true;
                 }
             }
-            if (!hasOperators)
+
+            // Fast path: no operator keys and no logical ops => pure containment
+            if (!hasFieldOperators && !hasLogicalOps)
             {
                 var parms = new List<object>();
                 bool hasDot = false;
@@ -2301,6 +2712,7 @@ namespace GoldLapel
                     var key = kv[0].Trim().Trim('"');
                     if (key.Contains(".")) { hasDot = true; break; }
                 }
+                var pName = "@p" + paramIdx++;
                 if (hasDot)
                 {
                     var flat = new Dictionary<string, string>();
@@ -2312,29 +2724,29 @@ namespace GoldLapel
                 {
                     parms.Add(s);
                 }
-                return new FilterResult("data @> @p0::jsonb", parms);
+                return new FilterResult("data @> " + pName + "::jsonb", parms, startIdx);
             }
 
             var containment = new Dictionary<string, string>();
             var allClauses = new List<string>();
             var allParams = new List<object>();
-            int paramIdx = 0;
 
-            // First pass: separate containment keys from operator keys
+            // Separate containment keys from operator/logical keys
             var operatorKeys = new List<string[]>();
+            var logicalKeys = new List<string[]>();
             foreach (var kv in pairs)
             {
+                var key = kv[0].Trim().Trim('"');
                 var val = kv[1].Trim();
-                if (val.StartsWith("{") && HasOperatorKeys(val))
+                if (LogicalOps.Contains(key))
+                    logicalKeys.Add(kv);
+                else if (val.StartsWith("{") && HasOperatorKeys(val))
                     operatorKeys.Add(kv);
                 else
-                {
-                    var key = kv[0].Trim().Trim('"');
                     containment[key] = val;
-                }
             }
 
-            // Containment clause first (so param ordering matches clause ordering)
+            // Containment clause first
             if (containment.Count > 0)
             {
                 var pName = "@p" + paramIdx++;
@@ -2387,7 +2799,6 @@ namespace GoldLapel
                         {
                             if (op == "$in")
                                 allClauses.Add("FALSE");
-                            // $nin with empty array matches everything
                         }
                         else
                         {
@@ -2424,9 +2835,50 @@ namespace GoldLapel
                 }
             }
 
+            // Logical operator clauses
+            foreach (var kv in logicalKeys)
+            {
+                var key = kv[0].Trim().Trim('"');
+                var val = kv[1].Trim();
+
+                if (key == "$not")
+                {
+                    if (!val.StartsWith("{") || !val.EndsWith("}"))
+                        throw new ArgumentException("$not value must be a filter object");
+                    var subResult = BuildFilter(val, ref paramIdx);
+                    if (!string.IsNullOrEmpty(subResult.WhereClause))
+                    {
+                        allClauses.Add("NOT (" + subResult.WhereClause + ")");
+                        allParams.AddRange(subResult.Params);
+                    }
+                }
+                else if (key == "$or" || key == "$and")
+                {
+                    if (!val.StartsWith("[") || !val.EndsWith("]"))
+                        throw new ArgumentException(key + " value must be a non-empty array");
+                    var elements = ParseJsonArray(val);
+                    if (elements.Count == 0)
+                        throw new ArgumentException(key + " value must be a non-empty array");
+
+                    var joiner = key == "$or" ? " OR " : " AND ";
+                    var subClauses = new List<string>();
+                    foreach (var elem in elements)
+                    {
+                        var subResult = BuildFilter(elem.Trim(), ref paramIdx);
+                        if (!string.IsNullOrEmpty(subResult.WhereClause))
+                        {
+                            subClauses.Add(subResult.WhereClause);
+                            allParams.AddRange(subResult.Params);
+                        }
+                    }
+                    if (subClauses.Count > 0)
+                        allClauses.Add("(" + string.Join(joiner, subClauses) + ")");
+                }
+            }
+
             if (allClauses.Count == 0)
-                return new FilterResult("", allParams);
-            return new FilterResult(string.Join(" AND ", allClauses), allParams);
+                return new FilterResult("", allParams, startIdx);
+            return new FilterResult(string.Join(" AND ", allClauses), allParams, startIdx);
         }
 
         private static bool HasOperatorKeys(string objStr)
@@ -2569,7 +3021,15 @@ namespace GoldLapel
         {
             for (int i = 0; i < filter.Params.Count; i++)
             {
-                AddParameter(cmd, "@p" + i, filter.Params[i]);
+                AddParameter(cmd, "@p" + (filter.ParamOffset + i), filter.Params[i]);
+            }
+        }
+
+        private static void ApplyUpdateParams(DbCommand cmd, UpdateResult update, int startIdx)
+        {
+            for (int i = 0; i < update.Params.Count; i++)
+            {
+                AddParameter(cmd, "@p" + (startIdx + i), update.Params[i]);
             }
         }
 
