@@ -1371,6 +1371,109 @@ namespace GoldLapel
             }
         }
 
+        public static IEnumerable<Dictionary<string, object>> DocFindCursor(DbConnection conn, string collection,
+            string filterJson = null, string sortJson = null, int? limit = null, int? skip = null, int batchSize = 100)
+        {
+            ValidateIdentifier(collection);
+            var filter = BuildFilter(filterJson);
+
+            var sql = "SELECT id, data, created_at, updated_at FROM " + collection;
+            var filterParams = new List<KeyValuePair<string, object>>();
+
+            if (!string.IsNullOrEmpty(filter.WhereClause))
+            {
+                sql += " WHERE " + filter.WhereClause;
+                for (int i = 0; i < filter.Params.Count; i++)
+                    filterParams.Add(new KeyValuePair<string, object>("@p" + (filter.ParamOffset + i), filter.Params[i]));
+            }
+
+            if (!string.IsNullOrEmpty(sortJson))
+            {
+                var sortClause = ParseDataSortClause(sortJson);
+                if (sortClause != null)
+                    sql += " ORDER BY " + sortClause;
+            }
+
+            if (limit.HasValue)
+            {
+                sql += " LIMIT @limit";
+                filterParams.Add(new KeyValuePair<string, object>("@limit", limit.Value));
+            }
+
+            if (skip.HasValue)
+            {
+                sql += " OFFSET @skip";
+                filterParams.Add(new KeyValuePair<string, object>("@skip", skip.Value));
+            }
+
+            var cursorName = "gl_cursor_" + Guid.NewGuid().ToString("N").Substring(0, 8);
+
+            // BEGIN transaction
+            using (var beginCmd = conn.CreateCommand())
+            {
+                beginCmd.CommandText = "BEGIN";
+                beginCmd.ExecuteNonQuery();
+            }
+
+            try
+            {
+                // DECLARE CURSOR
+                using (var declareCmd = conn.CreateCommand())
+                {
+                    declareCmd.CommandText = "DECLARE " + cursorName + " CURSOR FOR " + sql;
+                    foreach (var p in filterParams)
+                        AddParameter(declareCmd, p.Key, p.Value);
+                    declareCmd.ExecuteNonQuery();
+                }
+
+                // FETCH in batches
+                while (true)
+                {
+                    var batch = new List<Dictionary<string, object>>();
+                    using (var fetchCmd = conn.CreateCommand())
+                    {
+                        fetchCmd.CommandText = "FETCH " + batchSize + " FROM " + cursorName;
+                        using (var reader = fetchCmd.ExecuteReader())
+                        {
+                            while (reader.Read())
+                            {
+                                batch.Add(ReadRow(reader));
+                            }
+                        }
+                    }
+
+                    if (batch.Count == 0)
+                        break;
+
+                    foreach (var row in batch)
+                        yield return row;
+                }
+            }
+            finally
+            {
+                // CLOSE cursor and COMMIT
+                try
+                {
+                    using (var closeCmd = conn.CreateCommand())
+                    {
+                        closeCmd.CommandText = "CLOSE " + cursorName;
+                        closeCmd.ExecuteNonQuery();
+                    }
+                }
+                catch { }
+
+                try
+                {
+                    using (var commitCmd = conn.CreateCommand())
+                    {
+                        commitCmd.CommandText = "COMMIT";
+                        commitCmd.ExecuteNonQuery();
+                    }
+                }
+                catch { }
+            }
+        }
+
         public static Dictionary<string, object> DocFindOne(DbConnection conn, string collection, string filterJson = null)
         {
             ValidateIdentifier(collection);
@@ -2336,7 +2439,8 @@ namespace GoldLapel
 
         private static readonly HashSet<string> SupportedFilterOps = new HashSet<string>
         {
-            "$gt", "$gte", "$lt", "$lte", "$eq", "$ne", "$in", "$nin", "$exists", "$regex"
+            "$gt", "$gte", "$lt", "$lte", "$eq", "$ne", "$in", "$nin", "$exists", "$regex",
+            "$elemMatch", "$text"
         };
 
         private static readonly HashSet<string> LogicalOps = new HashSet<string>
@@ -2682,15 +2786,20 @@ namespace GoldLapel
 
             var pairs = SplitKeyValuePairs(body);
 
-            // Check for logical operators ($or, $and, $not) and field operators
+            // Check for logical operators ($or, $and, $not), $text, and field operators
             bool hasLogicalOps = false;
             bool hasFieldOperators = false;
+            bool hasTopLevelText = false;
             foreach (var kv in pairs)
             {
                 var key = kv[0].Trim().Trim('"');
                 if (LogicalOps.Contains(key))
                 {
                     hasLogicalOps = true;
+                }
+                else if (key == "$text")
+                {
+                    hasTopLevelText = true;
                 }
                 var val = kv[1].Trim();
                 if (val.StartsWith("{") && HasOperatorKeys(val))
@@ -2699,8 +2808,8 @@ namespace GoldLapel
                 }
             }
 
-            // Fast path: no operator keys and no logical ops => pure containment
-            if (!hasFieldOperators && !hasLogicalOps)
+            // Fast path: no operator keys, no logical ops, no $text => pure containment
+            if (!hasFieldOperators && !hasLogicalOps && !hasTopLevelText)
             {
                 var parms = new List<object>();
                 bool hasDot = false;
@@ -2728,15 +2837,18 @@ namespace GoldLapel
             var allClauses = new List<string>();
             var allParams = new List<object>();
 
-            // Separate containment keys from operator/logical keys
+            // Separate containment keys from operator/logical/$text keys
             var operatorKeys = new List<string[]>();
             var logicalKeys = new List<string[]>();
+            var textKeys = new List<string[]>();
             foreach (var kv in pairs)
             {
                 var key = kv[0].Trim().Trim('"');
                 var val = kv[1].Trim();
                 if (LogicalOps.Contains(key))
                     logicalKeys.Add(kv);
+                else if (key == "$text")
+                    textKeys.Add(kv);
                 else if (val.StartsWith("{") && HasOperatorKeys(val))
                     operatorKeys.Add(kv);
                 else
@@ -2829,6 +2941,76 @@ namespace GoldLapel
                         allClauses.Add(fieldExpr + " ~ " + pName);
                         allParams.Add(pattern);
                     }
+                    else if (op == "$elemMatch")
+                    {
+                        if (!operand.StartsWith("{") || !operand.EndsWith("}"))
+                            throw new ArgumentException("$elemMatch value must be an object");
+                        var fieldJson = FieldPathJson(key);
+                        var elemBody = operand.Substring(1, operand.Length - 2).Trim();
+                        var subPairs = SplitKeyValuePairs(elemBody);
+                        var elemClauses = new List<string>();
+                        foreach (var sp in subPairs)
+                        {
+                            var subOp = sp[0].Trim().Trim('"');
+                            var subVal = sp[1].Trim();
+                            if (ComparisonOps.ContainsKey(subOp))
+                            {
+                                var sqlOp = ComparisonOps[subOp];
+                                var pName = "@p" + paramIdx++;
+                                if (IsNumericLiteral(subVal))
+                                {
+                                    elemClauses.Add("(elem#>>'{}')::numeric " + sqlOp + " " + pName);
+                                    allParams.Add(double.Parse(subVal, CultureInfo.InvariantCulture));
+                                }
+                                else
+                                {
+                                    elemClauses.Add("elem#>>'{}' " + sqlOp + " " + pName);
+                                    allParams.Add(Unquote(subVal));
+                                }
+                            }
+                            else if (subOp == "$regex")
+                            {
+                                var pName = "@p" + paramIdx++;
+                                elemClauses.Add("elem#>>'{}' ~ " + pName);
+                                allParams.Add(Unquote(subVal));
+                            }
+                            else
+                            {
+                                throw new ArgumentException("Unsupported $elemMatch operator: " + subOp);
+                            }
+                        }
+                        if (elemClauses.Count > 0)
+                        {
+                            allClauses.Add(
+                                "EXISTS (SELECT 1 FROM jsonb_array_elements(" + fieldJson +
+                                ") AS elem WHERE " + string.Join(" AND ", elemClauses) + ")");
+                        }
+                    }
+                    else if (op == "$text")
+                    {
+                        if (!operand.StartsWith("{") || !operand.EndsWith("}"))
+                            throw new ArgumentException("$text requires {$search: 'query'}");
+                        var textBody = operand.Substring(1, operand.Length - 2).Trim();
+                        var textPairs = SplitKeyValuePairs(textBody);
+                        string searchVal = null;
+                        string langVal = "english";
+                        foreach (var tp in textPairs)
+                        {
+                            var tk = tp[0].Trim().Trim('"');
+                            var tv = tp[1].Trim();
+                            if (tk == "$search") searchVal = Unquote(tv);
+                            else if (tk == "$language") langVal = Unquote(tv);
+                        }
+                        if (searchVal == null)
+                            throw new ArgumentException("$text requires {$search: 'query'}");
+                        var pLang = "@p" + paramIdx++;
+                        var pLang2 = "@p" + paramIdx++;
+                        var pSearch = "@p" + paramIdx++;
+                        allClauses.Add("to_tsvector(" + pLang + ", " + fieldExpr + ") @@ plainto_tsquery(" + pLang2 + ", " + pSearch + ")");
+                        allParams.Add(langVal);
+                        allParams.Add(langVal);
+                        allParams.Add(searchVal);
+                    }
                 }
             }
 
@@ -2871,6 +3053,34 @@ namespace GoldLapel
                     if (subClauses.Count > 0)
                         allClauses.Add("(" + string.Join(joiner, subClauses) + ")");
                 }
+            }
+
+            // Top-level $text clauses
+            foreach (var kv in textKeys)
+            {
+                var val = kv[1].Trim();
+                if (!val.StartsWith("{") || !val.EndsWith("}"))
+                    throw new ArgumentException("$text requires {$search: 'query'}");
+                var textBody = val.Substring(1, val.Length - 2).Trim();
+                var textPairs = SplitKeyValuePairs(textBody);
+                string searchVal = null;
+                string langVal = "english";
+                foreach (var tp in textPairs)
+                {
+                    var tk = tp[0].Trim().Trim('"');
+                    var tv = tp[1].Trim();
+                    if (tk == "$search") searchVal = Unquote(tv);
+                    else if (tk == "$language") langVal = Unquote(tv);
+                }
+                if (searchVal == null)
+                    throw new ArgumentException("$text requires {$search: 'query'}");
+                var pLang = "@p" + paramIdx++;
+                var pLang2 = "@p" + paramIdx++;
+                var pSearch = "@p" + paramIdx++;
+                allClauses.Add("to_tsvector(" + pLang + ", data::text) @@ plainto_tsquery(" + pLang2 + ", " + pSearch + ")");
+                allParams.Add(langVal);
+                allParams.Add(langVal);
+                allParams.Add(searchVal);
             }
 
             if (allClauses.Count == 0)

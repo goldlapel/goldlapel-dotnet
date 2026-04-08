@@ -86,6 +86,18 @@ namespace GoldLapel.Tests
         }
 
         [Fact]
+        public void DocFindCursorDelegates()
+        {
+            // Exhaust the enumerator so SQL is actually issued
+            foreach (var _ in _gl.DocFindCursor("users")) { }
+
+            var sqls = _spy.Commands.Select(c => c.CommandText).ToList();
+            Assert.Equal("BEGIN", sqls[0]);
+            Assert.Contains("CURSOR FOR", sqls[1]);
+            Assert.Contains("SELECT id, data, created_at, updated_at FROM users", sqls[1]);
+        }
+
+        [Fact]
         public void DocFindOneDelegates()
         {
             _gl.DocFindOne("users", filterJson: "{\"id\":1}");

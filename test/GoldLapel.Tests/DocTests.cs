@@ -1845,4 +1845,272 @@ namespace GoldLapel.Tests
             Assert.Throws<ArgumentException>(() => Utils.JsonbPath("bad;key"));
         }
     }
+
+    // ── $elemMatch ──────────────────────────────────────────────
+
+    public class ElemMatchTest
+    {
+        [Fact]
+        public void NumericRange()
+        {
+            var r = Utils.BuildFilter("{\"scores\": {\"$elemMatch\": {\"$gt\": 80, \"$lt\": 90}}}");
+            Assert.Contains("EXISTS", r.WhereClause);
+            Assert.Contains("jsonb_array_elements", r.WhereClause);
+            Assert.Contains("elem#>>'{}'", r.WhereClause);
+            Assert.Contains("::numeric", r.WhereClause);
+            Assert.Contains(80.0, r.Params);
+            Assert.Contains(90.0, r.Params);
+        }
+
+        [Fact]
+        public void StringRegex()
+        {
+            var r = Utils.BuildFilter("{\"tags\": {\"$elemMatch\": {\"$regex\": \"^py\"}}}");
+            Assert.Contains("EXISTS", r.WhereClause);
+            Assert.Contains("elem#>>'{}' ~ @p0", r.WhereClause);
+            Assert.Single(r.Params);
+            Assert.Equal("^py", r.Params[0]);
+        }
+
+        [Fact]
+        public void SingleCondition()
+        {
+            var r = Utils.BuildFilter("{\"scores\": {\"$elemMatch\": {\"$eq\": 100}}}");
+            Assert.Contains("EXISTS", r.WhereClause);
+            Assert.Contains("elem#>>'{}'", r.WhereClause);
+            Assert.Single(r.Params);
+            Assert.Equal(100.0, r.Params[0]);
+        }
+
+        [Fact]
+        public void InvalidOperandThrows()
+        {
+            Assert.Throws<ArgumentException>(() =>
+                Utils.BuildFilter("{\"scores\": {\"$elemMatch\": [1, 2]}}"));
+        }
+
+        [Fact]
+        public void UnsupportedSubOpThrows()
+        {
+            Assert.Throws<ArgumentException>(() =>
+                Utils.BuildFilter("{\"scores\": {\"$elemMatch\": {\"$foo\": 1}}}"));
+        }
+
+        [Fact]
+        public void InDocFind()
+        {
+            var conn = new SpyConnection();
+            Utils.DocFind(conn, "users",
+                filterJson: "{\"scores\": {\"$elemMatch\": {\"$gt\": 80}}}");
+            var sql = conn.LastCommandText;
+            Assert.Contains("EXISTS", sql);
+            Assert.Contains("jsonb_array_elements", sql);
+        }
+
+        [Fact]
+        public void UsesFieldPathJson()
+        {
+            var r = Utils.BuildFilter("{\"data_arr\": {\"$elemMatch\": {\"$gt\": 5}}}");
+            Assert.Contains("data->'data_arr'", r.WhereClause);
+        }
+
+        [Fact]
+        public void ParamIdxThreading()
+        {
+            // Two conditions: $gt and $lt produce 2 params at @p0 and @p1
+            var r = Utils.BuildFilter("{\"scores\": {\"$elemMatch\": {\"$gt\": 10, \"$lt\": 20}}}");
+            Assert.Equal(2, r.Params.Count);
+            Assert.Equal(10.0, r.Params[0]);
+            Assert.Equal(20.0, r.Params[1]);
+            Assert.Contains("@p0", r.WhereClause);
+            Assert.Contains("@p1", r.WhereClause);
+        }
+    }
+
+    // ── $text in filters ────────────────────────────────────────
+
+    public class TextFilterTest
+    {
+        [Fact]
+        public void TopLevel()
+        {
+            var r = Utils.BuildFilter("{\"$text\": {\"$search\": \"hello world\"}}");
+            Assert.Contains("to_tsvector", r.WhereClause);
+            Assert.Contains("plainto_tsquery", r.WhereClause);
+            Assert.Contains("data::text", r.WhereClause);
+            Assert.Equal(3, r.Params.Count);
+            Assert.Equal("english", r.Params[0]);
+            Assert.Equal("english", r.Params[1]);
+            Assert.Equal("hello world", r.Params[2]);
+        }
+
+        [Fact]
+        public void FieldLevel()
+        {
+            var r = Utils.BuildFilter("{\"content\": {\"$text\": {\"$search\": \"hello\"}}}");
+            Assert.Contains("to_tsvector", r.WhereClause);
+            Assert.Contains("plainto_tsquery", r.WhereClause);
+            Assert.Contains("data->>'content'", r.WhereClause);
+            Assert.Equal(3, r.Params.Count);
+            Assert.Equal("english", r.Params[0]);
+            Assert.Equal("english", r.Params[1]);
+            Assert.Equal("hello", r.Params[2]);
+        }
+
+        [Fact]
+        public void CustomLanguage()
+        {
+            var r = Utils.BuildFilter("{\"$text\": {\"$search\": \"bonjour\", \"$language\": \"french\"}}");
+            Assert.Contains("to_tsvector", r.WhereClause);
+            Assert.Equal(3, r.Params.Count);
+            Assert.Equal("french", r.Params[0]);
+            Assert.Equal("french", r.Params[1]);
+            Assert.Equal("bonjour", r.Params[2]);
+        }
+
+        [Fact]
+        public void MissingSearchThrows()
+        {
+            Assert.Throws<ArgumentException>(() =>
+                Utils.BuildFilter("{\"$text\": {\"$language\": \"english\"}}"));
+        }
+
+        [Fact]
+        public void NonDictThrows()
+        {
+            Assert.Throws<ArgumentException>(() =>
+                Utils.BuildFilter("{\"$text\": \"hello\"}"));
+        }
+
+        [Fact]
+        public void FieldLevelMissingSearchThrows()
+        {
+            Assert.Throws<ArgumentException>(() =>
+                Utils.BuildFilter("{\"content\": {\"$text\": {\"$language\": \"english\"}}}"));
+        }
+
+        [Fact]
+        public void InDocFind()
+        {
+            var conn = new SpyConnection();
+            Utils.DocFind(conn, "users",
+                filterJson: "{\"$text\": {\"$search\": \"hello\"}}");
+            var sql = conn.LastCommandText;
+            Assert.Contains("to_tsvector", sql);
+            Assert.Contains("@@", sql);
+        }
+
+        [Fact]
+        public void InDocCount()
+        {
+            var conn = new SpyConnection();
+            conn.NextScalarResult = 3L;
+            Utils.DocCount(conn, "users",
+                filterJson: "{\"bio\": {\"$text\": {\"$search\": \"python\"}}}");
+            var sql = conn.LastCommandText;
+            Assert.Contains("to_tsvector", sql);
+        }
+
+        [Fact]
+        public void FieldLevelCustomLanguage()
+        {
+            var r = Utils.BuildFilter("{\"bio\": {\"$text\": {\"$search\": \"hola\", \"$language\": \"spanish\"}}}");
+            Assert.Contains("data->>'bio'", r.WhereClause);
+            Assert.Equal("spanish", r.Params[0]);
+            Assert.Equal("spanish", r.Params[1]);
+            Assert.Equal("hola", r.Params[2]);
+        }
+    }
+
+    // ── DocFindCursor ───────────────────────────────────────────
+
+    public class DocFindCursorTest
+    {
+        [Fact]
+        public void IssuesBeginDeclareFetchCommit()
+        {
+            var conn = new SpyConnection();
+            // Default FakeDataReader returns false from Read() — empty result set
+            var results = new List<Dictionary<string, object>>();
+            foreach (var row in Utils.DocFindCursor(conn, "users"))
+                results.Add(row);
+
+            Assert.Empty(results);
+            // Commands: BEGIN, DECLARE, FETCH, CLOSE, COMMIT
+            var sqls = conn.Commands.Select(c => c.CommandText).ToList();
+            Assert.Equal("BEGIN", sqls[0]);
+            Assert.Contains("DECLARE", sqls[1]);
+            Assert.Contains("CURSOR FOR", sqls[1]);
+            Assert.Contains("SELECT id, data, created_at, updated_at FROM users", sqls[1]);
+            Assert.Contains("FETCH", sqls[2]);
+            Assert.Contains("CLOSE", sqls[3]);
+            Assert.Equal("COMMIT", sqls[4]);
+        }
+
+        [Fact]
+        public void WithFilter()
+        {
+            var conn = new SpyConnection();
+            foreach (var _ in Utils.DocFindCursor(conn, "users",
+                filterJson: "{\"active\":true}")) { }
+
+            var declareSql = conn.Commands[1].CommandText;
+            Assert.Contains("WHERE data @> @p0::jsonb", declareSql);
+            Assert.Equal("{\"active\":true}", conn.Commands[1].ParamValue("@p0"));
+        }
+
+        [Fact]
+        public void WithSort()
+        {
+            var conn = new SpyConnection();
+            foreach (var _ in Utils.DocFindCursor(conn, "users",
+                sortJson: "{\"name\": 1}")) { }
+
+            var declareSql = conn.Commands[1].CommandText;
+            Assert.Contains("ORDER BY data->>'name' ASC", declareSql);
+        }
+
+        [Fact]
+        public void WithLimitAndSkip()
+        {
+            var conn = new SpyConnection();
+            foreach (var _ in Utils.DocFindCursor(conn, "users",
+                limit: 100, skip: 50)) { }
+
+            var declareSql = conn.Commands[1].CommandText;
+            Assert.Contains("LIMIT @limit", declareSql);
+            Assert.Contains("OFFSET @skip", declareSql);
+            Assert.Equal(100, conn.Commands[1].ParamValue("@limit"));
+            Assert.Equal(50, conn.Commands[1].ParamValue("@skip"));
+        }
+
+        [Fact]
+        public void BatchSizeInFetch()
+        {
+            var conn = new SpyConnection();
+            foreach (var _ in Utils.DocFindCursor(conn, "users",
+                batchSize: 50)) { }
+
+            var fetchSql = conn.Commands[2].CommandText;
+            Assert.Contains("FETCH 50", fetchSql);
+        }
+
+        [Fact]
+        public void InvalidCollectionThrows()
+        {
+            var conn = new SpyConnection();
+            Assert.Throws<ArgumentException>(() =>
+            {
+                foreach (var _ in Utils.DocFindCursor(conn, "bad; name")) { }
+            });
+        }
+
+        [Fact]
+        public void ReturnsEnumerable()
+        {
+            var conn = new SpyConnection();
+            var result = Utils.DocFindCursor(conn, "users");
+            Assert.IsAssignableFrom<IEnumerable<Dictionary<string, object>>>(result);
+        }
+    }
 }

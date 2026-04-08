@@ -309,6 +309,10 @@ namespace GoldLapel
             string filterJson = null, Dictionary<string, int> sort = null, int? limit = null, int? skip = null)
             => Utils.DocFind(Connection, collection, filterJson, sort, limit, skip);
 
+        public IEnumerable<Dictionary<string, object>> DocFindCursor(string collection,
+            string filterJson = null, string sortJson = null, int? limit = null, int? skip = null, int batchSize = 100)
+            => Utils.DocFindCursor(Connection, collection, filterJson, sortJson, limit, skip, batchSize);
+
         public Dictionary<string, object> DocFindOne(string collection, string filterJson = null)
             => Utils.DocFindOne(Connection, collection, filterJson);
 
