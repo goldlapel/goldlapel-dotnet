@@ -1103,4 +1103,87 @@ namespace GoldLapel.Tests
                 Utils.BuildFilter("{\"x\": {\"$unknown\": 1}}"));
         }
     }
+
+    // ── Dot-notation expansion in plain containment filters ────────
+
+    public class DotNotationExpansionTest
+    {
+        [Fact]
+        public void SingleDottedKeyExpandsToNestedObject()
+        {
+            var conn = new SpyConnection();
+            Utils.DocFind(conn, "users", filterJson: "{\"addr.city\": \"NY\"}");
+
+            var sql = conn.LastCommandText;
+            Assert.Contains("data @> @p0::jsonb", sql);
+            Assert.Equal("{\"addr\": {\"city\": \"NY\"}}", conn.LastCommand.ParamValue("@p0"));
+        }
+
+        [Fact]
+        public void MultiLevelDottedKeyExpandsToDeeplyNested()
+        {
+            var conn = new SpyConnection();
+            Utils.DocFind(conn, "users", filterJson: "{\"a.b.c\": 42}");
+
+            Assert.Equal("{\"a\": {\"b\": {\"c\": 42}}}", conn.LastCommand.ParamValue("@p0"));
+        }
+
+        [Fact]
+        public void NonDottedKeyPassesThroughUnchanged()
+        {
+            var conn = new SpyConnection();
+            Utils.DocFind(conn, "users", filterJson: "{\"status\": \"active\"}");
+
+            Assert.Equal("{\"status\": \"active\"}", conn.LastCommand.ParamValue("@p0"));
+        }
+
+        [Fact]
+        public void MixedDottedAndPlainKeys()
+        {
+            var conn = new SpyConnection();
+            Utils.DocFind(conn, "users", filterJson: "{\"addr.city\": \"NY\", \"active\": true}");
+
+            Assert.Equal("{\"addr\": {\"city\": \"NY\"}, \"active\": true}", conn.LastCommand.ParamValue("@p0"));
+        }
+
+        [Fact]
+        public void MultipleDottedKeysSharingPrefixMerge()
+        {
+            var conn = new SpyConnection();
+            Utils.DocFind(conn, "users", filterJson: "{\"addr.city\": \"NY\", \"addr.zip\": \"10001\"}");
+
+            Assert.Equal("{\"addr\": {\"city\": \"NY\", \"zip\": \"10001\"}}", conn.LastCommand.ParamValue("@p0"));
+        }
+
+        [Fact]
+        public void DotExpansionWorksInDocCount()
+        {
+            var conn = new SpyConnection();
+            conn.NextScalarResult = 3L;
+            Utils.DocCount(conn, "orders", filterJson: "{\"ship.country\": \"US\"}");
+
+            var sql = conn.LastCommandText;
+            Assert.Contains("data @> @p0::jsonb", sql);
+            Assert.Equal("{\"ship\": {\"country\": \"US\"}}", conn.LastCommand.ParamValue("@p0"));
+        }
+
+        [Fact]
+        public void DotExpansionWorksInDocUpdate()
+        {
+            var conn = new SpyConnection();
+            Utils.DocUpdate(conn, "users", "{\"profile.verified\": true}", "{\"level\":\"pro\"}");
+
+            Assert.Equal("{\"profile\": {\"verified\": true}}", conn.LastCommand.ParamValue("@p0"));
+            Assert.Equal("{\"level\":\"pro\"}", conn.LastCommand.ParamValue("@update"));
+        }
+
+        [Fact]
+        public void DotExpansionWorksInDocDelete()
+        {
+            var conn = new SpyConnection();
+            Utils.DocDelete(conn, "logs", "{\"meta.source\": \"test\"}");
+
+            Assert.Equal("{\"meta\": {\"source\": \"test\"}}", conn.LastCommand.ParamValue("@p0"));
+        }
+    }
 }

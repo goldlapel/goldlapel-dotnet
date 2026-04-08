@@ -2295,7 +2295,23 @@ namespace GoldLapel
             if (!hasOperators)
             {
                 var parms = new List<object>();
-                parms.Add(s);
+                bool hasDot = false;
+                foreach (var kv in pairs)
+                {
+                    var key = kv[0].Trim().Trim('"');
+                    if (key.Contains(".")) { hasDot = true; break; }
+                }
+                if (hasDot)
+                {
+                    var flat = new Dictionary<string, string>();
+                    foreach (var kv in pairs)
+                        flat[kv[0].Trim().Trim('"')] = kv[1].Trim();
+                    parms.Add(ExpandDotKeys(flat));
+                }
+                else
+                {
+                    parms.Add(s);
+                }
                 return new FilterResult("data @> @p0::jsonb", parms);
             }
 
@@ -2323,7 +2339,12 @@ namespace GoldLapel
             {
                 var pName = "@p" + paramIdx++;
                 allClauses.Add("data @> " + pName + "::jsonb");
-                allParams.Add(RebuildJsonObject(containment));
+                bool hasDot = false;
+                foreach (var key in containment.Keys)
+                {
+                    if (key.Contains(".")) { hasDot = true; break; }
+                }
+                allParams.Add(hasDot ? ExpandDotKeys(containment) : RebuildJsonObject(containment));
             }
 
             // Operator clauses
@@ -2489,6 +2510,56 @@ namespace GoldLapel
                 else
                     sb.Append(entry.Key);
                 sb.Append(": ").Append(entry.Value);
+            }
+            sb.Append("}");
+            return sb.ToString();
+        }
+
+        private static string ExpandDotKeys(Dictionary<string, string> pairs)
+        {
+            // Tree node: either a leaf (raw JSON value) or a branch (children dict)
+            // We use Dictionary<string, object> where object is either:
+            //   string => leaf (raw JSON literal like "\"NY\"", "42", "true")
+            //   Dictionary<string, object> => branch (nested object)
+            var root = new Dictionary<string, object>();
+
+            foreach (var entry in pairs)
+            {
+                var parts = entry.Key.Split('.');
+                var current = root;
+                for (int i = 0; i < parts.Length - 1; i++)
+                {
+                    object child;
+                    if (!current.TryGetValue(parts[i], out child))
+                    {
+                        var next = new Dictionary<string, object>();
+                        current[parts[i]] = next;
+                        current = next;
+                    }
+                    else
+                    {
+                        current = (Dictionary<string, object>)child;
+                    }
+                }
+                current[parts[parts.Length - 1]] = entry.Value;
+            }
+
+            return SerializeTree(root);
+        }
+
+        private static string SerializeTree(Dictionary<string, object> node)
+        {
+            var sb = new System.Text.StringBuilder("{");
+            bool first = true;
+            foreach (var entry in node)
+            {
+                if (!first) sb.Append(", ");
+                first = false;
+                sb.Append("\"").Append(entry.Key).Append("\": ");
+                if (entry.Value is Dictionary<string, object>)
+                    sb.Append(SerializeTree((Dictionary<string, object>)entry.Value));
+                else
+                    sb.Append((string)entry.Value);
             }
             sb.Append("}");
             return sb.ToString();
