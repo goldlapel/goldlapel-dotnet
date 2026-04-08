@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using Xunit;
 
 namespace GoldLapel.Tests
@@ -1184,6 +1185,170 @@ namespace GoldLapel.Tests
             Utils.DocDelete(conn, "logs", "{\"meta.source\": \"test\"}");
 
             Assert.Equal("{\"meta\": {\"source\": \"test\"}}", conn.LastCommand.ParamValue("@p0"));
+        }
+    }
+
+    // ── DocWatch ──────────────────────────────────────────────────
+
+    public class DocWatchTest
+    {
+        [Fact]
+        public void CreatesTriggerFunction()
+        {
+            var conn = new SpyConnection();
+            // DocWatch will fail when trying to create a listen connection
+            // (SpyConnection isn't Npgsql), but trigger DDL is executed first
+            try { Utils.DocWatch(conn, "events", (ch, msg) => { }); }
+            catch (Exception) { }
+
+            var sqls = conn.Commands.Select(c => c.CommandText).ToList();
+            Assert.True(sqls.Any(s => s.Contains("CREATE OR REPLACE FUNCTION _gl_watch_events()")));
+            Assert.True(sqls.Any(s => s.Contains("pg_notify")));
+            Assert.True(sqls.Any(s => s.Contains("AFTER INSERT OR UPDATE OR DELETE ON events")));
+        }
+
+        [Fact]
+        public void TriggerUsesCorrectChannel()
+        {
+            var conn = new SpyConnection();
+            try { Utils.DocWatch(conn, "orders", (ch, msg) => { }); }
+            catch (Exception) { }
+
+            var sqls = conn.Commands.Select(c => c.CommandText).ToList();
+            Assert.True(sqls.Any(s => s.Contains("_gl_changes_orders")));
+        }
+
+        [Fact]
+        public void InvalidCollectionThrows()
+        {
+            var conn = new SpyConnection();
+            Assert.Throws<ArgumentException>(() =>
+                Utils.DocWatch(conn, "bad; name", (ch, msg) => { }));
+        }
+    }
+
+    // ── DocUnwatch ────────────────────────────────────────────────
+
+    public class DocUnwatchTest
+    {
+        [Fact]
+        public void DropsTriggerAndFunction()
+        {
+            var conn = new SpyConnection();
+            Utils.DocUnwatch(conn, "events");
+
+            var sqls = conn.Commands.Select(c => c.CommandText).ToList();
+            Assert.Contains("DROP TRIGGER IF EXISTS _gl_watch_events_trigger ON events", sqls);
+            Assert.Contains("DROP FUNCTION IF EXISTS _gl_watch_events()", sqls);
+        }
+
+        [Fact]
+        public void InvalidCollectionThrows()
+        {
+            var conn = new SpyConnection();
+            Assert.Throws<ArgumentException>(() =>
+                Utils.DocUnwatch(conn, "bad; name"));
+        }
+    }
+
+    // ── DocCreateTtlIndex ─────────────────────────────────────────
+
+    public class DocCreateTtlIndexTest
+    {
+        [Fact]
+        public void CreatesIndexAndTrigger()
+        {
+            var conn = new SpyConnection();
+            Utils.DocCreateTtlIndex(conn, "sessions", 3600);
+
+            var sqls = conn.Commands.Select(c => c.CommandText).ToList();
+            Assert.True(sqls.Any(s => s.Contains("CREATE INDEX IF NOT EXISTS idx_sessions_ttl")));
+            Assert.True(sqls.Any(s => s.Contains("CREATE OR REPLACE FUNCTION _gl_ttl_sessions()")));
+            Assert.True(sqls.Any(s => s.Contains("INTERVAL '3600 seconds'")));
+            Assert.True(sqls.Any(s => s.Contains("BEFORE INSERT ON sessions")));
+        }
+
+        [Fact]
+        public void InvalidCollectionThrows()
+        {
+            var conn = new SpyConnection();
+            Assert.Throws<ArgumentException>(() =>
+                Utils.DocCreateTtlIndex(conn, "bad; name", 3600));
+        }
+    }
+
+    // ── DocRemoveTtlIndex ─────────────────────────────────────────
+
+    public class DocRemoveTtlIndexTest
+    {
+        [Fact]
+        public void DropsTriggerFunctionAndIndex()
+        {
+            var conn = new SpyConnection();
+            Utils.DocRemoveTtlIndex(conn, "sessions");
+
+            var sqls = conn.Commands.Select(c => c.CommandText).ToList();
+            Assert.Contains("DROP TRIGGER IF EXISTS _gl_ttl_sessions_trigger ON sessions", sqls);
+            Assert.Contains("DROP FUNCTION IF EXISTS _gl_ttl_sessions()", sqls);
+            Assert.Contains("DROP INDEX IF EXISTS idx_sessions_ttl", sqls);
+        }
+
+        [Fact]
+        public void InvalidCollectionThrows()
+        {
+            var conn = new SpyConnection();
+            Assert.Throws<ArgumentException>(() =>
+                Utils.DocRemoveTtlIndex(conn, "bad; name"));
+        }
+    }
+
+    // ── DocCreateCapped ───────────────────────────────────────────
+
+    public class DocCreateCappedTest
+    {
+        [Fact]
+        public void EnsuresCollectionAndCreatesTrigger()
+        {
+            var conn = new SpyConnection();
+            Utils.DocCreateCapped(conn, "logs", 1000);
+
+            var sqls = conn.Commands.Select(c => c.CommandText).ToList();
+            Assert.True(sqls.Any(s => s.Contains("CREATE TABLE IF NOT EXISTS logs")));
+            Assert.True(sqls.Any(s => s.Contains("CREATE OR REPLACE FUNCTION _gl_cap_logs()")));
+            Assert.True(sqls.Any(s => s.Contains("COUNT(*) - 1000")));
+            Assert.True(sqls.Any(s => s.Contains("AFTER INSERT ON logs")));
+        }
+
+        [Fact]
+        public void InvalidCollectionThrows()
+        {
+            var conn = new SpyConnection();
+            Assert.Throws<ArgumentException>(() =>
+                Utils.DocCreateCapped(conn, "bad; name", 1000));
+        }
+    }
+
+    // ── DocRemoveCap ──────────────────────────────────────────────
+
+    public class DocRemoveCapTest
+    {
+        [Fact]
+        public void DropsTriggerAndFunction()
+        {
+            var conn = new SpyConnection();
+            Utils.DocRemoveCap(conn, "logs");
+
+            var sqls = conn.Commands.Select(c => c.CommandText).ToList();
+            Assert.Contains("DROP TRIGGER IF EXISTS _gl_cap_logs_trigger ON logs", sqls);
+            Assert.Contains("DROP FUNCTION IF EXISTS _gl_cap_logs()", sqls);
+        }
+
+        [Fact]
+        public void InvalidCollectionThrows()
+        {
+            var conn = new SpyConnection();
+            Assert.Throws<ArgumentException>(() =>
+                Utils.DocRemoveCap(conn, "bad; name"));
         }
     }
 }

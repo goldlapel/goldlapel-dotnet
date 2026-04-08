@@ -2581,6 +2581,242 @@ namespace GoldLapel
                 throw new ArgumentException("Invalid identifier: " + name);
         }
 
+        // ── Change streams (DocWatch / DocUnwatch) ─────────────────
+
+        /// <summary>
+        /// Watch a collection for changes via triggers + pg_notify.
+        /// Like MongoDB change streams. Creates an AFTER INSERT/UPDATE/DELETE trigger
+        /// that notifies on each row change. The callback receives the channel name
+        /// and a JSON payload with operationType, id, and fullDocument.
+        /// </summary>
+        public static void DocWatch(DbConnection conn, string collection,
+            Action<string, string> callback, bool blocking = true)
+        {
+            ValidateIdentifier(collection);
+
+            var funcName = "_gl_watch_" + collection;
+            var triggerName = funcName + "_trigger";
+            var channel = "_gl_changes_" + collection;
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText =
+                    "CREATE OR REPLACE FUNCTION " + funcName + "() RETURNS TRIGGER AS $$ " +
+                    "BEGIN " +
+                    "PERFORM pg_notify('" + channel + "', json_build_object(" +
+                    "'operationType', lower(TG_OP), " +
+                    "'id', COALESCE(NEW.id, OLD.id)::text, " +
+                    "'fullDocument', CASE WHEN TG_OP = 'DELETE' THEN NULL ELSE NEW.data END" +
+                    ")::text); " +
+                    "RETURN COALESCE(NEW, OLD); " +
+                    "END; " +
+                    "$$ LANGUAGE plpgsql";
+                cmd.ExecuteNonQuery();
+            }
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText =
+                    "DO $$ BEGIN " +
+                    "CREATE TRIGGER " + triggerName +
+                    " AFTER INSERT OR UPDATE OR DELETE ON " + collection +
+                    " FOR EACH ROW EXECUTE FUNCTION " + funcName + "(); " +
+                    "EXCEPTION WHEN duplicate_object THEN NULL; " +
+                    "END $$";
+                cmd.ExecuteNonQuery();
+            }
+
+            // Use the same Npgsql notification pattern as Subscribe
+            if (blocking)
+            {
+                ListenLoop(conn, channel, callback);
+            }
+            else
+            {
+                var thread = new Thread(() => ListenLoop(conn, channel, callback));
+                thread.IsBackground = true;
+                thread.Start();
+            }
+        }
+
+        /// <summary>
+        /// Remove change stream trigger from a collection.
+        /// </summary>
+        public static void DocUnwatch(DbConnection conn, string collection)
+        {
+            ValidateIdentifier(collection);
+
+            var funcName = "_gl_watch_" + collection;
+            var triggerName = funcName + "_trigger";
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText =
+                    "DROP TRIGGER IF EXISTS " + triggerName + " ON " + collection;
+                cmd.ExecuteNonQuery();
+            }
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText =
+                    "DROP FUNCTION IF EXISTS " + funcName + "()";
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        // ── TTL indexes (DocCreateTtlIndex / DocRemoveTtlIndex) ──────
+
+        /// <summary>
+        /// Create a TTL index that deletes expired rows on each INSERT.
+        /// Like MongoDB TTL indexes. Uses a BEFORE INSERT trigger.
+        /// </summary>
+        public static void DocCreateTtlIndex(DbConnection conn, string collection,
+            int expireAfterSeconds, string field = "created_at")
+        {
+            ValidateIdentifier(collection);
+            ValidateIdentifier(field);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText =
+                    "CREATE INDEX IF NOT EXISTS idx_" + collection + "_ttl ON " +
+                    collection + " (" + field + ")";
+                cmd.ExecuteNonQuery();
+            }
+
+            var funcName = "_gl_ttl_" + collection;
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText =
+                    "CREATE OR REPLACE FUNCTION " + funcName + "() RETURNS TRIGGER AS $$ " +
+                    "BEGIN " +
+                    "DELETE FROM " + collection + " WHERE " + field +
+                    " < NOW() - INTERVAL '" + expireAfterSeconds + " seconds'; " +
+                    "RETURN NEW; " +
+                    "END; " +
+                    "$$ LANGUAGE plpgsql";
+                cmd.ExecuteNonQuery();
+            }
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText =
+                    "DO $$ BEGIN " +
+                    "CREATE TRIGGER " + funcName + "_trigger" +
+                    " BEFORE INSERT ON " + collection +
+                    " FOR EACH STATEMENT EXECUTE FUNCTION " + funcName + "(); " +
+                    "EXCEPTION WHEN duplicate_object THEN NULL; " +
+                    "END $$";
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        /// <summary>
+        /// Remove TTL trigger, function, and index from a collection.
+        /// </summary>
+        public static void DocRemoveTtlIndex(DbConnection conn, string collection)
+        {
+            ValidateIdentifier(collection);
+
+            var funcName = "_gl_ttl_" + collection;
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText =
+                    "DROP TRIGGER IF EXISTS " + funcName + "_trigger ON " + collection;
+                cmd.ExecuteNonQuery();
+            }
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "DROP FUNCTION IF EXISTS " + funcName + "()";
+                cmd.ExecuteNonQuery();
+            }
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "DROP INDEX IF EXISTS idx_" + collection + "_ttl";
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        // ── Capped collections (DocCreateCapped / DocRemoveCap) ──────
+
+        /// <summary>
+        /// Create a capped collection that auto-deletes oldest rows.
+        /// Like MongoDB capped collections. Uses an AFTER INSERT trigger.
+        /// </summary>
+        public static void DocCreateCapped(DbConnection conn, string collection, int maxDocuments)
+        {
+            ValidateIdentifier(collection);
+
+            EnsureCollection(conn, collection);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText =
+                    "CREATE INDEX IF NOT EXISTS idx_" + collection +
+                    "_created_at ON " + collection + " (created_at ASC)";
+                cmd.ExecuteNonQuery();
+            }
+
+            var funcName = "_gl_cap_" + collection;
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText =
+                    "CREATE OR REPLACE FUNCTION " + funcName + "() RETURNS TRIGGER AS $$ " +
+                    "DECLARE excess INTEGER; " +
+                    "BEGIN " +
+                    "SELECT COUNT(*) - " + maxDocuments + " INTO excess FROM " + collection + "; " +
+                    "IF excess > 0 THEN " +
+                    "DELETE FROM " + collection + " WHERE id IN (" +
+                    "SELECT id FROM " + collection + " ORDER BY created_at ASC LIMIT excess" +
+                    "); " +
+                    "END IF; " +
+                    "RETURN NULL; " +
+                    "END; " +
+                    "$$ LANGUAGE plpgsql";
+                cmd.ExecuteNonQuery();
+            }
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText =
+                    "DO $$ BEGIN " +
+                    "CREATE TRIGGER " + funcName + "_trigger" +
+                    " AFTER INSERT ON " + collection +
+                    " FOR EACH STATEMENT EXECUTE FUNCTION " + funcName + "(); " +
+                    "EXCEPTION WHEN duplicate_object THEN NULL; " +
+                    "END $$";
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        /// <summary>
+        /// Remove capped collection trigger and function.
+        /// </summary>
+        public static void DocRemoveCap(DbConnection conn, string collection)
+        {
+            ValidateIdentifier(collection);
+
+            var funcName = "_gl_cap_" + collection;
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText =
+                    "DROP TRIGGER IF EXISTS " + funcName + "_trigger ON " + collection;
+                cmd.ExecuteNonQuery();
+            }
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "DROP FUNCTION IF EXISTS " + funcName + "()";
+                cmd.ExecuteNonQuery();
+            }
+        }
+
         private static void AddParameter(DbCommand cmd, string name, object value)
         {
             var param = cmd.CreateParameter();

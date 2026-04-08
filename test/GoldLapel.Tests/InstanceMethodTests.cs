@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Data.Common;
+using System.Linq;
 using System.Reflection;
 using Xunit;
 using GL = GoldLapel.GoldLapel;
@@ -613,6 +614,85 @@ namespace GoldLapel.Tests
             Assert.Contains("ts_rank(", sql);
             Assert.Contains("FROM articles", sql);
             Assert.Contains("WHERE id = @idValue", sql);
+        }
+    }
+
+    // ── Instance operational methods ────────────────────────
+
+    public class InstanceOperationalMethodsTest
+    {
+        private GL _gl;
+        private SpyConnection _spy;
+
+        public InstanceOperationalMethodsTest()
+        {
+            _gl = new GL("postgresql://localhost:5432/mydb");
+            _spy = new SpyConnection();
+            ConnectionPropertyTest.InjectConnection(_gl, _spy);
+        }
+
+        [Fact]
+        public void DocWatchDelegates()
+        {
+            // DocWatch creates trigger DDL then tries to LISTEN (which fails on SpyConnection)
+            try { _gl.DocWatch("events", (ch, msg) => { }); }
+            catch (Exception) { }
+
+            var sqls = _spy.Commands.Select(c => c.CommandText).ToList();
+            Assert.True(sqls.Any(s => s.Contains("CREATE OR REPLACE FUNCTION _gl_watch_events()")));
+            Assert.True(sqls.Any(s => s.Contains("AFTER INSERT OR UPDATE OR DELETE ON events")));
+        }
+
+        [Fact]
+        public void DocUnwatchDelegates()
+        {
+            _gl.DocUnwatch("events");
+
+            var sqls = _spy.Commands.Select(c => c.CommandText).ToList();
+            Assert.Contains("DROP TRIGGER IF EXISTS _gl_watch_events_trigger ON events", sqls);
+            Assert.Contains("DROP FUNCTION IF EXISTS _gl_watch_events()", sqls);
+        }
+
+        [Fact]
+        public void DocCreateTtlIndexDelegates()
+        {
+            _gl.DocCreateTtlIndex("sessions", 3600);
+
+            var sqls = _spy.Commands.Select(c => c.CommandText).ToList();
+            Assert.True(sqls.Any(s => s.Contains("CREATE INDEX IF NOT EXISTS idx_sessions_ttl")));
+            Assert.True(sqls.Any(s => s.Contains("INTERVAL '3600 seconds'")));
+        }
+
+        [Fact]
+        public void DocRemoveTtlIndexDelegates()
+        {
+            _gl.DocRemoveTtlIndex("sessions");
+
+            var sqls = _spy.Commands.Select(c => c.CommandText).ToList();
+            Assert.Contains("DROP TRIGGER IF EXISTS _gl_ttl_sessions_trigger ON sessions", sqls);
+            Assert.Contains("DROP FUNCTION IF EXISTS _gl_ttl_sessions()", sqls);
+            Assert.Contains("DROP INDEX IF EXISTS idx_sessions_ttl", sqls);
+        }
+
+        [Fact]
+        public void DocCreateCappedDelegates()
+        {
+            _gl.DocCreateCapped("logs", 1000);
+
+            var sqls = _spy.Commands.Select(c => c.CommandText).ToList();
+            Assert.True(sqls.Any(s => s.Contains("CREATE TABLE IF NOT EXISTS logs")));
+            Assert.True(sqls.Any(s => s.Contains("CREATE OR REPLACE FUNCTION _gl_cap_logs()")));
+            Assert.True(sqls.Any(s => s.Contains("COUNT(*) - 1000")));
+        }
+
+        [Fact]
+        public void DocRemoveCapDelegates()
+        {
+            _gl.DocRemoveCap("logs");
+
+            var sqls = _spy.Commands.Select(c => c.CommandText).ToList();
+            Assert.Contains("DROP TRIGGER IF EXISTS _gl_cap_logs_trigger ON logs", sqls);
+            Assert.Contains("DROP FUNCTION IF EXISTS _gl_cap_logs()", sqls);
         }
     }
 

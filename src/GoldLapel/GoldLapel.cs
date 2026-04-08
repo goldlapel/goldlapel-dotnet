@@ -333,6 +333,24 @@ namespace GoldLapel
         public List<Dictionary<string, object>> DocAggregate(string collection, string pipelineJson)
             => Utils.DocAggregate(Connection, collection, pipelineJson);
 
+        public void DocWatch(string collection, Action<string, string> callback, bool blocking = true)
+            => Utils.DocWatch(Connection, collection, callback, blocking);
+
+        public void DocUnwatch(string collection)
+            => Utils.DocUnwatch(Connection, collection);
+
+        public void DocCreateTtlIndex(string collection, int expireAfterSeconds, string field = "created_at")
+            => Utils.DocCreateTtlIndex(Connection, collection, expireAfterSeconds, field);
+
+        public void DocRemoveTtlIndex(string collection)
+            => Utils.DocRemoveTtlIndex(Connection, collection);
+
+        public void DocCreateCapped(string collection, int maxDocuments)
+            => Utils.DocCreateCapped(Connection, collection, maxDocuments);
+
+        public void DocRemoveCap(string collection)
+            => Utils.DocRemoveCap(Connection, collection);
+
         // Search
         public List<Dictionary<string, object>> Search(string table,
             string column, string query, int limit = 50, string lang = "english", bool highlight = false)
