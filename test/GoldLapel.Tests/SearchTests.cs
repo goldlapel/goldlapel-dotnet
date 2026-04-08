@@ -348,7 +348,7 @@ namespace GoldLapel.Tests
         public void SqlGenerationWithoutQuery()
         {
             var conn = new SpyConnection();
-            Utils.Facets(conn, "products", "category");
+            Utils.Facets(conn, "products", "category", queryColumn: (string)null);
 
             var sql = conn.LastCommandText;
             Assert.Contains("category AS value", sql);
@@ -401,7 +401,7 @@ namespace GoldLapel.Tests
         public void ParametersWithoutQuery()
         {
             var conn = new SpyConnection();
-            Utils.Facets(conn, "products", "category", limit: 20);
+            Utils.Facets(conn, "products", "category", limit: 20, queryColumn: (string)null);
 
             var cmd = conn.LastCommand;
             Assert.Equal(20, cmd.ParamValue("@limit"));
@@ -411,7 +411,7 @@ namespace GoldLapel.Tests
         public void DefaultLimit()
         {
             var conn = new SpyConnection();
-            Utils.Facets(conn, "products", "category");
+            Utils.Facets(conn, "products", "category", queryColumn: (string)null);
 
             Assert.Equal(50, conn.LastCommand.ParamValue("@limit"));
         }
@@ -420,7 +420,7 @@ namespace GoldLapel.Tests
         public void NoTsvectorWithoutQuery()
         {
             var conn = new SpyConnection();
-            Utils.Facets(conn, "products", "category");
+            Utils.Facets(conn, "products", "category", queryColumn: (string)null);
 
             Assert.DoesNotContain("to_tsvector", conn.LastCommandText);
             Assert.DoesNotContain("plainto_tsquery", conn.LastCommandText);
@@ -884,6 +884,7 @@ namespace GoldLapel.Tests
         public List<SpyCommand> Commands { get; } = new List<SpyCommand>();
         public Func<FakeDataReader> NextReaderFactory { get; set; }
         public int NextNonQueryResult { get; set; }
+        public object NextScalarResult { get; set; }
 
         public string LastCommandText => Commands.Last().CommandText;
         public SpyCommand LastCommand => Commands.Last();
@@ -943,7 +944,7 @@ namespace GoldLapel.Tests
         }
 
         public override int ExecuteNonQuery() => _conn.NextNonQueryResult;
-        public override object ExecuteScalar() => null;
+        public override object ExecuteScalar() => _conn.NextScalarResult;
 
         public object ParamValue(string name)
         {

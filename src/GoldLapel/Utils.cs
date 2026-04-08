@@ -1245,6 +1245,268 @@ namespace GoldLapel
             }
         }
 
+        // ── DocX: MongoDB-like document store ────────────────────
+
+        private static void EnsureCollection(DbConnection conn, string collection)
+        {
+            ValidateIdentifier(collection);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText =
+                    "CREATE TABLE IF NOT EXISTS " + collection + " (" +
+                    "id BIGSERIAL PRIMARY KEY, " +
+                    "data JSONB NOT NULL, " +
+                    "created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), " +
+                    "updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())";
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        private static Dictionary<string, object> ReadRow(DbDataReader reader)
+        {
+            var row = new Dictionary<string, object>();
+            for (int i = 0; i < reader.FieldCount; i++)
+            {
+                row[reader.GetName(i)] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+            }
+            return row;
+        }
+
+        public static Dictionary<string, object> DocInsert(DbConnection conn, string collection, string documentJson)
+        {
+            EnsureCollection(conn, collection);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText =
+                    "INSERT INTO " + collection + " (data) VALUES (@doc::jsonb) " +
+                    "RETURNING id, data, created_at, updated_at";
+                AddParameter(cmd, "@doc", documentJson);
+
+                using (var reader = cmd.ExecuteReader())
+                {
+                    if (reader.Read())
+                        return ReadRow(reader);
+                    return new Dictionary<string, object>();
+                }
+            }
+        }
+
+        public static List<Dictionary<string, object>> DocInsertMany(DbConnection conn, string collection, List<string> documents)
+        {
+            EnsureCollection(conn, collection);
+
+            var results = new List<Dictionary<string, object>>();
+            for (int i = 0; i < documents.Count; i++)
+            {
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.CommandText =
+                        "INSERT INTO " + collection + " (data) VALUES (@doc::jsonb) " +
+                        "RETURNING id, data, created_at, updated_at";
+                    AddParameter(cmd, "@doc", documents[i]);
+
+                    using (var reader = cmd.ExecuteReader())
+                    {
+                        if (reader.Read())
+                            results.Add(ReadRow(reader));
+                    }
+                }
+            }
+            return results;
+        }
+
+        public static List<Dictionary<string, object>> DocFind(DbConnection conn, string collection,
+            string filterJson = null, Dictionary<string, int> sort = null, int? limit = null, int? skip = null)
+        {
+            ValidateIdentifier(collection);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                var sql = "SELECT id, data, created_at, updated_at FROM " + collection;
+
+                if (filterJson != null)
+                {
+                    sql += " WHERE data @> @filter::jsonb";
+                    AddParameter(cmd, "@filter", filterJson);
+                }
+
+                if (sort != null && sort.Count > 0)
+                {
+                    var orderParts = new List<string>();
+                    foreach (var kv in sort)
+                    {
+                        ValidateIdentifier(kv.Key);
+                        var dir = kv.Value >= 0 ? "ASC" : "DESC";
+                        orderParts.Add("data->>'" + kv.Key + "' " + dir);
+                    }
+                    sql += " ORDER BY " + string.Join(", ", orderParts);
+                }
+
+                if (limit.HasValue)
+                {
+                    sql += " LIMIT @limit";
+                    AddParameter(cmd, "@limit", limit.Value);
+                }
+
+                if (skip.HasValue)
+                {
+                    sql += " OFFSET @skip";
+                    AddParameter(cmd, "@skip", skip.Value);
+                }
+
+                cmd.CommandText = sql;
+
+                var results = new List<Dictionary<string, object>>();
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        results.Add(ReadRow(reader));
+                    }
+                }
+                return results;
+            }
+        }
+
+        public static Dictionary<string, object> DocFindOne(DbConnection conn, string collection, string filterJson = null)
+        {
+            ValidateIdentifier(collection);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                var sql = "SELECT id, data, created_at, updated_at FROM " + collection;
+
+                if (filterJson != null)
+                {
+                    sql += " WHERE data @> @filter::jsonb";
+                    AddParameter(cmd, "@filter", filterJson);
+                }
+
+                sql += " LIMIT 1";
+                cmd.CommandText = sql;
+
+                using (var reader = cmd.ExecuteReader())
+                {
+                    if (reader.Read())
+                        return ReadRow(reader);
+                    return null;
+                }
+            }
+        }
+
+        public static int DocUpdate(DbConnection conn, string collection, string filterJson, string updateJson)
+        {
+            ValidateIdentifier(collection);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText =
+                    "UPDATE " + collection + " SET data = data || @update::jsonb, updated_at = NOW() " +
+                    "WHERE data @> @filter::jsonb";
+                AddParameter(cmd, "@update", updateJson);
+                AddParameter(cmd, "@filter", filterJson);
+                return cmd.ExecuteNonQuery();
+            }
+        }
+
+        public static int DocUpdateOne(DbConnection conn, string collection, string filterJson, string updateJson)
+        {
+            ValidateIdentifier(collection);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText =
+                    "UPDATE " + collection + " SET data = data || @update::jsonb, updated_at = NOW() " +
+                    "WHERE id = (SELECT id FROM " + collection + " WHERE data @> @filter::jsonb LIMIT 1)";
+                AddParameter(cmd, "@update", updateJson);
+                AddParameter(cmd, "@filter", filterJson);
+                return cmd.ExecuteNonQuery();
+            }
+        }
+
+        public static int DocDelete(DbConnection conn, string collection, string filterJson)
+        {
+            ValidateIdentifier(collection);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText =
+                    "DELETE FROM " + collection + " WHERE data @> @filter::jsonb";
+                AddParameter(cmd, "@filter", filterJson);
+                return cmd.ExecuteNonQuery();
+            }
+        }
+
+        public static int DocDeleteOne(DbConnection conn, string collection, string filterJson)
+        {
+            ValidateIdentifier(collection);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText =
+                    "DELETE FROM " + collection + " WHERE id = (" +
+                    "SELECT id FROM " + collection + " WHERE data @> @filter::jsonb LIMIT 1)";
+                AddParameter(cmd, "@filter", filterJson);
+                return cmd.ExecuteNonQuery();
+            }
+        }
+
+        public static long DocCount(DbConnection conn, string collection, string filterJson = null)
+        {
+            ValidateIdentifier(collection);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                var sql = "SELECT COUNT(*) FROM " + collection;
+
+                if (filterJson != null)
+                {
+                    sql += " WHERE data @> @filter::jsonb";
+                    AddParameter(cmd, "@filter", filterJson);
+                }
+
+                cmd.CommandText = sql;
+                return (long)cmd.ExecuteScalar();
+            }
+        }
+
+        public static void DocCreateIndex(DbConnection conn, string collection, List<string> keys = null)
+        {
+            EnsureCollection(conn, collection);
+
+            if (keys == null || keys.Count == 0)
+            {
+                // Default: GIN index on the entire data column
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.CommandText =
+                        "CREATE INDEX IF NOT EXISTS " + collection + "_data_gin ON " +
+                        collection + " USING GIN (data)";
+                    cmd.ExecuteNonQuery();
+                }
+            }
+            else
+            {
+                // Create a btree index on specific JSONB keys
+                foreach (var key in keys)
+                    ValidateIdentifier(key);
+
+                var indexName = collection + "_" + string.Join("_", keys) + "_idx";
+                var indexExprs = string.Join(", ",
+                    keys.Select(k => "(data->>'" + k + "')"));
+
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.CommandText =
+                        "CREATE INDEX IF NOT EXISTS " + indexName + " ON " +
+                        collection + " (" + indexExprs + ")";
+                    cmd.ExecuteNonQuery();
+                }
+            }
+        }
+
         private static readonly Regex IdentifierPattern = new Regex(@"^[a-zA-Z_][a-zA-Z0-9_]*$");
 
         private static void ValidateIdentifier(string name)
