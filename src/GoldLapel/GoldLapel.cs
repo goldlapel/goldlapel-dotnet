@@ -327,6 +327,15 @@ namespace GoldLapel
         public long DocCount(string collection, string filterJson = null)
             => Utils.DocCount(Connection, collection, filterJson);
 
+        public Dictionary<string, object> DocFindOneAndUpdate(string collection, string filterJson, string updateJson)
+            => Utils.DocFindOneAndUpdate(Connection, collection, filterJson, updateJson);
+
+        public Dictionary<string, object> DocFindOneAndDelete(string collection, string filterJson)
+            => Utils.DocFindOneAndDelete(Connection, collection, filterJson);
+
+        public List<string> DocDistinct(string collection, string field, string filterJson = null)
+            => Utils.DocDistinct(Connection, collection, field, filterJson);
+
         public void DocCreateIndex(string collection, List<string> keys = null)
             => Utils.DocCreateIndex(Connection, collection, keys);
 
