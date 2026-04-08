@@ -115,8 +115,8 @@ namespace GoldLapel.Tests
             Utils.DocFind(conn, "users", filterJson: "{\"active\":true}");
 
             var sql = conn.LastCommandText;
-            Assert.Contains("WHERE data @> @filter::jsonb", sql);
-            Assert.Equal("{\"active\":true}", conn.LastCommand.ParamValue("@filter"));
+            Assert.Contains("WHERE data @> @p0::jsonb", sql);
+            Assert.Equal("{\"active\":true}", conn.LastCommand.ParamValue("@p0"));
         }
 
         [Fact]
@@ -173,12 +173,12 @@ namespace GoldLapel.Tests
 
             var sql = conn.LastCommandText;
             Assert.Contains("FROM posts", sql);
-            Assert.Contains("WHERE data @> @filter::jsonb", sql);
+            Assert.Contains("WHERE data @> @p0::jsonb", sql);
             Assert.Contains("ORDER BY data->>'date' DESC", sql);
             Assert.Contains("LIMIT @limit", sql);
             Assert.Contains("OFFSET @skip", sql);
 
-            Assert.Equal("{\"status\":\"published\"}", conn.LastCommand.ParamValue("@filter"));
+            Assert.Equal("{\"status\":\"published\"}", conn.LastCommand.ParamValue("@p0"));
             Assert.Equal(20, conn.LastCommand.ParamValue("@limit"));
             Assert.Equal(10, conn.LastCommand.ParamValue("@skip"));
         }
@@ -224,9 +224,9 @@ namespace GoldLapel.Tests
             Utils.DocFindOne(conn, "users", filterJson: "{\"email\":\"a@b.com\"}");
 
             var sql = conn.LastCommandText;
-            Assert.Contains("WHERE data @> @filter::jsonb", sql);
+            Assert.Contains("WHERE data @> @p0::jsonb", sql);
             Assert.Contains("LIMIT 1", sql);
-            Assert.Equal("{\"email\":\"a@b.com\"}", conn.LastCommand.ParamValue("@filter"));
+            Assert.Equal("{\"email\":\"a@b.com\"}", conn.LastCommand.ParamValue("@p0"));
         }
 
         [Fact]
@@ -252,7 +252,7 @@ namespace GoldLapel.Tests
             Assert.Contains("UPDATE users", sql);
             Assert.Contains("SET data = data || @update::jsonb", sql);
             Assert.Contains("updated_at = NOW()", sql);
-            Assert.Contains("WHERE data @> @filter::jsonb", sql);
+            Assert.Contains("WHERE data @> @p0::jsonb", sql);
         }
 
         [Fact]
@@ -262,7 +262,7 @@ namespace GoldLapel.Tests
             Utils.DocUpdate(conn, "users", "{\"active\":true}", "{\"role\":\"admin\"}");
 
             Assert.Equal("{\"role\":\"admin\"}", conn.LastCommand.ParamValue("@update"));
-            Assert.Equal("{\"active\":true}", conn.LastCommand.ParamValue("@filter"));
+            Assert.Equal("{\"active\":true}", conn.LastCommand.ParamValue("@p0"));
         }
 
         [Fact]
@@ -288,7 +288,7 @@ namespace GoldLapel.Tests
             Assert.Contains("UPDATE users", sql);
             Assert.Contains("SET data = data || @update::jsonb", sql);
             Assert.Contains("updated_at = NOW()", sql);
-            Assert.Contains("WHERE id = (SELECT id FROM users WHERE data @> @filter::jsonb LIMIT 1)", sql);
+            Assert.Contains("WHERE id = (SELECT id FROM users WHERE data @> @p0::jsonb LIMIT 1)", sql);
         }
 
         [Fact]
@@ -298,7 +298,7 @@ namespace GoldLapel.Tests
             Utils.DocUpdateOne(conn, "users", "{\"name\":\"alice\"}", "{\"age\":30}");
 
             Assert.Equal("{\"age\":30}", conn.LastCommand.ParamValue("@update"));
-            Assert.Equal("{\"name\":\"alice\"}", conn.LastCommand.ParamValue("@filter"));
+            Assert.Equal("{\"name\":\"alice\"}", conn.LastCommand.ParamValue("@p0"));
         }
 
         [Fact]
@@ -322,7 +322,7 @@ namespace GoldLapel.Tests
 
             var sql = conn.LastCommandText;
             Assert.Contains("DELETE FROM users", sql);
-            Assert.Contains("WHERE data @> @filter::jsonb", sql);
+            Assert.Contains("WHERE data @> @p0::jsonb", sql);
         }
 
         [Fact]
@@ -331,7 +331,7 @@ namespace GoldLapel.Tests
             var conn = new SpyConnection();
             Utils.DocDelete(conn, "users", "{\"active\":false}");
 
-            Assert.Equal("{\"active\":false}", conn.LastCommand.ParamValue("@filter"));
+            Assert.Equal("{\"active\":false}", conn.LastCommand.ParamValue("@p0"));
         }
 
         [Fact]
@@ -356,7 +356,7 @@ namespace GoldLapel.Tests
             var sql = conn.LastCommandText;
             Assert.Contains("DELETE FROM users", sql);
             Assert.Contains("WHERE id = (", sql);
-            Assert.Contains("SELECT id FROM users WHERE data @> @filter::jsonb LIMIT 1)", sql);
+            Assert.Contains("SELECT id FROM users WHERE data @> @p0::jsonb LIMIT 1)", sql);
         }
 
         [Fact]
@@ -365,7 +365,7 @@ namespace GoldLapel.Tests
             var conn = new SpyConnection();
             Utils.DocDeleteOne(conn, "users", "{\"name\":\"alice\"}");
 
-            Assert.Equal("{\"name\":\"alice\"}", conn.LastCommand.ParamValue("@filter"));
+            Assert.Equal("{\"name\":\"alice\"}", conn.LastCommand.ParamValue("@p0"));
         }
 
         [Fact]
@@ -404,8 +404,8 @@ namespace GoldLapel.Tests
 
             var sql = conn.LastCommandText;
             Assert.Contains("SELECT COUNT(*) FROM users", sql);
-            Assert.Contains("WHERE data @> @filter::jsonb", sql);
-            Assert.Equal("{\"active\":true}", conn.LastCommand.ParamValue("@filter"));
+            Assert.Contains("WHERE data @> @p0::jsonb", sql);
+            Assert.Equal("{\"active\":true}", conn.LastCommand.ParamValue("@p0"));
         }
 
         [Fact]
@@ -521,12 +521,12 @@ namespace GoldLapel.Tests
             var sql = conn.LastCommandText;
             Assert.Contains("SELECT data->>'region' AS _id, SUM((data->>'amount')::numeric) AS total", sql);
             Assert.Contains("FROM orders", sql);
-            Assert.Contains("WHERE data @> @filter::jsonb", sql);
+            Assert.Contains("WHERE data @> @p0::jsonb", sql);
             Assert.Contains("GROUP BY data->>'region'", sql);
             Assert.Contains("ORDER BY total DESC", sql);
             Assert.Contains("LIMIT @limit", sql);
             Assert.Contains("OFFSET @skip", sql);
-            Assert.Equal("{\"status\":\"shipped\"}", conn.LastCommand.ParamValue("@filter"));
+            Assert.Equal("{\"status\":\"shipped\"}", conn.LastCommand.ParamValue("@p0"));
             Assert.Equal(10, conn.LastCommand.ParamValue("@limit"));
             Assert.Equal(5, conn.LastCommand.ParamValue("@skip"));
         }
@@ -575,9 +575,9 @@ namespace GoldLapel.Tests
 
             var sql = conn.LastCommandText;
             Assert.Contains("SELECT id, data, created_at, updated_at FROM users", sql);
-            Assert.Contains("WHERE data @> @filter::jsonb", sql);
+            Assert.Contains("WHERE data @> @p0::jsonb", sql);
             Assert.DoesNotContain("GROUP BY", sql);
-            Assert.Equal("{\"active\":true}", conn.LastCommand.ParamValue("@filter"));
+            Assert.Equal("{\"active\":true}", conn.LastCommand.ParamValue("@p0"));
         }
 
         [Fact]
@@ -676,6 +676,146 @@ namespace GoldLapel.Tests
             Assert.Throws<ArgumentException>(() =>
                 Utils.DocAggregate(conn, "users",
                     "[{\"$group\": {\"_id\": null, \"n\": {\"$first\": \"$name\"}}}]"));
+        }
+    }
+
+    // ── BuildFilter (comparison operators) ─────────────────────
+
+    public class BuildFilterTest
+    {
+        [Fact]
+        public void PlainContainmentPassthrough()
+        {
+            var r = Utils.BuildFilter("{\"active\":true}");
+            Assert.Equal("data @> @p0::jsonb", r.WhereClause);
+            Assert.Single(r.Params);
+            Assert.Equal("{\"active\":true}", r.Params[0]);
+        }
+
+        [Fact]
+        public void GtNumeric()
+        {
+            var r = Utils.BuildFilter("{\"age\": {\"$gt\": 21}}");
+            Assert.Equal("(data->>'age')::numeric > @p0", r.WhereClause);
+            Assert.Single(r.Params);
+            Assert.Equal(21.0, r.Params[0]);
+        }
+
+        [Fact]
+        public void GteNumeric()
+        {
+            var r = Utils.BuildFilter("{\"score\": {\"$gte\": 90}}");
+            Assert.Equal("(data->>'score')::numeric >= @p0", r.WhereClause);
+            Assert.Single(r.Params);
+            Assert.Equal(90.0, r.Params[0]);
+        }
+
+        [Fact]
+        public void LtAndLte()
+        {
+            var r = Utils.BuildFilter("{\"price\": {\"$lt\": 100, \"$gte\": 10}}");
+            Assert.Equal("(data->>'price')::numeric < @p0 AND (data->>'price')::numeric >= @p1", r.WhereClause);
+            Assert.Equal(2, r.Params.Count);
+            Assert.Equal(100.0, r.Params[0]);
+            Assert.Equal(10.0, r.Params[1]);
+        }
+
+        [Fact]
+        public void EqString()
+        {
+            var r = Utils.BuildFilter("{\"status\": {\"$eq\": \"active\"}}");
+            Assert.Equal("data->>'status' = @p0", r.WhereClause);
+            Assert.Single(r.Params);
+            Assert.Equal("active", r.Params[0]);
+        }
+
+        [Fact]
+        public void NeOperator()
+        {
+            var r = Utils.BuildFilter("{\"status\": {\"$ne\": \"deleted\"}}");
+            Assert.Equal("data->>'status' != @p0", r.WhereClause);
+            Assert.Single(r.Params);
+            Assert.Equal("deleted", r.Params[0]);
+        }
+
+        [Fact]
+        public void InOperator()
+        {
+            var r = Utils.BuildFilter("{\"color\": {\"$in\": [\"red\", \"blue\"]}}");
+            Assert.Equal("data->>'color' IN (@p0, @p1)", r.WhereClause);
+            Assert.Equal(2, r.Params.Count);
+            Assert.Equal("red", r.Params[0]);
+            Assert.Equal("blue", r.Params[1]);
+        }
+
+        [Fact]
+        public void NinOperator()
+        {
+            var r = Utils.BuildFilter("{\"color\": {\"$nin\": [\"red\"]}}");
+            Assert.Equal("data->>'color' NOT IN (@p0)", r.WhereClause);
+            Assert.Single(r.Params);
+            Assert.Equal("red", r.Params[0]);
+        }
+
+        [Fact]
+        public void ExistsTrue()
+        {
+            var r = Utils.BuildFilter("{\"email\": {\"$exists\": true}}");
+            Assert.Equal("data ?? @p0", r.WhereClause);
+            Assert.Single(r.Params);
+            Assert.Equal("email", r.Params[0]);
+        }
+
+        [Fact]
+        public void ExistsFalse()
+        {
+            var r = Utils.BuildFilter("{\"email\": {\"$exists\": false}}");
+            Assert.Equal("NOT (data ?? @p0)", r.WhereClause);
+            Assert.Single(r.Params);
+            Assert.Equal("email", r.Params[0]);
+        }
+
+        [Fact]
+        public void RegexOperator()
+        {
+            var r = Utils.BuildFilter("{\"name\": {\"$regex\": \"^A.*\"}}");
+            Assert.Equal("data->>'name' ~ @p0", r.WhereClause);
+            Assert.Single(r.Params);
+            Assert.Equal("^A.*", r.Params[0]);
+        }
+
+        [Fact]
+        public void MixedContainmentAndOperator()
+        {
+            var r = Utils.BuildFilter("{\"active\": true, \"age\": {\"$gte\": 18}}");
+            Assert.Equal("data @> @p0::jsonb AND (data->>'age')::numeric >= @p1", r.WhereClause);
+            Assert.Equal(2, r.Params.Count);
+            Assert.Equal("{\"active\": true}", r.Params[0]);
+            Assert.Equal(18.0, r.Params[1]);
+        }
+
+        [Fact]
+        public void NestedFieldPath()
+        {
+            var r = Utils.BuildFilter("{\"address.city\": {\"$eq\": \"NYC\"}}");
+            Assert.Equal("data->'address'->>'city' = @p0", r.WhereClause);
+            Assert.Single(r.Params);
+            Assert.Equal("NYC", r.Params[0]);
+        }
+
+        [Fact]
+        public void NullFilterReturnsEmpty()
+        {
+            var r = Utils.BuildFilter(null);
+            Assert.Equal("", r.WhereClause);
+            Assert.Empty(r.Params);
+        }
+
+        [Fact]
+        public void UnsupportedOperatorThrows()
+        {
+            Assert.Throws<ArgumentException>(() =>
+                Utils.BuildFilter("{\"x\": {\"$unknown\": 1}}"));
         }
     }
 }

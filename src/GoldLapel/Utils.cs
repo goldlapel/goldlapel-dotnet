@@ -1321,15 +1321,16 @@ namespace GoldLapel
             string filterJson = null, Dictionary<string, int> sort = null, int? limit = null, int? skip = null)
         {
             ValidateIdentifier(collection);
+            var filter = BuildFilter(filterJson);
 
             using (var cmd = conn.CreateCommand())
             {
                 var sql = "SELECT id, data, created_at, updated_at FROM " + collection;
 
-                if (filterJson != null)
+                if (!string.IsNullOrEmpty(filter.WhereClause))
                 {
-                    sql += " WHERE data @> @filter::jsonb";
-                    AddParameter(cmd, "@filter", filterJson);
+                    sql += " WHERE " + filter.WhereClause;
+                    ApplyFilterParams(cmd, filter);
                 }
 
                 if (sort != null && sort.Count > 0)
@@ -1373,15 +1374,16 @@ namespace GoldLapel
         public static Dictionary<string, object> DocFindOne(DbConnection conn, string collection, string filterJson = null)
         {
             ValidateIdentifier(collection);
+            var filter = BuildFilter(filterJson);
 
             using (var cmd = conn.CreateCommand())
             {
                 var sql = "SELECT id, data, created_at, updated_at FROM " + collection;
 
-                if (filterJson != null)
+                if (!string.IsNullOrEmpty(filter.WhereClause))
                 {
-                    sql += " WHERE data @> @filter::jsonb";
-                    AddParameter(cmd, "@filter", filterJson);
+                    sql += " WHERE " + filter.WhereClause;
+                    ApplyFilterParams(cmd, filter);
                 }
 
                 sql += " LIMIT 1";
@@ -1399,14 +1401,20 @@ namespace GoldLapel
         public static int DocUpdate(DbConnection conn, string collection, string filterJson, string updateJson)
         {
             ValidateIdentifier(collection);
+            var filter = BuildFilter(filterJson);
 
             using (var cmd = conn.CreateCommand())
             {
-                cmd.CommandText =
-                    "UPDATE " + collection + " SET data = data || @update::jsonb, updated_at = NOW() " +
-                    "WHERE data @> @filter::jsonb";
+                var sql = "UPDATE " + collection + " SET data = data || @update::jsonb, updated_at = NOW()";
                 AddParameter(cmd, "@update", updateJson);
-                AddParameter(cmd, "@filter", filterJson);
+
+                if (!string.IsNullOrEmpty(filter.WhereClause))
+                {
+                    sql += " WHERE " + filter.WhereClause;
+                    ApplyFilterParams(cmd, filter);
+                }
+
+                cmd.CommandText = sql;
                 return cmd.ExecuteNonQuery();
             }
         }
@@ -1414,14 +1422,23 @@ namespace GoldLapel
         public static int DocUpdateOne(DbConnection conn, string collection, string filterJson, string updateJson)
         {
             ValidateIdentifier(collection);
+            var filter = BuildFilter(filterJson);
 
             using (var cmd = conn.CreateCommand())
             {
-                cmd.CommandText =
-                    "UPDATE " + collection + " SET data = data || @update::jsonb, updated_at = NOW() " +
-                    "WHERE id = (SELECT id FROM " + collection + " WHERE data @> @filter::jsonb LIMIT 1)";
+                var sql = "UPDATE " + collection + " SET data = data || @update::jsonb, updated_at = NOW() " +
+                    "WHERE id = (SELECT id FROM " + collection;
+
+                if (!string.IsNullOrEmpty(filter.WhereClause))
+                {
+                    sql += " WHERE " + filter.WhereClause;
+                    ApplyFilterParams(cmd, filter);
+                }
+
+                sql += " LIMIT 1)";
+
                 AddParameter(cmd, "@update", updateJson);
-                AddParameter(cmd, "@filter", filterJson);
+                cmd.CommandText = sql;
                 return cmd.ExecuteNonQuery();
             }
         }
@@ -1429,12 +1446,19 @@ namespace GoldLapel
         public static int DocDelete(DbConnection conn, string collection, string filterJson)
         {
             ValidateIdentifier(collection);
+            var filter = BuildFilter(filterJson);
 
             using (var cmd = conn.CreateCommand())
             {
-                cmd.CommandText =
-                    "DELETE FROM " + collection + " WHERE data @> @filter::jsonb";
-                AddParameter(cmd, "@filter", filterJson);
+                var sql = "DELETE FROM " + collection;
+
+                if (!string.IsNullOrEmpty(filter.WhereClause))
+                {
+                    sql += " WHERE " + filter.WhereClause;
+                    ApplyFilterParams(cmd, filter);
+                }
+
+                cmd.CommandText = sql;
                 return cmd.ExecuteNonQuery();
             }
         }
@@ -1442,13 +1466,21 @@ namespace GoldLapel
         public static int DocDeleteOne(DbConnection conn, string collection, string filterJson)
         {
             ValidateIdentifier(collection);
+            var filter = BuildFilter(filterJson);
 
             using (var cmd = conn.CreateCommand())
             {
-                cmd.CommandText =
-                    "DELETE FROM " + collection + " WHERE id = (" +
-                    "SELECT id FROM " + collection + " WHERE data @> @filter::jsonb LIMIT 1)";
-                AddParameter(cmd, "@filter", filterJson);
+                var sql = "DELETE FROM " + collection + " WHERE id = (" +
+                    "SELECT id FROM " + collection;
+
+                if (!string.IsNullOrEmpty(filter.WhereClause))
+                {
+                    sql += " WHERE " + filter.WhereClause;
+                    ApplyFilterParams(cmd, filter);
+                }
+
+                sql += " LIMIT 1)";
+                cmd.CommandText = sql;
                 return cmd.ExecuteNonQuery();
             }
         }
@@ -1456,15 +1488,16 @@ namespace GoldLapel
         public static long DocCount(DbConnection conn, string collection, string filterJson = null)
         {
             ValidateIdentifier(collection);
+            var filter = BuildFilter(filterJson);
 
             using (var cmd = conn.CreateCommand())
             {
                 var sql = "SELECT COUNT(*) FROM " + collection;
 
-                if (filterJson != null)
+                if (!string.IsNullOrEmpty(filter.WhereClause))
                 {
-                    sql += " WHERE data @> @filter::jsonb";
-                    AddParameter(cmd, "@filter", filterJson);
+                    sql += " WHERE " + filter.WhereClause;
+                    ApplyFilterParams(cmd, filter);
                 }
 
                 cmd.CommandText = sql;
@@ -1480,7 +1513,7 @@ namespace GoldLapel
 
             var stages = ParsePipeline(pipelineJson);
 
-            string matchFilter = null;
+            FilterResult matchResult = null;
             bool hasGroup = false;
             string groupIdField = null;
             var selectExprs = new List<string>();
@@ -1496,7 +1529,7 @@ namespace GoldLapel
                 switch (stageType)
                 {
                     case "$match":
-                        matchFilter = stage["_body"];
+                        matchResult = BuildFilter(stage["_body"]);
                         break;
                     case "$group":
                         hasGroup = true;
@@ -1554,10 +1587,10 @@ namespace GoldLapel
 
                 sql += " FROM " + collection;
 
-                if (matchFilter != null)
+                if (matchResult != null && !string.IsNullOrEmpty(matchResult.WhereClause))
                 {
-                    sql += " WHERE data @> @filter::jsonb";
-                    AddParameter(cmd, "@filter", matchFilter);
+                    sql += " WHERE " + matchResult.WhereClause;
+                    ApplyFilterParams(cmd, matchResult);
                 }
 
                 if (groupByExprs.Count > 0)
@@ -1756,7 +1789,7 @@ namespace GoldLapel
                 // Skip whitespace
                 while (i < body.Length && (body[i] == ' ' || body[i] == '\t')) i++;
 
-                // Find value (could be object, string, number, null)
+                // Find value (could be object, array, string, number, null)
                 int valStart = i;
                 if (i < body.Length && body[i] == '{')
                 {
@@ -1765,6 +1798,16 @@ namespace GoldLapel
                     {
                         if (body[i] == '{') depth++;
                         else if (body[i] == '}') { depth--; if (depth == 0) { i++; break; } }
+                        i++;
+                    }
+                }
+                else if (i < body.Length && body[i] == '[')
+                {
+                    int depth = 0;
+                    while (i < body.Length)
+                    {
+                        if (body[i] == '[') depth++;
+                        else if (body[i] == ']') { depth--; if (depth == 0) { i++; break; } }
                         i++;
                     }
                 }
@@ -1900,6 +1943,284 @@ namespace GoldLapel
         }
 
         private static readonly Regex IdentifierPattern = new Regex(@"^[a-zA-Z_][a-zA-Z0-9_]*$");
+        private static readonly Regex FieldPartPattern = new Regex(@"^[a-zA-Z_][a-zA-Z0-9_]*$");
+
+        private static readonly Dictionary<string, string> ComparisonOps = new Dictionary<string, string>
+        {
+            { "$gt", ">" }, { "$gte", ">=" }, { "$lt", "<" }, { "$lte", "<=" },
+            { "$eq", "=" }, { "$ne", "!=" }
+        };
+
+        private static readonly HashSet<string> SupportedFilterOps = new HashSet<string>
+        {
+            "$gt", "$gte", "$lt", "$lte", "$eq", "$ne", "$in", "$nin", "$exists", "$regex"
+        };
+
+        internal class FilterResult
+        {
+            public string WhereClause { get; }
+            public List<object> Params { get; }
+
+            public FilterResult(string whereClause, List<object> parameters)
+            {
+                WhereClause = whereClause;
+                Params = parameters;
+            }
+        }
+
+        internal static string FieldPath(string key)
+        {
+            var parts = key.Split('.');
+            foreach (var part in parts)
+            {
+                if (!FieldPartPattern.IsMatch(part))
+                    throw new ArgumentException("Invalid filter key: " + key);
+            }
+            if (parts.Length == 1)
+                return "data->>'" + parts[0] + "'";
+
+            var sb = new System.Text.StringBuilder("data");
+            for (int i = 0; i < parts.Length - 1; i++)
+                sb.Append("->'").Append(parts[i]).Append("'");
+            sb.Append("->>'").Append(parts[parts.Length - 1]).Append("'");
+            return sb.ToString();
+        }
+
+        internal static FilterResult BuildFilter(string filterJson)
+        {
+            if (string.IsNullOrWhiteSpace(filterJson))
+                return new FilterResult("", new List<object>());
+
+            var s = filterJson.Trim();
+            if (!s.StartsWith("{") || !s.EndsWith("}"))
+                throw new ArgumentException("Filter must be a JSON object");
+
+            var body = s.Substring(1, s.Length - 2).Trim();
+            if (body.Length == 0)
+                return new FilterResult("", new List<object>());
+
+            var pairs = SplitKeyValuePairs(body);
+
+            // Fast path: no operator keys => pure containment
+            bool hasOperators = false;
+            foreach (var kv in pairs)
+            {
+                var val = kv[1].Trim();
+                if (val.StartsWith("{") && HasOperatorKeys(val))
+                {
+                    hasOperators = true;
+                    break;
+                }
+            }
+            if (!hasOperators)
+            {
+                var parms = new List<object>();
+                parms.Add(s);
+                return new FilterResult("data @> @p0::jsonb", parms);
+            }
+
+            var containment = new Dictionary<string, string>();
+            var allClauses = new List<string>();
+            var allParams = new List<object>();
+            int paramIdx = 0;
+
+            // First pass: separate containment keys from operator keys
+            var operatorKeys = new List<string[]>();
+            foreach (var kv in pairs)
+            {
+                var val = kv[1].Trim();
+                if (val.StartsWith("{") && HasOperatorKeys(val))
+                    operatorKeys.Add(kv);
+                else
+                {
+                    var key = kv[0].Trim().Trim('"');
+                    containment[key] = val;
+                }
+            }
+
+            // Containment clause first (so param ordering matches clause ordering)
+            if (containment.Count > 0)
+            {
+                var pName = "@p" + paramIdx++;
+                allClauses.Add("data @> " + pName + "::jsonb");
+                allParams.Add(RebuildJsonObject(containment));
+            }
+
+            // Operator clauses
+            foreach (var kv in operatorKeys)
+            {
+                var key = kv[0].Trim().Trim('"');
+                var val = kv[1].Trim();
+                var fieldExpr = FieldPath(key);
+                var opPairs = SplitKeyValuePairs(
+                    val.Substring(1, val.Length - 2).Trim());
+
+                foreach (var opKv in opPairs)
+                {
+                    var op = opKv[0].Trim().Trim('"');
+                    var operand = opKv[1].Trim();
+
+                    if (!SupportedFilterOps.Contains(op))
+                        throw new ArgumentException("Unsupported filter operator: " + op);
+
+                    if (ComparisonOps.ContainsKey(op))
+                    {
+                        var sqlOp = ComparisonOps[op];
+                        var pName = "@p" + paramIdx++;
+                        if (IsNumericLiteral(operand))
+                        {
+                            allClauses.Add("(" + fieldExpr + ")::numeric " + sqlOp + " " + pName);
+                            allParams.Add(double.Parse(operand, CultureInfo.InvariantCulture));
+                        }
+                        else
+                        {
+                            var strVal = Unquote(operand);
+                            allClauses.Add(fieldExpr + " " + sqlOp + " " + pName);
+                            allParams.Add(strVal);
+                        }
+                    }
+                    else if (op == "$in" || op == "$nin")
+                    {
+                        var elements = ParseJsonArray(operand);
+                        if (elements.Count == 0)
+                        {
+                            if (op == "$in")
+                                allClauses.Add("FALSE");
+                            // $nin with empty array matches everything
+                        }
+                        else
+                        {
+                            var placeholders = new List<string>();
+                            foreach (var elem in elements)
+                            {
+                                var pName = "@p" + paramIdx++;
+                                placeholders.Add(pName);
+                                allParams.Add(Unquote(elem.Trim()));
+                            }
+                            var notPrefix = op == "$nin" ? "NOT " : "";
+                            allClauses.Add(fieldExpr + " " + notPrefix + "IN (" +
+                                string.Join(", ", placeholders) + ")");
+                        }
+                    }
+                    else if (op == "$exists")
+                    {
+                        var topKey = key.Split('.')[0];
+                        var pName = "@p" + paramIdx++;
+                        bool exists = operand == "true";
+                        if (exists)
+                            allClauses.Add("data ?? " + pName);
+                        else
+                            allClauses.Add("NOT (data ?? " + pName + ")");
+                        allParams.Add(topKey);
+                    }
+                    else if (op == "$regex")
+                    {
+                        var pattern = Unquote(operand);
+                        var pName = "@p" + paramIdx++;
+                        allClauses.Add(fieldExpr + " ~ " + pName);
+                        allParams.Add(pattern);
+                    }
+                }
+            }
+
+            if (allClauses.Count == 0)
+                return new FilterResult("", allParams);
+            return new FilterResult(string.Join(" AND ", allClauses), allParams);
+        }
+
+        private static bool HasOperatorKeys(string objStr)
+        {
+            var inner = objStr.Substring(1, objStr.Length - 2).Trim();
+            if (inner.Length == 0) return false;
+            string firstKey;
+            if (inner[0] == '"')
+            {
+                int end = inner.IndexOf('"', 1);
+                if (end < 0) return false;
+                firstKey = inner.Substring(1, end - 1);
+            }
+            else
+            {
+                int colon = inner.IndexOf(':');
+                if (colon < 0) return false;
+                firstKey = inner.Substring(0, colon).Trim();
+            }
+            return firstKey.StartsWith("$");
+        }
+
+        private static bool IsNumericLiteral(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return false;
+            double _;
+            return double.TryParse(s, NumberStyles.Any, CultureInfo.InvariantCulture, out _);
+        }
+
+        private static string Unquote(string s)
+        {
+            if (s.Length >= 2 && s.StartsWith("\"") && s.EndsWith("\""))
+                return s.Substring(1, s.Length - 2);
+            return s;
+        }
+
+        private static List<string> ParseJsonArray(string s)
+        {
+            s = s.Trim();
+            if (!s.StartsWith("[") || !s.EndsWith("]"))
+                throw new ArgumentException("Expected JSON array: " + s);
+
+            var inner = s.Substring(1, s.Length - 2).Trim();
+            if (inner.Length == 0)
+                return new List<string>();
+
+            var elements = new List<string>();
+            int depth = 0;
+            int start = 0;
+            bool inString = false;
+            for (int i = 0; i < inner.Length; i++)
+            {
+                char c = inner[i];
+                if (c == '"' && (i == 0 || inner[i - 1] != '\\'))
+                    inString = !inString;
+                else if (!inString)
+                {
+                    if (c == '{' || c == '[') depth++;
+                    else if (c == '}' || c == ']') depth--;
+                    else if (c == ',' && depth == 0)
+                    {
+                        elements.Add(inner.Substring(start, i - start).Trim());
+                        start = i + 1;
+                    }
+                }
+            }
+            elements.Add(inner.Substring(start).Trim());
+            return elements;
+        }
+
+        private static string RebuildJsonObject(Dictionary<string, string> pairs)
+        {
+            var sb = new System.Text.StringBuilder("{");
+            bool first = true;
+            foreach (var entry in pairs)
+            {
+                if (!first) sb.Append(", ");
+                first = false;
+                if (!entry.Key.StartsWith("\""))
+                    sb.Append("\"").Append(entry.Key).Append("\"");
+                else
+                    sb.Append(entry.Key);
+                sb.Append(": ").Append(entry.Value);
+            }
+            sb.Append("}");
+            return sb.ToString();
+        }
+
+        private static void ApplyFilterParams(DbCommand cmd, FilterResult filter)
+        {
+            for (int i = 0; i < filter.Params.Count; i++)
+            {
+                AddParameter(cmd, "@p" + i, filter.Params[i]);
+            }
+        }
 
         private static void ValidateIdentifier(string name)
         {

@@ -80,8 +80,8 @@ namespace GoldLapel.Tests
 
             var sql = _spy.LastCommandText;
             Assert.Contains("SELECT id, data, created_at, updated_at FROM users", sql);
-            Assert.Contains("WHERE data @> @filter::jsonb", sql);
-            Assert.Equal("{\"active\":true}", _spy.LastCommand.ParamValue("@filter"));
+            Assert.Contains("WHERE data @> @p0::jsonb", sql);
+            Assert.Equal("{\"active\":true}", _spy.LastCommand.ParamValue("@p0"));
         }
 
         [Fact]
@@ -111,7 +111,7 @@ namespace GoldLapel.Tests
 
             var sql = _spy.LastCommandText;
             Assert.Contains("DELETE FROM users", sql);
-            Assert.Contains("WHERE data @> @filter::jsonb", sql);
+            Assert.Contains("WHERE data @> @p0::jsonb", sql);
         }
 
         [Fact]
