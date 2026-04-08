@@ -2213,7 +2213,11 @@ namespace GoldLapel
                 {
                     keyStart = i;
                     i++;
-                    while (i < body.Length && body[i] != '"') i++;
+                    while (i < body.Length && body[i] != '"')
+                    {
+                        if (body[i] == '\\') i++;
+                        i++;
+                    }
                     keyEnd = i + 1;
                     i++;
                 }
