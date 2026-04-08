@@ -885,6 +885,8 @@ namespace GoldLapel.Tests
         public Func<FakeDataReader> NextReaderFactory { get; set; }
         public int NextNonQueryResult { get; set; }
         public object NextScalarResult { get; set; }
+        public bool WasClosed { get; private set; }
+        public bool WasDisposed { get; private set; }
 
         public string LastCommandText => Commands.Last().CommandText;
         public SpyCommand LastCommand => Commands.Last();
@@ -897,7 +899,13 @@ namespace GoldLapel.Tests
 
         public override void ChangeDatabase(string databaseName) { }
         public override void Open() { }
-        public override void Close() { }
+        public override void Close() { WasClosed = true; }
+
+        protected override void Dispose(bool disposing)
+        {
+            WasDisposed = true;
+            base.Dispose(disposing);
+        }
 
         protected override DbTransaction BeginDbTransaction(IsolationLevel isolationLevel)
         {
