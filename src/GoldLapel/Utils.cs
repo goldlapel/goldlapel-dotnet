@@ -2642,18 +2642,15 @@ namespace GoldLapel
                         var jp = JsonbPath(field);
                         var fj = FieldPathJson(field);
                         var pJp = "@p" + paramIdx++;
-                        // $addToSet uses the value param 3 times in the expression
-                        // but we need separate param names for each usage
+                        // $addToSet uses the value in 2 places (containment check + append)
                         var valExpr1 = ToJsonbExpr(atsVal, ref paramIdx);
                         var valExpr2 = ToJsonbExpr(atsVal, ref paramIdx);
-                        var valExpr3 = ToJsonbExpr(atsVal, ref paramIdx);
                         expr = "jsonb_set(" + expr + ", " + pJp + "::text[], " +
                             "CASE WHEN COALESCE(" + fj + ", '[]'::jsonb) @> " + valExpr1 + " " +
                             "THEN " + fj + " " +
                             "ELSE COALESCE(" + fj + ", '[]'::jsonb) || " + valExpr2 + " END)";
                         allParams.Add(jp);
                         var v = ToJsonbValue(atsVal);
-                        allParams.Add(v);
                         allParams.Add(v);
                         allParams.Add(v);
                     }

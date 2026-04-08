@@ -102,7 +102,7 @@ namespace GoldLapel.Tests
 
             var sql = _spy.LastCommandText;
             Assert.Contains("UPDATE users", sql);
-            Assert.Contains("SET data = data || @update::jsonb", sql);
+            Assert.Contains("SET data = data || @p0::jsonb", sql);
         }
 
         [Fact]

@@ -251,9 +251,9 @@ namespace GoldLapel.Tests
 
             var sql = conn.LastCommandText;
             Assert.Contains("UPDATE users", sql);
-            Assert.Contains("SET data = data || @update::jsonb", sql);
+            Assert.Contains("SET data = data || @p0::jsonb", sql);
             Assert.Contains("updated_at = NOW()", sql);
-            Assert.Contains("WHERE data @> @p0::jsonb", sql);
+            Assert.Contains("WHERE data @> @p1::jsonb", sql);
         }
 
         [Fact]
@@ -262,8 +262,8 @@ namespace GoldLapel.Tests
             var conn = new SpyConnection();
             Utils.DocUpdate(conn, "users", "{\"active\":true}", "{\"role\":\"admin\"}");
 
-            Assert.Equal("{\"role\":\"admin\"}", conn.LastCommand.ParamValue("@update"));
-            Assert.Equal("{\"active\":true}", conn.LastCommand.ParamValue("@p0"));
+            Assert.Equal("{\"role\":\"admin\"}", conn.LastCommand.ParamValue("@p0"));
+            Assert.Equal("{\"active\":true}", conn.LastCommand.ParamValue("@p1"));
         }
 
         [Fact]
@@ -287,7 +287,7 @@ namespace GoldLapel.Tests
 
             var sql = conn.LastCommandText;
             Assert.Contains("UPDATE users", sql);
-            Assert.Contains("SET data = data || @update::jsonb", sql);
+            Assert.Contains("SET data = data || @p1::jsonb", sql);
             Assert.Contains("updated_at = NOW()", sql);
             Assert.Contains("WHERE id = (SELECT id FROM users WHERE data @> @p0::jsonb LIMIT 1)", sql);
         }
@@ -298,7 +298,7 @@ namespace GoldLapel.Tests
             var conn = new SpyConnection();
             Utils.DocUpdateOne(conn, "users", "{\"name\":\"alice\"}", "{\"age\":30}");
 
-            Assert.Equal("{\"age\":30}", conn.LastCommand.ParamValue("@update"));
+            Assert.Equal("{\"age\":30}", conn.LastCommand.ParamValue("@p1"));
             Assert.Equal("{\"name\":\"alice\"}", conn.LastCommand.ParamValue("@p0"));
         }
 
@@ -1174,8 +1174,8 @@ namespace GoldLapel.Tests
             var conn = new SpyConnection();
             Utils.DocUpdate(conn, "users", "{\"profile.verified\": true}", "{\"level\":\"pro\"}");
 
-            Assert.Equal("{\"profile\": {\"verified\": true}}", conn.LastCommand.ParamValue("@p0"));
-            Assert.Equal("{\"level\":\"pro\"}", conn.LastCommand.ParamValue("@update"));
+            Assert.Equal("{\"level\":\"pro\"}", conn.LastCommand.ParamValue("@p0"));
+            Assert.Equal("{\"profile\": {\"verified\": true}}", conn.LastCommand.ParamValue("@p1"));
         }
 
         [Fact]
@@ -1349,6 +1349,500 @@ namespace GoldLapel.Tests
             var conn = new SpyConnection();
             Assert.Throws<ArgumentException>(() =>
                 Utils.DocRemoveCap(conn, "bad; name"));
+        }
+    }
+
+    // ── Logical operators ($or, $and, $not) ──────────────────────
+
+    public class LogicalOperatorsTest
+    {
+        [Fact]
+        public void OrSimple()
+        {
+            var r = Utils.BuildFilter("{\"$or\": [{\"status\":\"active\"}, {\"status\":\"inactive\"}]}");
+            Assert.Contains("OR", r.WhereClause);
+            Assert.StartsWith("(", r.WhereClause);
+            Assert.Equal(2, r.Params.Count);
+            Assert.Equal("{\"status\":\"active\"}", r.Params[0]);
+            Assert.Equal("{\"status\":\"inactive\"}", r.Params[1]);
+        }
+
+        [Fact]
+        public void AndExplicit()
+        {
+            var r = Utils.BuildFilter("{\"$and\": [{\"age\": {\"$gt\": 18}}, {\"age\": {\"$lt\": 65}}]}");
+            Assert.Contains("AND", r.WhereClause);
+            Assert.StartsWith("(", r.WhereClause);
+            Assert.Equal(2, r.Params.Count);
+            Assert.Equal(18.0, r.Params[0]);
+            Assert.Equal(65.0, r.Params[1]);
+        }
+
+        [Fact]
+        public void NotOperator()
+        {
+            var r = Utils.BuildFilter("{\"$not\": {\"status\":\"active\"}}");
+            Assert.StartsWith("NOT (", r.WhereClause);
+            Assert.Single(r.Params);
+            Assert.Equal("{\"status\":\"active\"}", r.Params[0]);
+        }
+
+        [Fact]
+        public void OrWithOperators()
+        {
+            var r = Utils.BuildFilter("{\"$or\": [{\"status\":\"active\"}, {\"age\": {\"$gt\": 25}}]}");
+            Assert.Contains("OR", r.WhereClause);
+            Assert.Equal(2, r.Params.Count);
+            Assert.Equal("{\"status\":\"active\"}", r.Params[0]);
+            Assert.Equal(25.0, r.Params[1]);
+        }
+
+        [Fact]
+        public void NestedOrAnd()
+        {
+            var r = Utils.BuildFilter(
+                "{\"$or\": [{\"$and\": [{\"a\": 1}, {\"b\": 2}]}, {\"$not\": {\"c\": 3}}]}");
+            Assert.Contains("OR", r.WhereClause);
+            Assert.Contains("AND", r.WhereClause);
+            Assert.Contains("NOT", r.WhereClause);
+        }
+
+        [Fact]
+        public void MixedLogicalAndField()
+        {
+            var r = Utils.BuildFilter(
+                "{\"name\": \"alice\", \"$or\": [{\"status\":\"active\"}, {\"age\": {\"$gt\": 25}}]}");
+            Assert.Contains("AND", r.WhereClause);
+            Assert.Contains("OR", r.WhereClause);
+            // First param should be containment for name
+            Assert.Contains("alice", r.Params[0].ToString());
+        }
+
+        [Fact]
+        public void OrEmptyThrows()
+        {
+            Assert.Throws<ArgumentException>(() =>
+                Utils.BuildFilter("{\"$or\": []}"));
+        }
+
+        [Fact]
+        public void OrNonArrayThrows()
+        {
+            Assert.Throws<ArgumentException>(() =>
+                Utils.BuildFilter("{\"$or\": {\"a\": 1}}"));
+        }
+
+        [Fact]
+        public void NotNonObjectThrows()
+        {
+            Assert.Throws<ArgumentException>(() =>
+                Utils.BuildFilter("{\"$not\": [{\"a\": 1}]}"));
+        }
+
+        [Fact]
+        public void OrInDocFind()
+        {
+            var conn = new SpyConnection();
+            Utils.DocFind(conn, "users",
+                filterJson: "{\"$or\": [{\"status\":\"active\"}, {\"status\":\"inactive\"}]}");
+            Assert.Contains("OR", conn.LastCommandText);
+        }
+
+        [Fact]
+        public void NotInDocCount()
+        {
+            var conn = new SpyConnection();
+            conn.NextScalarResult = 5L;
+            Utils.DocCount(conn, "users", filterJson: "{\"$not\": {\"status\":\"suspended\"}}");
+            Assert.Contains("NOT", conn.LastCommandText);
+        }
+    }
+
+    // ── Field update operators ($set, $inc, $unset, $mul, $rename) ──
+
+    public class FieldUpdateOperatorsTest
+    {
+        [Fact]
+        public void PlainUpdateFallback()
+        {
+            var r = Utils.BuildUpdate("{\"name\":\"new\"}");
+            Assert.Equal("data || @p0::jsonb", r.Expression);
+            Assert.Single(r.Params);
+            Assert.Equal("{\"name\":\"new\"}", r.Params[0]);
+        }
+
+        [Fact]
+        public void SetOperator()
+        {
+            var r = Utils.BuildUpdate("{\"$set\": {\"name\":\"new\", \"age\": 30}}");
+            Assert.Contains("|| @p0::jsonb", r.Expression);
+            Assert.Single(r.Params);
+            Assert.Equal("{\"name\":\"new\", \"age\": 30}", r.Params[0]);
+        }
+
+        [Fact]
+        public void IncOperator()
+        {
+            var r = Utils.BuildUpdate("{\"$inc\": {\"count\": 1}}");
+            Assert.Contains("jsonb_set", r.Expression);
+            Assert.Contains("COALESCE", r.Expression);
+            Assert.Contains("+ @p1", r.Expression);
+            Assert.Equal(2, r.Params.Count);
+            Assert.Equal("{count}", r.Params[0]);
+            Assert.Equal(1.0, r.Params[1]);
+        }
+
+        [Fact]
+        public void IncNested()
+        {
+            var r = Utils.BuildUpdate("{\"$inc\": {\"stats.views\": 5}}");
+            Assert.Contains("{stats,views}", r.Params[0].ToString());
+            Assert.Contains("data->'stats'->>'views'", r.Expression);
+        }
+
+        [Fact]
+        public void UnsetTopLevel()
+        {
+            var r = Utils.BuildUpdate("{\"$unset\": {\"old_field\": \"\"}}");
+            Assert.Contains("- @p0", r.Expression);
+            Assert.Single(r.Params);
+            Assert.Equal("old_field", r.Params[0]);
+        }
+
+        [Fact]
+        public void UnsetNested()
+        {
+            var r = Utils.BuildUpdate("{\"$unset\": {\"nested.field\": \"\"}}");
+            Assert.Contains("#- @p0::text[]", r.Expression);
+            Assert.Single(r.Params);
+            Assert.Equal("{nested,field}", r.Params[0]);
+        }
+
+        [Fact]
+        public void MulOperator()
+        {
+            var r = Utils.BuildUpdate("{\"$mul\": {\"price\": 1.1}}");
+            Assert.Contains("jsonb_set", r.Expression);
+            Assert.Contains("* @p1", r.Expression);
+            Assert.Equal(2, r.Params.Count);
+            Assert.Equal("{price}", r.Params[0]);
+            Assert.Equal(1.1, r.Params[1]);
+        }
+
+        [Fact]
+        public void RenameOperator()
+        {
+            var r = Utils.BuildUpdate("{\"$rename\": {\"old_name\": \"new_name\"}}");
+            Assert.Contains("jsonb_set", r.Expression);
+            Assert.Contains("- @p0", r.Expression);
+            Assert.Equal(2, r.Params.Count);
+            Assert.Equal("old_name", r.Params[0]);
+            Assert.Equal("{new_name}", r.Params[1]);
+        }
+
+        [Fact]
+        public void CombinedSetIncUnset()
+        {
+            var r = Utils.BuildUpdate(
+                "{\"$set\": {\"name\":\"new\"}, \"$inc\": {\"count\": 1}, \"$unset\": {\"temp\": \"\"}}");
+            Assert.Contains("|| @p0::jsonb", r.Expression);
+            Assert.Contains("jsonb_set", r.Expression);
+            Assert.Contains("- @p", r.Expression);
+            // $set param, then $unset param (temp), then $inc params (path + amount)
+            Assert.Contains("new", r.Params[0].ToString());
+            Assert.Contains("temp", r.Params.Cast<object>().Select(p => p.ToString()).ToList());
+        }
+
+        [Fact]
+        public void SetInDocUpdate()
+        {
+            var conn = new SpyConnection();
+            Utils.DocUpdate(conn, "users",
+                "{\"status\": \"old\"}",
+                "{\"$set\": {\"status\": \"new\"}}");
+
+            var sql = conn.LastCommandText;
+            Assert.Contains("|| @p0::jsonb", sql);
+            Assert.Contains("UPDATE users SET data =", sql);
+        }
+
+        [Fact]
+        public void IncInDocUpdateOne()
+        {
+            var conn = new SpyConnection();
+            Utils.DocUpdateOne(conn, "users",
+                "{\"name\": \"alice\"}",
+                "{\"$inc\": {\"score\": 10}}");
+
+            var sql = conn.LastCommandText;
+            Assert.Contains("jsonb_set", sql);
+            Assert.Contains("COALESCE", sql);
+        }
+
+        [Fact]
+        public void InvalidFieldKeyThrows()
+        {
+            Assert.Throws<ArgumentException>(() =>
+                Utils.BuildUpdate("{\"$inc\": {\"bad;field\": 1}}"));
+        }
+    }
+
+    // ── Array update operators ($push, $pull, $addToSet) ─────────
+
+    public class ArrayUpdateOperatorsTest
+    {
+        [Fact]
+        public void PushString()
+        {
+            var r = Utils.BuildUpdate("{\"$push\": {\"tags\": \"new_tag\"}}");
+            Assert.Contains("jsonb_set", r.Expression);
+            Assert.Contains("COALESCE", r.Expression);
+            Assert.Contains("to_jsonb(@p1::text)", r.Expression);
+            Assert.Equal(2, r.Params.Count);
+            Assert.Equal("{tags}", r.Params[0]);
+            Assert.Equal("new_tag", r.Params[1]);
+        }
+
+        [Fact]
+        public void PushNumber()
+        {
+            var r = Utils.BuildUpdate("{\"$push\": {\"scores\": 99}}");
+            Assert.Contains("to_jsonb(@p1::numeric)", r.Expression);
+            Assert.Equal(2, r.Params.Count);
+            Assert.Equal("{scores}", r.Params[0]);
+            Assert.Equal(99.0, r.Params[1]);
+        }
+
+        [Fact]
+        public void Pull()
+        {
+            var r = Utils.BuildUpdate("{\"$pull\": {\"tags\": \"old_tag\"}}");
+            Assert.Contains("jsonb_agg(elem)", r.Expression);
+            Assert.Contains("WHERE elem !=", r.Expression);
+            Assert.Equal(2, r.Params.Count);
+            Assert.Equal("{tags}", r.Params[0]);
+            Assert.Equal("old_tag", r.Params[1]);
+        }
+
+        [Fact]
+        public void AddToSet()
+        {
+            var r = Utils.BuildUpdate("{\"$addToSet\": {\"tags\": \"maybe\"}}");
+            Assert.Contains("CASE WHEN", r.Expression);
+            Assert.Contains("@>", r.Expression);
+            Assert.Equal(3, r.Params.Count);
+            Assert.Equal("{tags}", r.Params[0]);
+            Assert.Equal("maybe", r.Params[1]);
+            Assert.Equal("maybe", r.Params[2]);
+        }
+
+        [Fact]
+        public void PushInDocUpdate()
+        {
+            var conn = new SpyConnection();
+            Utils.DocUpdate(conn, "users",
+                "{\"name\":\"alice\"}",
+                "{\"$push\": {\"tags\": \"python\"}}");
+
+            var sql = conn.LastCommandText;
+            Assert.Contains("jsonb_set", sql);
+            Assert.Contains("COALESCE", sql);
+        }
+
+        [Fact]
+        public void CombinedSetPush()
+        {
+            var r = Utils.BuildUpdate(
+                "{\"$set\": {\"name\":\"new\"}, \"$push\": {\"tags\": \"added\"}}");
+            Assert.Contains("|| @p0::jsonb", r.Expression);
+            Assert.Contains("jsonb_set", r.Expression);
+        }
+    }
+
+    // ── DocFindOneAndUpdate ──────────────────────────────────────
+
+    public class DocFindOneAndUpdateTest
+    {
+        [Fact]
+        public void SqlGeneration()
+        {
+            var conn = new SpyConnection();
+            Utils.DocFindOneAndUpdate(conn, "users",
+                "{\"name\":\"alice\"}", "{\"$inc\": {\"score\": 5}}");
+
+            var sql = conn.LastCommandText;
+            Assert.Contains("WITH target AS", sql);
+            Assert.Contains("RETURNING", sql);
+            Assert.Contains("jsonb_set", sql);
+            Assert.Contains("SELECT id FROM users", sql);
+            Assert.Contains("WHERE data @> @p0::jsonb", sql);
+        }
+
+        [Fact]
+        public void PlainUpdate()
+        {
+            var conn = new SpyConnection();
+            Utils.DocFindOneAndUpdate(conn, "users",
+                "{\"name\":\"alice\"}", "{\"status\":\"updated\"}");
+
+            var sql = conn.LastCommandText;
+            Assert.Contains("|| @p1::jsonb", sql);
+            Assert.Contains("RETURNING", sql);
+        }
+
+        [Fact]
+        public void InvalidCollectionThrows()
+        {
+            var conn = new SpyConnection();
+            Assert.Throws<ArgumentException>(() =>
+                Utils.DocFindOneAndUpdate(conn, "bad; name", "{}", "{\"a\":1}"));
+        }
+    }
+
+    // ── DocFindOneAndDelete ──────────────────────────────────────
+
+    public class DocFindOneAndDeleteTest
+    {
+        [Fact]
+        public void SqlGeneration()
+        {
+            var conn = new SpyConnection();
+            Utils.DocFindOneAndDelete(conn, "users", "{\"name\":\"alice\"}");
+
+            var sql = conn.LastCommandText;
+            Assert.Contains("WITH target AS", sql);
+            Assert.Contains("DELETE FROM users", sql);
+            Assert.Contains("RETURNING", sql);
+            Assert.Contains("SELECT id FROM users", sql);
+            Assert.Contains("WHERE data @> @p0::jsonb", sql);
+        }
+
+        [Fact]
+        public void WithoutFilter()
+        {
+            var conn = new SpyConnection();
+            Utils.DocFindOneAndDelete(conn, "users", null);
+
+            var sql = conn.LastCommandText;
+            Assert.Contains("WITH target AS", sql);
+            Assert.Contains("DELETE FROM users", sql);
+            Assert.DoesNotContain("WHERE data @>", sql);
+        }
+
+        [Fact]
+        public void InvalidCollectionThrows()
+        {
+            var conn = new SpyConnection();
+            Assert.Throws<ArgumentException>(() =>
+                Utils.DocFindOneAndDelete(conn, "bad; name", "{}"));
+        }
+    }
+
+    // ── DocDistinct ─────────────────────────────────────────────
+
+    public class DocDistinctTest
+    {
+        [Fact]
+        public void BasicDistinct()
+        {
+            var conn = new SpyConnection();
+            Utils.DocDistinct(conn, "users", "status");
+
+            var sql = conn.LastCommandText;
+            Assert.Contains("SELECT DISTINCT", sql);
+            Assert.Contains("data->>'status'", sql);
+            Assert.Contains("IS NOT NULL", sql);
+        }
+
+        [Fact]
+        public void DotNotation()
+        {
+            var conn = new SpyConnection();
+            Utils.DocDistinct(conn, "users", "address.city");
+
+            var sql = conn.LastCommandText;
+            Assert.Contains("data->'address'->>'city'", sql);
+        }
+
+        [Fact]
+        public void WithFilter()
+        {
+            var conn = new SpyConnection();
+            Utils.DocDistinct(conn, "users", "status",
+                filterJson: "{\"age\": {\"$gt\": 25}}");
+
+            var sql = conn.LastCommandText;
+            Assert.Contains("SELECT DISTINCT", sql);
+            Assert.Contains("IS NOT NULL", sql);
+            Assert.Contains("(data->>'age')::numeric > @p0", sql);
+        }
+
+        [Fact]
+        public void NoFilter()
+        {
+            var conn = new SpyConnection();
+            Utils.DocDistinct(conn, "users", "status");
+
+            var sql = conn.LastCommandText;
+            Assert.Contains("SELECT DISTINCT", sql);
+            Assert.Contains("IS NOT NULL", sql);
+        }
+
+        [Fact]
+        public void InvalidFieldThrows()
+        {
+            var conn = new SpyConnection();
+            Assert.Throws<ArgumentException>(() =>
+                Utils.DocDistinct(conn, "users", "bad;field"));
+        }
+
+        [Fact]
+        public void InvalidCollectionThrows()
+        {
+            var conn = new SpyConnection();
+            Assert.Throws<ArgumentException>(() =>
+                Utils.DocDistinct(conn, "bad; name", "status"));
+        }
+    }
+
+    // ── Helper function tests ───────────────────────────────────
+
+    public class HelperFunctionTest
+    {
+        [Fact]
+        public void FieldPathJsonSingle()
+        {
+            Assert.Equal("data->'name'", Utils.FieldPathJson("name"));
+        }
+
+        [Fact]
+        public void FieldPathJsonNested()
+        {
+            Assert.Equal("data->'addr'->'city'", Utils.FieldPathJson("addr.city"));
+        }
+
+        [Fact]
+        public void FieldPathJsonInvalidThrows()
+        {
+            Assert.Throws<ArgumentException>(() => Utils.FieldPathJson("bad;key"));
+        }
+
+        [Fact]
+        public void JsonbPathSingle()
+        {
+            Assert.Equal("{name}", Utils.JsonbPath("name"));
+        }
+
+        [Fact]
+        public void JsonbPathNested()
+        {
+            Assert.Equal("{addr,city}", Utils.JsonbPath("addr.city"));
+        }
+
+        [Fact]
+        public void JsonbPathInvalidThrows()
+        {
+            Assert.Throws<ArgumentException>(() => Utils.JsonbPath("bad;key"));
         }
     }
 }
