@@ -1472,6 +1472,126 @@ namespace GoldLapel
             }
         }
 
+        public static List<Dictionary<string, object>> DocAggregate(DbConnection conn, string collection, string pipelineJson)
+        {
+            ValidateIdentifier(collection);
+            if (pipelineJson == null)
+                throw new ArgumentException("Pipeline must not be null");
+
+            var stages = ParsePipeline(pipelineJson);
+
+            string matchFilter = null;
+            bool hasGroup = false;
+            string groupIdField = null;
+            var selectExprs = new List<string>();
+            var groupByExprs = new List<string>();
+            string sortClause = null;
+            bool sortAfterGroup = false;
+            int? limitVal = null;
+            int? skipVal = null;
+
+            foreach (var stage in stages)
+            {
+                string stageType = stage["_type"];
+                switch (stageType)
+                {
+                    case "$match":
+                        matchFilter = stage["_body"];
+                        break;
+                    case "$group":
+                        hasGroup = true;
+                        if (stage.ContainsKey("_id"))
+                        {
+                            var idRaw = stage["_id"];
+                            if (idRaw != null && idRaw != "null")
+                            {
+                                if (idRaw.StartsWith("\"$") && idRaw.EndsWith("\""))
+                                    groupIdField = idRaw.Substring(2, idRaw.Length - 3);
+                                else if (idRaw.StartsWith("$"))
+                                    groupIdField = idRaw.Substring(1);
+                                else
+                                    groupIdField = idRaw.Trim('"');
+
+                                ValidateIdentifier(groupIdField);
+                                selectExprs.Add("data->>'" + groupIdField + "' AS _id");
+                                groupByExprs.Add("data->>'" + groupIdField + "'");
+                            }
+                        }
+                        foreach (var kv in stage)
+                        {
+                            if (kv.Key == "_type" || kv.Key == "_id" || kv.Key == "_body")
+                                continue;
+                            ValidateIdentifier(kv.Key);
+                            var accExpr = ParseAccumulator(kv.Value);
+                            selectExprs.Add(accExpr + " AS " + kv.Key);
+                        }
+                        break;
+                    case "$sort":
+                        sortAfterGroup = hasGroup;
+                        if (sortAfterGroup)
+                            sortClause = ParseAliasSortClause(stage["_body"]);
+                        else
+                            sortClause = ParseDataSortClause(stage["_body"]);
+                        break;
+                    case "$limit":
+                        limitVal = int.Parse(stage["_body"]);
+                        break;
+                    case "$skip":
+                        skipVal = int.Parse(stage["_body"]);
+                        break;
+                    default:
+                        throw new ArgumentException("Unsupported pipeline stage: " + stageType);
+                }
+            }
+
+            using (var cmd = conn.CreateCommand())
+            {
+                var sql = "";
+                if (hasGroup && selectExprs.Count > 0)
+                    sql = "SELECT " + string.Join(", ", selectExprs);
+                else
+                    sql = "SELECT id, data, created_at, updated_at";
+
+                sql += " FROM " + collection;
+
+                if (matchFilter != null)
+                {
+                    sql += " WHERE data @> @filter::jsonb";
+                    AddParameter(cmd, "@filter", matchFilter);
+                }
+
+                if (groupByExprs.Count > 0)
+                    sql += " GROUP BY " + string.Join(", ", groupByExprs);
+
+                if (sortClause != null)
+                    sql += " ORDER BY " + sortClause;
+
+                if (limitVal.HasValue)
+                {
+                    sql += " LIMIT @limit";
+                    AddParameter(cmd, "@limit", limitVal.Value);
+                }
+
+                if (skipVal.HasValue)
+                {
+                    sql += " OFFSET @skip";
+                    AddParameter(cmd, "@skip", skipVal.Value);
+                }
+
+                cmd.CommandText = sql;
+
+                var results = new List<Dictionary<string, object>>();
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        results.Add(ReadRow(reader));
+                    }
+                }
+                return results;
+            }
+        }
+
         public static void DocCreateIndex(DbConnection conn, string collection, List<string> keys = null)
         {
             EnsureCollection(conn, collection);
@@ -1505,6 +1625,278 @@ namespace GoldLapel
                     cmd.ExecuteNonQuery();
                 }
             }
+        }
+
+        // ── Pipeline parsing helpers ────────────────────────────────
+
+        internal static List<Dictionary<string, string>> ParsePipeline(string pipelineJson)
+        {
+            var s = pipelineJson.Trim();
+            if (!s.StartsWith("[") || !s.EndsWith("]"))
+                throw new ArgumentException("Pipeline must be a JSON array");
+
+            s = s.Substring(1, s.Length - 2).Trim();
+            if (s.Length == 0)
+                return new List<Dictionary<string, string>>();
+
+            var objects = SplitTopLevelObjects(s);
+            var stages = new List<Dictionary<string, string>>();
+            foreach (var obj in objects)
+                stages.Add(ParseStageObject(obj.Trim()));
+            return stages;
+        }
+
+        private static List<string> SplitTopLevelObjects(string s)
+        {
+            var result = new List<string>();
+            int depth = 0;
+            int start = -1;
+            for (int i = 0; i < s.Length; i++)
+            {
+                char c = s[i];
+                if (c == '{')
+                {
+                    if (depth == 0) start = i;
+                    depth++;
+                }
+                else if (c == '}')
+                {
+                    depth--;
+                    if (depth == 0 && start >= 0)
+                    {
+                        result.Add(s.Substring(start, i - start + 1));
+                        start = -1;
+                    }
+                }
+            }
+            return result;
+        }
+
+        private static Dictionary<string, string> ParseStageObject(string obj)
+        {
+            if (!obj.StartsWith("{") || !obj.EndsWith("}"))
+                throw new ArgumentException("Invalid stage: " + obj);
+
+            var body = obj.Substring(1, obj.Length - 2).Trim();
+            int colonPos = body.IndexOf(':');
+            if (colonPos < 0)
+                throw new ArgumentException("Invalid stage: " + obj);
+
+            var stageKey = body.Substring(0, colonPos).Trim().Trim('"');
+            var stageValue = body.Substring(colonPos + 1).Trim();
+
+            var stage = new Dictionary<string, string>();
+            stage["_type"] = stageKey;
+
+            if (stageKey == "$group")
+                ParseGroupStage(stageValue, stage);
+            else if (stageKey == "$sort")
+                stage["_body"] = stageValue;
+            else if (stageKey == "$match")
+                stage["_body"] = stageValue;
+            else
+                stage["_body"] = stageValue.Trim();
+
+            return stage;
+        }
+
+        private static void ParseGroupStage(string value, Dictionary<string, string> stage)
+        {
+            if (!value.StartsWith("{") || !value.EndsWith("}"))
+                throw new ArgumentException("$group value must be an object");
+
+            var body = value.Substring(1, value.Length - 2).Trim();
+            var pairs = SplitKeyValuePairs(body);
+            foreach (var kv in pairs)
+            {
+                var key = kv[0].Trim().Trim('"');
+                var val = kv[1].Trim();
+                if (key == "_id")
+                    stage["_id"] = val;
+                else
+                    stage[key] = val;
+            }
+        }
+
+        private static List<string[]> SplitKeyValuePairs(string body)
+        {
+            var pairs = new List<string[]>();
+            int i = 0;
+            while (i < body.Length)
+            {
+                // Skip whitespace and commas
+                while (i < body.Length && (body[i] == ',' || body[i] == ' '
+                    || body[i] == '\n' || body[i] == '\r' || body[i] == '\t'))
+                    i++;
+
+                if (i >= body.Length) break;
+
+                // Find key
+                int keyStart, keyEnd;
+                if (body[i] == '"')
+                {
+                    keyStart = i;
+                    i++;
+                    while (i < body.Length && body[i] != '"') i++;
+                    keyEnd = i + 1;
+                    i++;
+                }
+                else
+                {
+                    keyStart = i;
+                    while (i < body.Length && body[i] != ':') i++;
+                    keyEnd = i;
+                }
+                var key = body.Substring(keyStart, keyEnd - keyStart).Trim();
+
+                // Skip colon
+                while (i < body.Length && body[i] != ':') i++;
+                i++; // skip ':'
+
+                // Skip whitespace
+                while (i < body.Length && (body[i] == ' ' || body[i] == '\t')) i++;
+
+                // Find value (could be object, string, number, null)
+                int valStart = i;
+                if (i < body.Length && body[i] == '{')
+                {
+                    int depth = 0;
+                    while (i < body.Length)
+                    {
+                        if (body[i] == '{') depth++;
+                        else if (body[i] == '}') { depth--; if (depth == 0) { i++; break; } }
+                        i++;
+                    }
+                }
+                else if (i < body.Length && body[i] == '"')
+                {
+                    i++;
+                    while (i < body.Length && body[i] != '"')
+                    {
+                        if (body[i] == '\\') i++; // skip escaped char
+                        i++;
+                    }
+                    i++; // closing quote
+                }
+                else
+                {
+                    // number or null or bare token
+                    while (i < body.Length && body[i] != ',' && body[i] != '}'
+                        && body[i] != ' ' && body[i] != '\n')
+                        i++;
+                }
+                var val = body.Substring(valStart, i - valStart).Trim();
+                pairs.Add(new string[] { key, val });
+            }
+            return pairs;
+        }
+
+        private static string ParseAccumulator(string accJson)
+        {
+            var s = accJson.Trim();
+            if (!s.StartsWith("{") || !s.EndsWith("}"))
+                throw new ArgumentException("Accumulator must be an object: " + accJson);
+
+            var inner = s.Substring(1, s.Length - 2).Trim();
+            int colonPos = inner.IndexOf(':');
+            if (colonPos < 0)
+                throw new ArgumentException("Invalid accumulator: " + accJson);
+
+            var op = inner.Substring(0, colonPos).Trim().Trim('"');
+            var arg = inner.Substring(colonPos + 1).Trim();
+
+            switch (op)
+            {
+                case "$sum":
+                    if (arg == "1")
+                        return "COUNT(*)";
+                    else
+                    {
+                        var field = ExtractFieldRef(arg);
+                        return "SUM((data->>'" + field + "')::numeric)";
+                    }
+                case "$avg":
+                {
+                    var field = ExtractFieldRef(arg);
+                    return "AVG((data->>'" + field + "')::numeric)";
+                }
+                case "$min":
+                {
+                    var field = ExtractFieldRef(arg);
+                    return "MIN((data->>'" + field + "')::numeric)";
+                }
+                case "$max":
+                {
+                    var field = ExtractFieldRef(arg);
+                    return "MAX((data->>'" + field + "')::numeric)";
+                }
+                case "$count":
+                    return "COUNT(*)";
+                default:
+                    throw new ArgumentException("Unsupported accumulator: " + op);
+            }
+        }
+
+        private static string ExtractFieldRef(string arg)
+        {
+            var s = arg.Trim().Trim('"');
+            if (!s.StartsWith("$"))
+                throw new ArgumentException("Accumulator field must be a $reference: " + arg);
+            var field = s.Substring(1);
+            ValidateIdentifier(field);
+            return field;
+        }
+
+        private static string ParseAliasSortClause(string sortJson)
+        {
+            if (string.IsNullOrEmpty(sortJson))
+                return null;
+            var body = sortJson.Trim();
+            if (!body.StartsWith("{") || !body.EndsWith("}"))
+                throw new ArgumentException("Sort must be a JSON object");
+            body = body.Substring(1, body.Length - 2).Trim();
+            if (body.Length == 0)
+                return null;
+
+            var parts = new List<string>();
+            var pairs = body.Split(',');
+            foreach (var pair in pairs)
+            {
+                var kv = pair.Split(':');
+                if (kv.Length != 2)
+                    throw new ArgumentException("Invalid sort entry: " + pair.Trim());
+                var key = kv[0].Trim().Trim('"');
+                ValidateIdentifier(key);
+                int dir = int.Parse(kv[1].Trim());
+                parts.Add(key + (dir == 1 ? " ASC" : " DESC"));
+            }
+            return string.Join(", ", parts);
+        }
+
+        private static string ParseDataSortClause(string sortJson)
+        {
+            if (string.IsNullOrEmpty(sortJson))
+                return null;
+            var body = sortJson.Trim();
+            if (!body.StartsWith("{") || !body.EndsWith("}"))
+                throw new ArgumentException("Sort must be a JSON object");
+            body = body.Substring(1, body.Length - 2).Trim();
+            if (body.Length == 0)
+                return null;
+
+            var parts = new List<string>();
+            var pairs = body.Split(',');
+            foreach (var pair in pairs)
+            {
+                var kv = pair.Split(':');
+                if (kv.Length != 2)
+                    throw new ArgumentException("Invalid sort entry: " + pair.Trim());
+                var key = kv[0].Trim().Trim('"');
+                ValidateIdentifier(key);
+                int dir = int.Parse(kv[1].Trim());
+                parts.Add("data->>'" + key + "' " + (dir == 1 ? "ASC" : "DESC"));
+            }
+            return string.Join(", ", parts);
         }
 
         private static readonly Regex IdentifierPattern = new Regex(@"^[a-zA-Z_][a-zA-Z0-9_]*$");

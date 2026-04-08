@@ -502,4 +502,180 @@ namespace GoldLapel.Tests
                 Utils.DocCreateIndex(conn, "users", new List<string> { "bad key!" }));
         }
     }
+
+    // ── DocAggregate ────────────────────────────────────────────
+
+    public class DocAggregateTest
+    {
+        [Fact]
+        public void FullPipeline()
+        {
+            var conn = new SpyConnection();
+            Utils.DocAggregate(conn, "orders",
+                "[{\"$match\": {\"status\":\"shipped\"}}, " +
+                "{\"$group\": {\"_id\": \"$region\", \"total\": {\"$sum\": \"$amount\"}}}, " +
+                "{\"$sort\": {\"total\": -1}}, " +
+                "{\"$limit\": 10}, " +
+                "{\"$skip\": 5}]");
+
+            var sql = conn.LastCommandText;
+            Assert.Contains("SELECT data->>'region' AS _id, SUM((data->>'amount')::numeric) AS total", sql);
+            Assert.Contains("FROM orders", sql);
+            Assert.Contains("WHERE data @> @filter::jsonb", sql);
+            Assert.Contains("GROUP BY data->>'region'", sql);
+            Assert.Contains("ORDER BY total DESC", sql);
+            Assert.Contains("LIMIT @limit", sql);
+            Assert.Contains("OFFSET @skip", sql);
+            Assert.Equal("{\"status\":\"shipped\"}", conn.LastCommand.ParamValue("@filter"));
+            Assert.Equal(10, conn.LastCommand.ParamValue("@limit"));
+            Assert.Equal(5, conn.LastCommand.ParamValue("@skip"));
+        }
+
+        [Fact]
+        public void Accumulators()
+        {
+            var conn = new SpyConnection();
+            Utils.DocAggregate(conn, "orders",
+                "[{\"$group\": {" +
+                "\"_id\": \"$category\", " +
+                "\"cnt\": {\"$sum\": 1}, " +
+                "\"total\": {\"$sum\": \"$price\"}, " +
+                "\"mean\": {\"$avg\": \"$price\"}, " +
+                "\"lo\": {\"$min\": \"$price\"}, " +
+                "\"hi\": {\"$max\": \"$price\"}}}]");
+
+            var sql = conn.LastCommandText;
+            Assert.Contains("COUNT(*) AS cnt", sql);
+            Assert.Contains("SUM((data->>'price')::numeric) AS total", sql);
+            Assert.Contains("AVG((data->>'price')::numeric) AS mean", sql);
+            Assert.Contains("MIN((data->>'price')::numeric) AS lo", sql);
+            Assert.Contains("MAX((data->>'price')::numeric) AS hi", sql);
+            Assert.Contains("GROUP BY data->>'category'", sql);
+        }
+
+        [Fact]
+        public void NullGroupId()
+        {
+            var conn = new SpyConnection();
+            Utils.DocAggregate(conn, "orders",
+                "[{\"$group\": {\"_id\": null, \"total\": {\"$sum\": \"$amount\"}}}]");
+
+            var sql = conn.LastCommandText;
+            Assert.Contains("SUM((data->>'amount')::numeric) AS total", sql);
+            Assert.DoesNotContain("GROUP BY", sql);
+            Assert.DoesNotContain("AS _id", sql);
+        }
+
+        [Fact]
+        public void MatchOnly()
+        {
+            var conn = new SpyConnection();
+            Utils.DocAggregate(conn, "users",
+                "[{\"$match\": {\"active\":true}}]");
+
+            var sql = conn.LastCommandText;
+            Assert.Contains("SELECT id, data, created_at, updated_at FROM users", sql);
+            Assert.Contains("WHERE data @> @filter::jsonb", sql);
+            Assert.DoesNotContain("GROUP BY", sql);
+            Assert.Equal("{\"active\":true}", conn.LastCommand.ParamValue("@filter"));
+        }
+
+        [Fact]
+        public void SortBeforeGroup()
+        {
+            var conn = new SpyConnection();
+            Utils.DocAggregate(conn, "users",
+                "[{\"$sort\": {\"name\": 1}}]");
+
+            var sql = conn.LastCommandText;
+            Assert.Contains("ORDER BY data->>'name' ASC", sql);
+        }
+
+        [Fact]
+        public void SortAfterGroup()
+        {
+            var conn = new SpyConnection();
+            Utils.DocAggregate(conn, "users",
+                "[{\"$group\": {\"_id\": \"$role\", \"cnt\": {\"$sum\": 1}}}, " +
+                "{\"$sort\": {\"cnt\": -1}}]");
+
+            var sql = conn.LastCommandText;
+            Assert.Contains("ORDER BY cnt DESC", sql);
+            Assert.DoesNotContain("data->>'cnt'", sql);
+        }
+
+        [Fact]
+        public void EmptyPipeline()
+        {
+            var conn = new SpyConnection();
+            Utils.DocAggregate(conn, "users", "[]");
+
+            var sql = conn.LastCommandText;
+            Assert.Contains("SELECT id, data, created_at, updated_at FROM users", sql);
+            Assert.DoesNotContain("WHERE", sql);
+            Assert.DoesNotContain("GROUP BY", sql);
+        }
+
+        [Fact]
+        public void CountAccumulator()
+        {
+            var conn = new SpyConnection();
+            Utils.DocAggregate(conn, "events",
+                "[{\"$group\": {\"_id\": \"$type\", \"n\": {\"$count\": {}}}}]");
+
+            var sql = conn.LastCommandText;
+            Assert.Contains("COUNT(*) AS n", sql);
+        }
+
+        [Fact]
+        public void UnsupportedStageThrows()
+        {
+            var conn = new SpyConnection();
+            Assert.Throws<ArgumentException>(() =>
+                Utils.DocAggregate(conn, "users", "[{\"$lookup\": {}}]"));
+        }
+
+        [Fact]
+        public void InvalidCollectionThrows()
+        {
+            var conn = new SpyConnection();
+            Assert.Throws<ArgumentException>(() =>
+                Utils.DocAggregate(conn, "bad table", "[]"));
+        }
+
+        [Fact]
+        public void NullPipelineThrows()
+        {
+            var conn = new SpyConnection();
+            Assert.Throws<ArgumentException>(() =>
+                Utils.DocAggregate(conn, "users", null));
+        }
+
+        [Fact]
+        public void InvalidGroupFieldThrows()
+        {
+            var conn = new SpyConnection();
+            Assert.Throws<ArgumentException>(() =>
+                Utils.DocAggregate(conn, "users",
+                    "[{\"$group\": {\"_id\": \"$bad field!\", \"n\": {\"$sum\": 1}}}]"));
+        }
+
+        [Fact]
+        public void InvalidAccumulatorFieldThrows()
+        {
+            var conn = new SpyConnection();
+            Assert.Throws<ArgumentException>(() =>
+                Utils.DocAggregate(conn, "users",
+                    "[{\"$group\": {\"_id\": null, \"n\": {\"$sum\": \"$bad field!\"}}}]"));
+        }
+
+        [Fact]
+        public void UnsupportedAccumulatorThrows()
+        {
+            var conn = new SpyConnection();
+            Assert.Throws<ArgumentException>(() =>
+                Utils.DocAggregate(conn, "users",
+                    "[{\"$group\": {\"_id\": null, \"n\": {\"$first\": \"$name\"}}}]"));
+        }
+    }
 }
