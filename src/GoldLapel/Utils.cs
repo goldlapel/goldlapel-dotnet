@@ -1515,6 +1515,7 @@ namespace GoldLapel
 
             FilterResult matchResult = null;
             bool hasGroup = false;
+            bool hasProject = false;
             string groupIdField = null;
             var selectExprs = new List<string>();
             var groupByExprs = new List<string>();
@@ -1522,7 +1523,12 @@ namespace GoldLapel
             bool sortAfterGroup = false;
             int? limitVal = null;
             int? skipVal = null;
+            var unwindFields = new List<string>();
+            var lookupStages = new List<Dictionary<string, string>>();
+            Dictionary<string, string> projectStage = null;
 
+            // Collect all stage data first
+            var groupStageData = (Dictionary<string, string>)null;
             foreach (var stage in stages)
             {
                 string stageType = stage["_type"];
@@ -1533,54 +1539,11 @@ namespace GoldLapel
                         break;
                     case "$group":
                         hasGroup = true;
-                        if (stage.ContainsKey("_id"))
-                        {
-                            var idRaw = stage["_id"];
-                            if (idRaw != null && idRaw != "null")
-                            {
-                                if (idRaw.StartsWith("{") && idRaw.EndsWith("}"))
-                                {
-                                    // Composite _id: parse as key-value pairs
-                                    var idBody = idRaw.Substring(1, idRaw.Length - 2).Trim();
-                                    var idPairs = SplitKeyValuePairs(idBody);
-                                    var buildParts = new List<string>();
-                                    foreach (var pair in idPairs)
-                                    {
-                                        var key = pair[0].Trim().Trim('"');
-                                        ValidateIdentifier(key);
-                                        var fieldRef = ExtractFieldRef(pair[1]);
-                                        buildParts.Add("'" + key + "', data->>'" + fieldRef + "'");
-                                        groupByExprs.Add("data->>'" + fieldRef + "'");
-                                    }
-                                    selectExprs.Add("json_build_object(" + string.Join(", ", buildParts) + ") AS _id");
-                                }
-                                else
-                                {
-                                    if (idRaw.StartsWith("\"$") && idRaw.EndsWith("\""))
-                                        groupIdField = idRaw.Substring(2, idRaw.Length - 3);
-                                    else if (idRaw.StartsWith("$"))
-                                        groupIdField = idRaw.Substring(1);
-                                    else
-                                        groupIdField = idRaw.Trim('"');
-
-                                    ValidateIdentifier(groupIdField);
-                                    selectExprs.Add("data->>'" + groupIdField + "' AS _id");
-                                    groupByExprs.Add("data->>'" + groupIdField + "'");
-                                }
-                            }
-                        }
-                        foreach (var kv in stage)
-                        {
-                            if (kv.Key == "_type" || kv.Key == "_id" || kv.Key == "_body")
-                                continue;
-                            ValidateIdentifier(kv.Key);
-                            var accExpr = ParseAccumulator(kv.Value);
-                            selectExprs.Add(accExpr + " AS " + kv.Key);
-                        }
+                        groupStageData = stage;
                         break;
                     case "$sort":
                         sortAfterGroup = hasGroup;
-                        if (sortAfterGroup)
+                        if (sortAfterGroup || hasProject)
                             sortClause = ParseAliasSortClause(stage["_body"]);
                         else
                             sortClause = ParseDataSortClause(stage["_body"]);
@@ -1591,20 +1554,189 @@ namespace GoldLapel
                     case "$skip":
                         skipVal = int.Parse(stage["_body"]);
                         break;
+                    case "$unwind":
+                        unwindFields.Add(stage["_field"]);
+                        break;
+                    case "$lookup":
+                        lookupStages.Add(stage);
+                        break;
+                    case "$project":
+                        hasProject = true;
+                        projectStage = stage;
+                        break;
                     default:
                         throw new ArgumentException("Unsupported pipeline stage: " + stageType);
                 }
             }
 
+            // Build unwind map
+            Dictionary<string, string> unwindMap = null;
+            var fromExtras = new List<string>();
+            if (unwindFields.Count > 0)
+            {
+                unwindMap = new Dictionary<string, string>();
+                foreach (var field in unwindFields)
+                {
+                    var alias = "_unwound_" + field;
+                    unwindMap[field] = alias;
+                    fromExtras.Add("jsonb_array_elements_text(data->'" + field + "') AS " + alias);
+                }
+            }
+
+            // Build group expressions
+            if (groupStageData != null)
+            {
+                if (groupStageData.ContainsKey("_id"))
+                {
+                    var idRaw = groupStageData["_id"];
+                    if (idRaw != null && idRaw != "null")
+                    {
+                        if (idRaw.StartsWith("{") && idRaw.EndsWith("}"))
+                        {
+                            var idBody = idRaw.Substring(1, idRaw.Length - 2).Trim();
+                            var idPairs = SplitKeyValuePairs(idBody);
+                            var buildParts = new List<string>();
+                            foreach (var pair in idPairs)
+                            {
+                                var key = pair[0].Trim().Trim('"');
+                                ValidateIdentifier(key);
+                                var fieldRef = ExtractFieldRef(pair[1]);
+                                var resolved = ResolveField(fieldRef, unwindMap);
+                                buildParts.Add("'" + key + "', " + resolved);
+                                groupByExprs.Add(resolved);
+                            }
+                            selectExprs.Add("json_build_object(" + string.Join(", ", buildParts) + ") AS _id");
+                        }
+                        else
+                        {
+                            if (idRaw.StartsWith("\"$") && idRaw.EndsWith("\""))
+                                groupIdField = idRaw.Substring(2, idRaw.Length - 3);
+                            else if (idRaw.StartsWith("$"))
+                                groupIdField = idRaw.Substring(1);
+                            else
+                                groupIdField = idRaw.Trim('"');
+
+                            ValidateFieldName(groupIdField);
+                            var resolved = ResolveField(groupIdField, unwindMap);
+                            selectExprs.Add(resolved + " AS _id");
+                            groupByExprs.Add(resolved);
+                        }
+                    }
+                }
+                foreach (var kv in groupStageData)
+                {
+                    if (kv.Key == "_type" || kv.Key == "_id" || kv.Key == "_body")
+                        continue;
+                    ValidateIdentifier(kv.Key);
+                    var accExpr = ParseAccumulator(kv.Value, unwindMap);
+                    selectExprs.Add(accExpr + " AS " + kv.Key);
+                }
+            }
+
+            // Build $project SELECT (overrides group select if present)
+            if (projectStage != null)
+            {
+                var groupAliases = new HashSet<string>();
+                if (hasGroup && groupStageData != null)
+                {
+                    foreach (var kv in groupStageData)
+                    {
+                        if (kv.Key == "_type" || kv.Key == "_body")
+                            continue;
+                        if (kv.Key == "_id")
+                            groupAliases.Add("_id");
+                        else
+                            groupAliases.Add(kv.Key);
+                    }
+                }
+
+                var projectExprs = new List<string>();
+                foreach (var kv in projectStage)
+                {
+                    if (kv.Key == "_type" || kv.Key == "_body")
+                        continue;
+                    var key = kv.Key;
+                    var val = kv.Value.Trim();
+
+                    if (key == "_id" && val == "0")
+                        continue;
+
+                    ValidateIdentifier(key);
+
+                    if (val == "1")
+                    {
+                        if (groupAliases.Count > 0 && groupAliases.Contains(key))
+                            projectExprs.Add(key);
+                        else
+                            projectExprs.Add("data->>'" + key + "' AS " + key);
+                    }
+                    else if (val.StartsWith("\"$") && val.EndsWith("\""))
+                    {
+                        var refField = val.Substring(2, val.Length - 3);
+                        ValidateFieldName(refField);
+                        if (groupAliases.Count > 0 && groupAliases.Contains(refField))
+                            projectExprs.Add(refField + " AS " + key);
+                        else
+                            projectExprs.Add(FieldPath(refField) + " AS " + key);
+                    }
+                    else if (val.StartsWith("$"))
+                    {
+                        var refField = val.Substring(1);
+                        ValidateFieldName(refField);
+                        if (groupAliases.Count > 0 && groupAliases.Contains(refField))
+                            projectExprs.Add(refField + " AS " + key);
+                        else
+                            projectExprs.Add(FieldPath(refField) + " AS " + key);
+                    }
+                    else
+                    {
+                        throw new ArgumentException("Invalid $project value for " + key + ": " + val);
+                    }
+                }
+                selectExprs = projectExprs;
+            }
+
+            // Append $lookup subqueries to SELECT
+            foreach (var lookup in lookupStages)
+            {
+                var fromTable = lookup["from"];
+                var localField = lookup["localField"];
+                var foreignField = lookup["foreignField"];
+                var asName = lookup["as"];
+
+                var localExpr = FieldPath(localField);
+                var foreignParts = foreignField.Split('.');
+                string foreignExpr;
+                if (foreignParts.Length == 1)
+                    foreignExpr = "b.data->>'" + foreignParts[0] + "'";
+                else
+                {
+                    foreignExpr = "b.data";
+                    for (int i = 0; i < foreignParts.Length - 1; i++)
+                        foreignExpr += "->'" + foreignParts[i] + "'";
+                    foreignExpr += "->>'" + foreignParts[foreignParts.Length - 1] + "'";
+                }
+
+                var subquery = "COALESCE((SELECT json_agg(b.data) FROM " + fromTable + " b" +
+                    " WHERE " + foreignExpr + " = " + collection + "." + localExpr +
+                    "), '[]'::json) AS " + asName;
+                selectExprs.Add(subquery);
+            }
+
             using (var cmd = conn.CreateCommand())
             {
                 var sql = "";
-                if (hasGroup && selectExprs.Count > 0)
+                if (selectExprs.Count > 0)
                     sql = "SELECT " + string.Join(", ", selectExprs);
                 else
                     sql = "SELECT id, data, created_at, updated_at";
 
-                sql += " FROM " + collection;
+                // Build FROM clause
+                var fromClause = collection;
+                foreach (var extra in fromExtras)
+                    fromClause += ", " + extra;
+
+                sql += " FROM " + fromClause;
 
                 if (matchResult != null && !string.IsNullOrEmpty(matchResult.WhereClause))
                 {
@@ -1746,6 +1878,12 @@ namespace GoldLapel
                 stage["_body"] = stageValue;
             else if (stageKey == "$match")
                 stage["_body"] = stageValue;
+            else if (stageKey == "$project")
+                ParseProjectStage(stageValue, stage);
+            else if (stageKey == "$unwind")
+                ParseUnwindStage(stageValue, stage);
+            else if (stageKey == "$lookup")
+                ParseLookupStage(stageValue, stage);
             else
                 stage["_body"] = stageValue.Trim();
 
@@ -1768,6 +1906,86 @@ namespace GoldLapel
                 else
                     stage[key] = val;
             }
+        }
+
+        private static void ParseProjectStage(string value, Dictionary<string, string> stage)
+        {
+            if (!value.StartsWith("{") || !value.EndsWith("}"))
+                throw new ArgumentException("$project value must be an object");
+
+            var body = value.Substring(1, value.Length - 2).Trim();
+            var pairs = SplitKeyValuePairs(body);
+            foreach (var kv in pairs)
+            {
+                var key = kv[0].Trim().Trim('"');
+                var val = kv[1].Trim();
+                stage[key] = val;
+            }
+        }
+
+        private static void ParseUnwindStage(string value, Dictionary<string, string> stage)
+        {
+            var v = value.Trim();
+            string path;
+            if (v.StartsWith("{"))
+            {
+                // Object form: {"path": "$tags"}
+                if (!v.EndsWith("}"))
+                    throw new ArgumentException("Invalid $unwind value");
+                var body = v.Substring(1, v.Length - 2).Trim();
+                var pairs = SplitKeyValuePairs(body);
+                path = null;
+                foreach (var kv in pairs)
+                {
+                    var key = kv[0].Trim().Trim('"');
+                    if (key == "path")
+                    {
+                        path = kv[1].Trim().Trim('"');
+                        break;
+                    }
+                }
+                if (path == null)
+                    throw new ArgumentException("$unwind object must have a 'path' field");
+            }
+            else
+            {
+                // String form: "$tags"
+                path = v.Trim('"');
+            }
+
+            if (!path.StartsWith("$"))
+                throw new ArgumentException("$unwind path must be a string starting with '$': " + path);
+
+            var field = path.Substring(1);
+            ValidateFieldName(field);
+            stage["_field"] = field;
+        }
+
+        private static void ParseLookupStage(string value, Dictionary<string, string> stage)
+        {
+            if (!value.StartsWith("{") || !value.EndsWith("}"))
+                throw new ArgumentException("$lookup value must be an object");
+
+            var body = value.Substring(1, value.Length - 2).Trim();
+            var pairs = SplitKeyValuePairs(body);
+            foreach (var kv in pairs)
+            {
+                var key = kv[0].Trim().Trim('"');
+                var val = kv[1].Trim().Trim('"');
+                stage[key] = val;
+            }
+
+            var requiredFields = new[] { "from", "localField", "foreignField", "as" };
+            foreach (var required in requiredFields)
+            {
+                if (!stage.ContainsKey(required))
+                    throw new ArgumentException("$lookup missing required field: " + required);
+            }
+
+            ValidateIdentifier(stage["from"]);
+            ValidateFieldName(stage["localField"]);
+            ValidateFieldName(stage["foreignField"]);
+            ValidateIdentifier(stage["as"]);
         }
 
         private static List<string[]> SplitKeyValuePairs(string body)
@@ -1853,7 +2071,7 @@ namespace GoldLapel
             return pairs;
         }
 
-        private static string ParseAccumulator(string accJson)
+        private static string ParseAccumulator(string accJson, Dictionary<string, string> unwindMap = null)
         {
             var s = accJson.Trim();
             if (!s.StartsWith("{") || !s.EndsWith("}"))
@@ -1875,34 +2093,48 @@ namespace GoldLapel
                     else
                     {
                         var field = ExtractFieldRef(arg);
-                        return "SUM((data->>'" + field + "')::numeric)";
+                        var resolved = ResolveField(field, unwindMap);
+                        if (unwindMap != null && unwindMap.ContainsKey(field))
+                            return "SUM(" + resolved + "::numeric)";
+                        return "SUM((" + resolved + ")::numeric)";
                     }
                 case "$avg":
                 {
                     var field = ExtractFieldRef(arg);
-                    return "AVG((data->>'" + field + "')::numeric)";
+                    var resolved = ResolveField(field, unwindMap);
+                    if (unwindMap != null && unwindMap.ContainsKey(field))
+                        return "AVG(" + resolved + "::numeric)";
+                    return "AVG((" + resolved + ")::numeric)";
                 }
                 case "$min":
                 {
                     var field = ExtractFieldRef(arg);
-                    return "MIN((data->>'" + field + "')::numeric)";
+                    var resolved = ResolveField(field, unwindMap);
+                    if (unwindMap != null && unwindMap.ContainsKey(field))
+                        return "MIN(" + resolved + "::numeric)";
+                    return "MIN((" + resolved + ")::numeric)";
                 }
                 case "$max":
                 {
                     var field = ExtractFieldRef(arg);
-                    return "MAX((data->>'" + field + "')::numeric)";
+                    var resolved = ResolveField(field, unwindMap);
+                    if (unwindMap != null && unwindMap.ContainsKey(field))
+                        return "MAX(" + resolved + "::numeric)";
+                    return "MAX((" + resolved + ")::numeric)";
                 }
                 case "$count":
                     return "COUNT(*)";
                 case "$push":
                 {
                     var field = ExtractFieldRef(arg);
-                    return "array_agg(data->>'" + field + "')";
+                    var resolved = ResolveField(field, unwindMap);
+                    return "array_agg(" + resolved + ")";
                 }
                 case "$addToSet":
                 {
                     var field = ExtractFieldRef(arg);
-                    return "array_agg(DISTINCT data->>'" + field + "')";
+                    var resolved = ResolveField(field, unwindMap);
+                    return "array_agg(DISTINCT " + resolved + ")";
                 }
                 default:
                     throw new ArgumentException("Unsupported accumulator: " + op);
@@ -1915,8 +2147,27 @@ namespace GoldLapel
             if (!s.StartsWith("$"))
                 throw new ArgumentException("Accumulator field must be a $reference: " + arg);
             var field = s.Substring(1);
-            ValidateIdentifier(field);
+            ValidateFieldName(field);
             return field;
+        }
+
+        private static string ResolveField(string field, Dictionary<string, string> unwindMap)
+        {
+            if (unwindMap != null && unwindMap.ContainsKey(field))
+                return unwindMap[field];
+            return FieldPath(field);
+        }
+
+        private static void ValidateFieldName(string name)
+        {
+            if (string.IsNullOrEmpty(name))
+                throw new ArgumentException("Field name must be a non-empty string");
+            var parts = name.Split('.');
+            foreach (var part in parts)
+            {
+                if (!IdentifierPattern.IsMatch(part))
+                    throw new ArgumentException("Invalid field name: " + name);
+            }
         }
 
         private static string ParseAliasSortClause(string sortJson)

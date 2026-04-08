@@ -632,7 +632,7 @@ namespace GoldLapel.Tests
         {
             var conn = new SpyConnection();
             Assert.Throws<ArgumentException>(() =>
-                Utils.DocAggregate(conn, "users", "[{\"$lookup\": {}}]"));
+                Utils.DocAggregate(conn, "users", "[{\"$bucket\": {}}]"));
         }
 
         [Fact]
@@ -766,6 +766,201 @@ namespace GoldLapel.Tests
             Assert.Throws<ArgumentException>(() =>
                 Utils.DocAggregate(conn, "orders",
                     "[{\"$group\": {\"_id\": null, \"x\": {\"$addToSet\": \"$bad field!\"}}}]"));
+        }
+    }
+
+    // ── $project ────────────────────────────────────────────────
+
+    public class DocProjectTest
+    {
+        [Fact]
+        public void ProjectInclude()
+        {
+            var conn = new SpyConnection();
+            Utils.DocAggregate(conn, "users",
+                "[{\"$project\": {\"name\": 1, \"status\": 1}}]");
+
+            var sql = conn.LastCommandText;
+            Assert.Contains("data->>'name' AS name", sql);
+            Assert.Contains("data->>'status' AS status", sql);
+        }
+
+        [Fact]
+        public void ProjectExcludeId()
+        {
+            var conn = new SpyConnection();
+            Utils.DocAggregate(conn, "users",
+                "[{\"$project\": {\"_id\": 0, \"name\": 1}}]");
+
+            var sql = conn.LastCommandText;
+            Assert.DoesNotContain("AS _id", sql);
+            Assert.Contains("data->>'name' AS name", sql);
+        }
+
+        [Fact]
+        public void ProjectRename()
+        {
+            var conn = new SpyConnection();
+            Utils.DocAggregate(conn, "users",
+                "[{\"$project\": {\"fullName\": \"$name\"}}]");
+
+            var sql = conn.LastCommandText;
+            Assert.Contains("data->>'name' AS fullName", sql);
+        }
+
+        [Fact]
+        public void ProjectAfterGroup()
+        {
+            var conn = new SpyConnection();
+            Utils.DocAggregate(conn, "products",
+                "[{\"$group\": {\"_id\": \"$category\", \"count\": {\"$sum\": 1}}}, " +
+                "{\"$project\": {\"_id\": 1, \"count\": 1}}]");
+
+            var sql = conn.LastCommandText;
+            // $project after $group should pass through aliases, not data->>
+            Assert.DoesNotContain("data->>'_id'", sql);
+            Assert.DoesNotContain("data->>'count'", sql);
+            Assert.Contains("GROUP BY", sql);
+        }
+
+        [Fact]
+        public void ProjectDotNotation()
+        {
+            var conn = new SpyConnection();
+            Utils.DocAggregate(conn, "users",
+                "[{\"$project\": {\"city\": \"$addr.city\"}}]");
+
+            var sql = conn.LastCommandText;
+            Assert.Contains("data->'addr'->>'city' AS city", sql);
+        }
+    }
+
+    // ── $unwind ────────────────────────────────────────────────
+
+    public class DocUnwindTest
+    {
+        [Fact]
+        public void UnwindBasic()
+        {
+            var conn = new SpyConnection();
+            Utils.DocAggregate(conn, "posts",
+                "[{\"$unwind\": \"$tags\"}]");
+
+            var sql = conn.LastCommandText;
+            Assert.Contains("jsonb_array_elements_text(data->'tags') AS _unwound_tags", sql);
+        }
+
+        [Fact]
+        public void UnwindThenGroup()
+        {
+            var conn = new SpyConnection();
+            Utils.DocAggregate(conn, "posts",
+                "[{\"$unwind\": \"$tags\"}, " +
+                "{\"$group\": {\"_id\": \"$tags\", \"count\": {\"$sum\": 1}}}]");
+
+            var sql = conn.LastCommandText;
+            Assert.Contains("_unwound_tags AS _id", sql);
+            Assert.Contains("GROUP BY _unwound_tags", sql);
+            Assert.DoesNotContain("data->>'tags'", sql);
+        }
+
+        [Fact]
+        public void UnwindObjectForm()
+        {
+            var conn = new SpyConnection();
+            Utils.DocAggregate(conn, "posts",
+                "[{\"$unwind\": {\"path\": \"$tags\"}}]");
+
+            var sql = conn.LastCommandText;
+            Assert.Contains("jsonb_array_elements_text(data->'tags') AS _unwound_tags", sql);
+        }
+
+        [Fact]
+        public void UnwindInvalid()
+        {
+            var conn = new SpyConnection();
+            Assert.Throws<ArgumentException>(() =>
+                Utils.DocAggregate(conn, "posts",
+                    "[{\"$unwind\": \"no_dollar\"}]"));
+        }
+    }
+
+    // ── $lookup ────────────────────────────────────────────────
+
+    public class DocLookupTest
+    {
+        [Fact]
+        public void LookupBasic()
+        {
+            var conn = new SpyConnection();
+            Utils.DocAggregate(conn, "users",
+                "[{\"$lookup\": {" +
+                "\"from\": \"orders\", " +
+                "\"localField\": \"uid\", " +
+                "\"foreignField\": \"uid\", " +
+                "\"as\": \"user_orders\"}}]");
+
+            var sql = conn.LastCommandText;
+            Assert.Contains("COALESCE(", sql);
+            Assert.Contains("json_agg(b.data)", sql);
+            Assert.Contains("FROM orders b", sql);
+            Assert.Contains("b.data->>'uid'", sql);
+            Assert.Contains("users.data->>'uid'", sql);
+            Assert.Contains("AS user_orders", sql);
+        }
+
+        [Fact]
+        public void LookupMissingField()
+        {
+            var conn = new SpyConnection();
+            Assert.Throws<ArgumentException>(() =>
+                Utils.DocAggregate(conn, "users",
+                    "[{\"$lookup\": {\"localField\": \"uid\", \"foreignField\": \"uid\", \"as\": \"x\"}}]"));
+        }
+
+        [Fact]
+        public void LookupValidatesIdentifiers()
+        {
+            var conn = new SpyConnection();
+            Assert.Throws<ArgumentException>(() =>
+                Utils.DocAggregate(conn, "users",
+                    "[{\"$lookup\": {" +
+                    "\"from\": \"DROP TABLE; --\", " +
+                    "\"localField\": \"uid\", " +
+                    "\"foreignField\": \"uid\", " +
+                    "\"as\": \"x\"}}]"));
+        }
+    }
+
+    // ── Full pipeline (unwind + group + match + sort + limit) ──
+
+    public class DocFullPipelineTest
+    {
+        [Fact]
+        public void UnwindGroupMatchSortLimit()
+        {
+            var conn = new SpyConnection();
+            Utils.DocAggregate(conn, "posts",
+                "[{\"$match\": {\"status\":\"published\"}}, " +
+                "{\"$unwind\": \"$tags\"}, " +
+                "{\"$group\": {\"_id\": \"$tags\", \"count\": {\"$sum\": 1}}}, " +
+                "{\"$sort\": {\"count\": -1}}, " +
+                "{\"$limit\": 5}]");
+
+            var sql = conn.LastCommandText;
+            // FROM has the unwind cross join
+            Assert.Contains("jsonb_array_elements_text(data->'tags')", sql);
+            // GROUP BY uses the unwound alias
+            Assert.Contains("GROUP BY _unwound_tags", sql);
+            // SELECT uses the unwound alias
+            Assert.Contains("_unwound_tags AS _id", sql);
+            // WHERE from $match
+            Assert.Contains("WHERE data @> @p0::jsonb", sql);
+            // ORDER BY + LIMIT
+            Assert.Contains("ORDER BY count DESC", sql);
+            Assert.Contains("LIMIT @limit", sql);
+            Assert.Equal("{\"status\":\"published\"}", conn.LastCommand.ParamValue("@p0"));
+            Assert.Equal(5, conn.LastCommand.ParamValue("@limit"));
         }
     }
 
