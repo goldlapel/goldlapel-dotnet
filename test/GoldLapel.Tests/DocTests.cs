@@ -677,6 +677,96 @@ namespace GoldLapel.Tests
                 Utils.DocAggregate(conn, "users",
                     "[{\"$group\": {\"_id\": null, \"n\": {\"$first\": \"$name\"}}}]"));
         }
+
+        [Fact]
+        public void CompositeGroupId()
+        {
+            var conn = new SpyConnection();
+            Utils.DocAggregate(conn, "orders",
+                "[{\"$group\": {\"_id\": {\"region\": \"$region\", \"year\": \"$year\"}, \"total\": {\"$sum\": \"$amount\"}}}]");
+
+            var sql = conn.LastCommandText;
+            Assert.Contains("json_build_object('region', data->>'region', 'year', data->>'year') AS _id", sql);
+            Assert.Contains("SUM((data->>'amount')::numeric) AS total", sql);
+            Assert.Contains("GROUP BY data->>'region', data->>'year'", sql);
+        }
+
+        [Fact]
+        public void CompositeGroupIdSingleKey()
+        {
+            var conn = new SpyConnection();
+            Utils.DocAggregate(conn, "events",
+                "[{\"$group\": {\"_id\": {\"type\": \"$type\"}, \"cnt\": {\"$sum\": 1}}}]");
+
+            var sql = conn.LastCommandText;
+            Assert.Contains("json_build_object('type', data->>'type') AS _id", sql);
+            Assert.Contains("COUNT(*) AS cnt", sql);
+            Assert.Contains("GROUP BY data->>'type'", sql);
+        }
+
+        [Fact]
+        public void CompositeGroupIdInvalidFieldThrows()
+        {
+            var conn = new SpyConnection();
+            Assert.Throws<ArgumentException>(() =>
+                Utils.DocAggregate(conn, "orders",
+                    "[{\"$group\": {\"_id\": {\"x\": \"$bad field!\"}, \"n\": {\"$sum\": 1}}}]"));
+        }
+
+        [Fact]
+        public void CompositeGroupIdInvalidKeyThrows()
+        {
+            var conn = new SpyConnection();
+            Assert.Throws<ArgumentException>(() =>
+                Utils.DocAggregate(conn, "orders",
+                    "[{\"$group\": {\"_id\": {\"bad key!\": \"$region\"}, \"n\": {\"$sum\": 1}}}]"));
+        }
+
+        [Fact]
+        public void PushAccumulator()
+        {
+            var conn = new SpyConnection();
+            Utils.DocAggregate(conn, "orders",
+                "[{\"$group\": {\"_id\": \"$region\", \"items\": {\"$push\": \"$item\"}}}]");
+
+            var sql = conn.LastCommandText;
+            Assert.Contains("array_agg(data->>'item') AS items", sql);
+            Assert.Contains("GROUP BY data->>'region'", sql);
+        }
+
+        [Fact]
+        public void AddToSetAccumulator()
+        {
+            var conn = new SpyConnection();
+            Utils.DocAggregate(conn, "orders",
+                "[{\"$group\": {\"_id\": \"$region\", \"tags\": {\"$addToSet\": \"$tag\"}}}]");
+
+            var sql = conn.LastCommandText;
+            Assert.Contains("array_agg(DISTINCT data->>'tag') AS tags", sql);
+            Assert.Contains("GROUP BY data->>'region'", sql);
+        }
+
+        [Fact]
+        public void PushWithNullGroupId()
+        {
+            var conn = new SpyConnection();
+            Utils.DocAggregate(conn, "events",
+                "[{\"$group\": {\"_id\": null, \"names\": {\"$push\": \"$name\"}}}]");
+
+            var sql = conn.LastCommandText;
+            Assert.Contains("array_agg(data->>'name') AS names", sql);
+            Assert.DoesNotContain("GROUP BY", sql);
+            Assert.DoesNotContain("AS _id", sql);
+        }
+
+        [Fact]
+        public void AddToSetInvalidFieldThrows()
+        {
+            var conn = new SpyConnection();
+            Assert.Throws<ArgumentException>(() =>
+                Utils.DocAggregate(conn, "orders",
+                    "[{\"$group\": {\"_id\": null, \"x\": {\"$addToSet\": \"$bad field!\"}}}]"));
+        }
     }
 
     // ── BuildFilter (comparison operators) ─────────────────────

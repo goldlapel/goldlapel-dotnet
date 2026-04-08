@@ -1538,16 +1538,35 @@ namespace GoldLapel
                             var idRaw = stage["_id"];
                             if (idRaw != null && idRaw != "null")
                             {
-                                if (idRaw.StartsWith("\"$") && idRaw.EndsWith("\""))
-                                    groupIdField = idRaw.Substring(2, idRaw.Length - 3);
-                                else if (idRaw.StartsWith("$"))
-                                    groupIdField = idRaw.Substring(1);
+                                if (idRaw.StartsWith("{") && idRaw.EndsWith("}"))
+                                {
+                                    // Composite _id: parse as key-value pairs
+                                    var idBody = idRaw.Substring(1, idRaw.Length - 2).Trim();
+                                    var idPairs = SplitKeyValuePairs(idBody);
+                                    var buildParts = new List<string>();
+                                    foreach (var pair in idPairs)
+                                    {
+                                        var key = pair[0].Trim().Trim('"');
+                                        ValidateIdentifier(key);
+                                        var fieldRef = ExtractFieldRef(pair[1]);
+                                        buildParts.Add("'" + key + "', data->>'" + fieldRef + "'");
+                                        groupByExprs.Add("data->>'" + fieldRef + "'");
+                                    }
+                                    selectExprs.Add("json_build_object(" + string.Join(", ", buildParts) + ") AS _id");
+                                }
                                 else
-                                    groupIdField = idRaw.Trim('"');
+                                {
+                                    if (idRaw.StartsWith("\"$") && idRaw.EndsWith("\""))
+                                        groupIdField = idRaw.Substring(2, idRaw.Length - 3);
+                                    else if (idRaw.StartsWith("$"))
+                                        groupIdField = idRaw.Substring(1);
+                                    else
+                                        groupIdField = idRaw.Trim('"');
 
-                                ValidateIdentifier(groupIdField);
-                                selectExprs.Add("data->>'" + groupIdField + "' AS _id");
-                                groupByExprs.Add("data->>'" + groupIdField + "'");
+                                    ValidateIdentifier(groupIdField);
+                                    selectExprs.Add("data->>'" + groupIdField + "' AS _id");
+                                    groupByExprs.Add("data->>'" + groupIdField + "'");
+                                }
                             }
                         }
                         foreach (var kv in stage)
@@ -1875,6 +1894,16 @@ namespace GoldLapel
                 }
                 case "$count":
                     return "COUNT(*)";
+                case "$push":
+                {
+                    var field = ExtractFieldRef(arg);
+                    return "array_agg(data->>'" + field + "')";
+                }
+                case "$addToSet":
+                {
+                    var field = ExtractFieldRef(arg);
+                    return "array_agg(DISTINCT data->>'" + field + "')";
+                }
                 default:
                     throw new ArgumentException("Unsupported accumulator: " + op);
             }
