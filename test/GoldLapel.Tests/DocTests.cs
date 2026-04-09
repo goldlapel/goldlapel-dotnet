@@ -17,7 +17,7 @@ namespace GoldLapel.Tests
 
             Assert.Equal(2, conn.Commands.Count);
             Assert.Contains("CREATE TABLE IF NOT EXISTS users", conn.Commands[0].CommandText);
-            Assert.Contains("BIGSERIAL PRIMARY KEY", conn.Commands[0].CommandText);
+            Assert.Contains("_id UUID PRIMARY KEY DEFAULT gen_random_uuid()", conn.Commands[0].CommandText);
             Assert.Contains("data JSONB NOT NULL", conn.Commands[0].CommandText);
             Assert.Contains("created_at TIMESTAMPTZ", conn.Commands[0].CommandText);
             Assert.Contains("updated_at TIMESTAMPTZ", conn.Commands[0].CommandText);
@@ -32,7 +32,7 @@ namespace GoldLapel.Tests
             var cmd = conn.Commands[1];
             Assert.Contains("INSERT INTO users", cmd.CommandText);
             Assert.Contains("VALUES (@doc::jsonb)", cmd.CommandText);
-            Assert.Contains("RETURNING id, data, created_at, updated_at", cmd.CommandText);
+            Assert.Contains("RETURNING _id, data, created_at, updated_at", cmd.CommandText);
             Assert.Equal("{\"name\":\"alice\"}", cmd.ParamValue("@doc"));
         }
 
@@ -102,7 +102,7 @@ namespace GoldLapel.Tests
             Utils.DocFind(conn, "users");
 
             var sql = conn.LastCommandText;
-            Assert.Contains("SELECT id, data, created_at, updated_at FROM users", sql);
+            Assert.Contains("SELECT _id, data, created_at, updated_at FROM users", sql);
             Assert.DoesNotContain("WHERE", sql);
             Assert.DoesNotContain("ORDER BY", sql);
             Assert.DoesNotContain("LIMIT", sql);
@@ -213,7 +213,7 @@ namespace GoldLapel.Tests
             Utils.DocFindOne(conn, "users");
 
             var sql = conn.LastCommandText;
-            Assert.Contains("SELECT id, data, created_at, updated_at FROM users", sql);
+            Assert.Contains("SELECT _id, data, created_at, updated_at FROM users", sql);
             Assert.Contains("LIMIT 1", sql);
             Assert.DoesNotContain("WHERE", sql);
         }
@@ -289,7 +289,7 @@ namespace GoldLapel.Tests
             Assert.Contains("UPDATE users", sql);
             Assert.Contains("SET data = data || @p1::jsonb", sql);
             Assert.Contains("updated_at = NOW()", sql);
-            Assert.Contains("WHERE id = (SELECT id FROM users WHERE data @> @p0::jsonb LIMIT 1)", sql);
+            Assert.Contains("WHERE _id = (SELECT _id FROM users WHERE data @> @p0::jsonb LIMIT 1)", sql);
         }
 
         [Fact]
@@ -356,8 +356,8 @@ namespace GoldLapel.Tests
 
             var sql = conn.LastCommandText;
             Assert.Contains("DELETE FROM users", sql);
-            Assert.Contains("WHERE id = (", sql);
-            Assert.Contains("SELECT id FROM users WHERE data @> @p0::jsonb LIMIT 1)", sql);
+            Assert.Contains("WHERE _id = (", sql);
+            Assert.Contains("SELECT _id FROM users WHERE data @> @p0::jsonb LIMIT 1)", sql);
         }
 
         [Fact]
@@ -575,7 +575,7 @@ namespace GoldLapel.Tests
                 "[{\"$match\": {\"active\":true}}]");
 
             var sql = conn.LastCommandText;
-            Assert.Contains("SELECT id, data, created_at, updated_at FROM users", sql);
+            Assert.Contains("SELECT _id, data, created_at, updated_at FROM users", sql);
             Assert.Contains("WHERE data @> @p0::jsonb", sql);
             Assert.DoesNotContain("GROUP BY", sql);
             Assert.Equal("{\"active\":true}", conn.LastCommand.ParamValue("@p0"));
@@ -612,7 +612,7 @@ namespace GoldLapel.Tests
             Utils.DocAggregate(conn, "users", "[]");
 
             var sql = conn.LastCommandText;
-            Assert.Contains("SELECT id, data, created_at, updated_at FROM users", sql);
+            Assert.Contains("SELECT _id, data, created_at, updated_at FROM users", sql);
             Assert.DoesNotContain("WHERE", sql);
             Assert.DoesNotContain("GROUP BY", sql);
         }
@@ -1316,7 +1316,7 @@ namespace GoldLapel.Tests
             var sql = conn.Commands[0].CommandText;
             Assert.Contains("CREATE TABLE IF NOT EXISTS users", sql);
             Assert.DoesNotContain("UNLOGGED", sql);
-            Assert.Contains("BIGSERIAL PRIMARY KEY", sql);
+            Assert.Contains("_id UUID PRIMARY KEY DEFAULT gen_random_uuid()", sql);
             Assert.Contains("data JSONB NOT NULL", sql);
             Assert.Contains("created_at TIMESTAMPTZ", sql);
             Assert.Contains("updated_at TIMESTAMPTZ", sql);
@@ -1715,7 +1715,7 @@ namespace GoldLapel.Tests
             Assert.Contains("WITH target AS", sql);
             Assert.Contains("RETURNING", sql);
             Assert.Contains("jsonb_set", sql);
-            Assert.Contains("SELECT id FROM users", sql);
+            Assert.Contains("SELECT _id FROM users", sql);
             Assert.Contains("WHERE data @> @p0::jsonb", sql);
         }
 
@@ -1754,7 +1754,7 @@ namespace GoldLapel.Tests
             Assert.Contains("WITH target AS", sql);
             Assert.Contains("DELETE FROM users", sql);
             Assert.Contains("RETURNING", sql);
-            Assert.Contains("SELECT id FROM users", sql);
+            Assert.Contains("SELECT _id FROM users", sql);
             Assert.Contains("WHERE data @> @p0::jsonb", sql);
         }
 
@@ -2082,7 +2082,7 @@ namespace GoldLapel.Tests
             Assert.Equal("BEGIN", sqls[0]);
             Assert.Contains("DECLARE", sqls[1]);
             Assert.Contains("CURSOR FOR", sqls[1]);
-            Assert.Contains("SELECT id, data, created_at, updated_at FROM users", sqls[1]);
+            Assert.Contains("SELECT _id, data, created_at, updated_at FROM users", sqls[1]);
             Assert.Contains("FETCH", sqls[2]);
             Assert.Contains("CLOSE", sqls[3]);
             Assert.Equal("COMMIT", sqls[4]);

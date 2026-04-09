@@ -80,7 +80,7 @@ namespace GoldLapel.Tests
             _gl.DocFind("users", filterJson: "{\"active\":true}");
 
             var sql = _spy.LastCommandText;
-            Assert.Contains("SELECT id, data, created_at, updated_at FROM users", sql);
+            Assert.Contains("SELECT _id, data, created_at, updated_at FROM users", sql);
             Assert.Contains("WHERE data @> @p0::jsonb", sql);
             Assert.Equal("{\"active\":true}", _spy.LastCommand.ParamValue("@p0"));
         }
@@ -94,7 +94,7 @@ namespace GoldLapel.Tests
             var sqls = _spy.Commands.Select(c => c.CommandText).ToList();
             Assert.Equal("BEGIN", sqls[0]);
             Assert.Contains("CURSOR FOR", sqls[1]);
-            Assert.Contains("SELECT id, data, created_at, updated_at FROM users", sqls[1]);
+            Assert.Contains("SELECT _id, data, created_at, updated_at FROM users", sqls[1]);
         }
 
         [Fact]

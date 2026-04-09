@@ -1256,7 +1256,7 @@ namespace GoldLapel
             {
                 cmd.CommandText =
                     prefix + " IF NOT EXISTS " + collection + " (" +
-                    "id BIGSERIAL PRIMARY KEY, " +
+                    "_id UUID PRIMARY KEY DEFAULT gen_random_uuid(), " +
                     "data JSONB NOT NULL, " +
                     "created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), " +
                     "updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())";
@@ -1293,7 +1293,7 @@ namespace GoldLapel
             {
                 cmd.CommandText =
                     "INSERT INTO " + collection + " (data) VALUES (@doc::jsonb) " +
-                    "RETURNING id, data, created_at, updated_at";
+                    "RETURNING _id, data, created_at, updated_at";
                 AddParameter(cmd, "@doc", documentJson);
 
                 using (var reader = cmd.ExecuteReader())
@@ -1316,7 +1316,7 @@ namespace GoldLapel
                 {
                     cmd.CommandText =
                         "INSERT INTO " + collection + " (data) VALUES (@doc::jsonb) " +
-                        "RETURNING id, data, created_at, updated_at";
+                        "RETURNING _id, data, created_at, updated_at";
                     AddParameter(cmd, "@doc", documents[i]);
 
                     using (var reader = cmd.ExecuteReader())
@@ -1337,7 +1337,7 @@ namespace GoldLapel
 
             using (var cmd = conn.CreateCommand())
             {
-                var sql = "SELECT id, data, created_at, updated_at FROM " + collection;
+                var sql = "SELECT _id, data, created_at, updated_at FROM " + collection;
 
                 if (!string.IsNullOrEmpty(filter.WhereClause))
                 {
@@ -1389,7 +1389,7 @@ namespace GoldLapel
             ValidateIdentifier(collection);
             var filter = BuildFilter(filterJson);
 
-            var sql = "SELECT id, data, created_at, updated_at FROM " + collection;
+            var sql = "SELECT _id, data, created_at, updated_at FROM " + collection;
             var filterParams = new List<KeyValuePair<string, object>>();
 
             if (!string.IsNullOrEmpty(filter.WhereClause))
@@ -1493,7 +1493,7 @@ namespace GoldLapel
 
             using (var cmd = conn.CreateCommand())
             {
-                var sql = "SELECT id, data, created_at, updated_at FROM " + collection;
+                var sql = "SELECT _id, data, created_at, updated_at FROM " + collection;
 
                 if (!string.IsNullOrEmpty(filter.WhereClause))
                 {
@@ -1547,7 +1547,7 @@ namespace GoldLapel
             using (var cmd = conn.CreateCommand())
             {
                 var sql = "UPDATE " + collection + " SET data = " + update.Expression + ", updated_at = NOW() " +
-                    "WHERE id = (SELECT id FROM " + collection;
+                    "WHERE _id = (SELECT _id FROM " + collection;
 
                 ApplyFilterParams(cmd, filter);
                 ApplyUpdateParams(cmd, update, filter.ParamOffset + filter.Params.Count);
@@ -1591,8 +1591,8 @@ namespace GoldLapel
 
             using (var cmd = conn.CreateCommand())
             {
-                var sql = "DELETE FROM " + collection + " WHERE id = (" +
-                    "SELECT id FROM " + collection;
+                var sql = "DELETE FROM " + collection + " WHERE _id = (" +
+                    "SELECT _id FROM " + collection;
 
                 if (!string.IsNullOrEmpty(filter.WhereClause))
                 {
@@ -1640,10 +1640,10 @@ namespace GoldLapel
                 if (!string.IsNullOrEmpty(filter.WhereClause))
                     cteWhere = " WHERE " + filter.WhereClause;
 
-                var sql = "WITH target AS (SELECT id FROM " + collection + cteWhere + " LIMIT 1) " +
+                var sql = "WITH target AS (SELECT _id FROM " + collection + cteWhere + " LIMIT 1) " +
                     "UPDATE " + collection + " SET data = " + update.Expression + ", updated_at = NOW() " +
-                    "FROM target WHERE " + collection + ".id = target.id " +
-                    "RETURNING " + collection + ".id, " + collection + ".data, " +
+                    "FROM target WHERE " + collection + "._id = target._id " +
+                    "RETURNING " + collection + "._id, " + collection + ".data, " +
                     collection + ".created_at, " + collection + ".updated_at";
 
                 ApplyFilterParams(cmd, filter);
@@ -1672,10 +1672,10 @@ namespace GoldLapel
                 if (!string.IsNullOrEmpty(filter.WhereClause))
                     cteWhere = " WHERE " + filter.WhereClause;
 
-                var sql = "WITH target AS (SELECT id FROM " + collection + cteWhere + " LIMIT 1) " +
+                var sql = "WITH target AS (SELECT _id FROM " + collection + cteWhere + " LIMIT 1) " +
                     "DELETE FROM " + collection + " USING target " +
-                    "WHERE " + collection + ".id = target.id " +
-                    "RETURNING " + collection + ".id, " + collection + ".data, " +
+                    "WHERE " + collection + "._id = target._id " +
+                    "RETURNING " + collection + "._id, " + collection + ".data, " +
                     collection + ".created_at, " + collection + ".updated_at";
 
                 ApplyFilterParams(cmd, filter);
@@ -1947,7 +1947,7 @@ namespace GoldLapel
                 if (selectExprs.Count > 0)
                     sql = "SELECT " + string.Join(", ", selectExprs);
                 else
-                    sql = "SELECT id, data, created_at, updated_at";
+                    sql = "SELECT _id, data, created_at, updated_at";
 
                 // Build FROM clause
                 var fromClause = collection;
@@ -3270,7 +3270,7 @@ namespace GoldLapel
         /// Watch a collection for changes via triggers + pg_notify.
         /// Like MongoDB change streams. Creates an AFTER INSERT/UPDATE/DELETE trigger
         /// that notifies on each row change. The callback receives the channel name
-        /// and a JSON payload with operationType, id, and fullDocument.
+        /// and a JSON payload with operationType, _id, and fullDocument.
         /// </summary>
         public static void DocWatch(DbConnection conn, string collection,
             Action<string, string> callback, bool blocking = true)
@@ -3288,7 +3288,7 @@ namespace GoldLapel
                     "BEGIN " +
                     "PERFORM pg_notify('" + channel + "', json_build_object(" +
                     "'operationType', lower(TG_OP), " +
-                    "'id', COALESCE(NEW.id, OLD.id)::text, " +
+                    "'_id', COALESCE(NEW._id, OLD._id)::text, " +
                     "'fullDocument', CASE WHEN TG_OP = 'DELETE' THEN NULL ELSE NEW.data END" +
                     ")::text); " +
                     "RETURN COALESCE(NEW, OLD); " +
@@ -3454,8 +3454,8 @@ namespace GoldLapel
                     "BEGIN " +
                     "SELECT COUNT(*) - " + maxDocuments + " INTO excess FROM " + collection + "; " +
                     "IF excess > 0 THEN " +
-                    "DELETE FROM " + collection + " WHERE id IN (" +
-                    "SELECT id FROM " + collection + " ORDER BY created_at ASC LIMIT excess" +
+                    "DELETE FROM " + collection + " WHERE _id IN (" +
+                    "SELECT _id FROM " + collection + " ORDER BY created_at ASC LIMIT excess" +
                     "); " +
                     "END IF; " +
                     "RETURN NULL; " +
