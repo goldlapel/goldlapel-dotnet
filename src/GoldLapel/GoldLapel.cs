@@ -358,6 +358,9 @@ namespace GoldLapel
         public void DocRemoveTtlIndex(string collection)
             => Utils.DocRemoveTtlIndex(Connection, collection);
 
+        public void DocCreateCollection(string collection, bool unlogged = false)
+            => Utils.DocCreateCollection(Connection, collection, unlogged);
+
         public void DocCreateCapped(string collection, int maxDocuments)
             => Utils.DocCreateCapped(Connection, collection, maxDocuments);
 

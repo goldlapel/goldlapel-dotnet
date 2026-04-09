@@ -1302,6 +1302,47 @@ namespace GoldLapel.Tests
         }
     }
 
+    // ── DocCreateCollection ────────────────────────────────────────
+
+    public class DocCreateCollectionTest
+    {
+        [Fact]
+        public void CreatesRegularTableByDefault()
+        {
+            var conn = new SpyConnection();
+            Utils.DocCreateCollection(conn, "users");
+
+            Assert.Single(conn.Commands);
+            var sql = conn.Commands[0].CommandText;
+            Assert.Contains("CREATE TABLE IF NOT EXISTS users", sql);
+            Assert.DoesNotContain("UNLOGGED", sql);
+            Assert.Contains("BIGSERIAL PRIMARY KEY", sql);
+            Assert.Contains("data JSONB NOT NULL", sql);
+            Assert.Contains("created_at TIMESTAMPTZ", sql);
+            Assert.Contains("updated_at TIMESTAMPTZ", sql);
+        }
+
+        [Fact]
+        public void CreatesUnloggedTable()
+        {
+            var conn = new SpyConnection();
+            Utils.DocCreateCollection(conn, "ephemeral", true);
+
+            Assert.Single(conn.Commands);
+            var sql = conn.Commands[0].CommandText;
+            Assert.Contains("CREATE UNLOGGED TABLE IF NOT EXISTS ephemeral", sql);
+            Assert.DoesNotContain("CREATE TABLE IF NOT EXISTS", sql);
+        }
+
+        [Fact]
+        public void InvalidCollectionThrows()
+        {
+            var conn = new SpyConnection();
+            Assert.Throws<ArgumentException>(() =>
+                Utils.DocCreateCollection(conn, "bad; name"));
+        }
+    }
+
     // ── DocCreateCapped ───────────────────────────────────────────
 
     public class DocCreateCappedTest

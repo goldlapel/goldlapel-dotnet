@@ -1247,20 +1247,32 @@ namespace GoldLapel
 
         // ── DocX: MongoDB-like document store ────────────────────
 
-        private static void EnsureCollection(DbConnection conn, string collection)
+        private static void EnsureCollection(DbConnection conn, string collection, bool unlogged = false)
         {
             ValidateIdentifier(collection);
 
+            var prefix = unlogged ? "CREATE UNLOGGED TABLE" : "CREATE TABLE";
             using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText =
-                    "CREATE TABLE IF NOT EXISTS " + collection + " (" +
+                    prefix + " IF NOT EXISTS " + collection + " (" +
                     "id BIGSERIAL PRIMARY KEY, " +
                     "data JSONB NOT NULL, " +
                     "created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), " +
                     "updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())";
                 cmd.ExecuteNonQuery();
             }
+        }
+
+        /// <summary>
+        /// Explicitly create a collection table. Like MongoDB createCollection().
+        /// Optionally creates an UNLOGGED table for high-throughput ephemeral data.
+        /// UNLOGGED tables are not crash-safe but significantly faster for writes.
+        /// </summary>
+        public static void DocCreateCollection(DbConnection conn, string collection, bool unlogged = false)
+        {
+            ValidateIdentifier(collection);
+            EnsureCollection(conn, collection, unlogged);
         }
 
         private static Dictionary<string, object> ReadRow(DbDataReader reader)
