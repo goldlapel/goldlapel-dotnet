@@ -377,7 +377,7 @@ namespace GoldLapel.Tests
         {
             var conn = new SpyConnection();
             Utils.Facets(conn, "products", "category", query: "laptop",
-                queryColumn: new[] { "title", "description" });
+                queryColumns: new[] { "title", "description" });
 
             var sql = conn.LastCommandText;
             Assert.Contains("coalesce(title, '') || ' ' || coalesce(description, '')", sql);

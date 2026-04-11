@@ -1031,17 +1031,17 @@ namespace GoldLapel
         }
 
         public static List<Dictionary<string, object>> Facets(DbConnection conn, string table,
-            string column, int limit = 50, string query = null, string[] queryColumn = null,
+            string column, int limit = 50, string query = null, string[] queryColumns = null,
             string lang = "english")
         {
             ValidateIdentifier(table);
             ValidateIdentifier(column);
 
-            var hasQuery = query != null && queryColumn != null && queryColumn.Length > 0;
+            var hasQuery = query != null && queryColumns != null && queryColumns.Length > 0;
 
             if (hasQuery)
             {
-                foreach (var col in queryColumn)
+                foreach (var col in queryColumns)
                     ValidateIdentifier(col);
             }
 
@@ -1050,7 +1050,7 @@ namespace GoldLapel
                 if (hasQuery)
                 {
                     var tsvParts = string.Join(" || ' ' || ",
-                        queryColumn.Select(c => "coalesce(" + c + ", '')"));
+                        queryColumns.Select(c => "coalesce(" + c + ", '')"));
                     var tsv = "to_tsvector(@lang, " + tsvParts + ")";
 
                     cmd.CommandText =
