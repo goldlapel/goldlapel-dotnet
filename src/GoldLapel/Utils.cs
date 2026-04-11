@@ -272,12 +272,6 @@ namespace GoldLapel
         {
             using (var cmd = conn.CreateCommand())
             {
-                cmd.CommandText = "CREATE EXTENSION IF NOT EXISTS postgis";
-                cmd.ExecuteNonQuery();
-            }
-
-            using (var cmd = conn.CreateCommand())
-            {
                 cmd.CommandText =
                     "CREATE TABLE IF NOT EXISTS " + table + " (" +
                     "id BIGSERIAL PRIMARY KEY, " +
@@ -535,12 +529,6 @@ namespace GoldLapel
 
         public static string Script(DbConnection conn, string luaCode, params string[] args)
         {
-            using (var cmd = conn.CreateCommand())
-            {
-                cmd.CommandText = "CREATE EXTENSION IF NOT EXISTS pllua";
-                cmd.ExecuteNonQuery();
-            }
-
             var funcName = "_gl_lua_" + Guid.NewGuid().ToString("N").Substring(0, 8);
             var paramDefs = string.Join(", ", Enumerable.Range(0, args.Length).Select(i => $"p{i + 1} text"));
 
@@ -772,12 +760,6 @@ namespace GoldLapel
 
             using (var cmd = conn.CreateCommand())
             {
-                cmd.CommandText = "CREATE EXTENSION IF NOT EXISTS pg_trgm";
-                cmd.ExecuteNonQuery();
-            }
-
-            using (var cmd = conn.CreateCommand())
-            {
                 cmd.CommandText =
                     "SELECT *, similarity(" + column + ", @query) AS _score FROM " + table +
                     " WHERE similarity(" + column + ", @query2) > @threshold" +
@@ -809,18 +791,6 @@ namespace GoldLapel
         {
             ValidateIdentifier(table);
             ValidateIdentifier(column);
-
-            using (var cmd = conn.CreateCommand())
-            {
-                cmd.CommandText = "CREATE EXTENSION IF NOT EXISTS fuzzystrmatch";
-                cmd.ExecuteNonQuery();
-            }
-
-            using (var cmd = conn.CreateCommand())
-            {
-                cmd.CommandText = "CREATE EXTENSION IF NOT EXISTS pg_trgm";
-                cmd.ExecuteNonQuery();
-            }
 
             using (var cmd = conn.CreateCommand())
             {
@@ -949,12 +919,6 @@ namespace GoldLapel
             ValidateIdentifier(table);
             ValidateIdentifier(column);
 
-            using (var cmd = conn.CreateCommand())
-            {
-                cmd.CommandText = "CREATE EXTENSION IF NOT EXISTS vector";
-                cmd.ExecuteNonQuery();
-            }
-
             var vectorLiteral = "[" + string.Join(",",
                 vector.Select(v => v.ToString(CultureInfo.InvariantCulture))) + "]";
 
@@ -988,12 +952,6 @@ namespace GoldLapel
         {
             ValidateIdentifier(table);
             ValidateIdentifier(column);
-
-            using (var cmd = conn.CreateCommand())
-            {
-                cmd.CommandText = "CREATE EXTENSION IF NOT EXISTS pg_trgm";
-                cmd.ExecuteNonQuery();
-            }
 
             using (var cmd = conn.CreateCommand())
             {
