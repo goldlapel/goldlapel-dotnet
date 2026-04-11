@@ -193,7 +193,6 @@ namespace GoldLapel.Tests
         {
             _gl.SearchFuzzy("articles", "title", "helo");
 
-            // First command is CREATE EXTENSION, second is the search
             Assert.Contains("similarity(title, @query)", _spy.LastCommandText);
         }
 

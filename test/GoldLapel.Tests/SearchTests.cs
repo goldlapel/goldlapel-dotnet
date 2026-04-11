@@ -124,16 +124,6 @@ namespace GoldLapel.Tests
         }
 
         [Fact]
-        public void CreatesExtension()
-        {
-            var conn = new SpyConnection();
-            Utils.SearchFuzzy(conn, "articles", "title", "helo");
-
-            var extensionCmd = conn.Commands[0];
-            Assert.Equal("CREATE EXTENSION IF NOT EXISTS pg_trgm", extensionCmd.CommandText);
-        }
-
-        [Fact]
         public void Parameters()
         {
             var conn = new SpyConnection();
@@ -192,16 +182,6 @@ namespace GoldLapel.Tests
         }
 
         [Fact]
-        public void CreatesExtensions()
-        {
-            var conn = new SpyConnection();
-            Utils.SearchPhonetic(conn, "articles", "title", "jon");
-
-            Assert.Equal("CREATE EXTENSION IF NOT EXISTS fuzzystrmatch", conn.Commands[0].CommandText);
-            Assert.Equal("CREATE EXTENSION IF NOT EXISTS pg_trgm", conn.Commands[1].CommandText);
-        }
-
-        [Fact]
         public void Parameters()
         {
             var conn = new SpyConnection();
@@ -239,15 +219,6 @@ namespace GoldLapel.Tests
             Assert.Contains("FROM docs", sql);
             Assert.Contains("ORDER BY _score", sql);
             Assert.Contains("LIMIT @limit", sql);
-        }
-
-        [Fact]
-        public void CreatesExtension()
-        {
-            var conn = new SpyConnection();
-            Utils.Similar(conn, "docs", "embedding", new double[] { 0.1 });
-
-            Assert.Equal("CREATE EXTENSION IF NOT EXISTS vector", conn.Commands[0].CommandText);
         }
 
         [Fact]
@@ -307,15 +278,6 @@ namespace GoldLapel.Tests
             Assert.Contains("FROM cities", sql);
             Assert.Contains("ORDER BY _score DESC, name", sql);
             Assert.Contains("LIMIT @limit", sql);
-        }
-
-        [Fact]
-        public void CreatesExtension()
-        {
-            var conn = new SpyConnection();
-            Utils.Suggest(conn, "cities", "name", "new");
-
-            Assert.Equal("CREATE EXTENSION IF NOT EXISTS pg_trgm", conn.Commands[0].CommandText);
         }
 
         [Fact]

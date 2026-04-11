@@ -272,6 +272,12 @@ namespace GoldLapel
         {
             using (var cmd = conn.CreateCommand())
             {
+                cmd.CommandText = "CREATE EXTENSION IF NOT EXISTS postgis";
+                cmd.ExecuteNonQuery();
+            }
+
+            using (var cmd = conn.CreateCommand())
+            {
                 cmd.CommandText =
                     "CREATE TABLE IF NOT EXISTS " + table + " (" +
                     "id BIGSERIAL PRIMARY KEY, " +
@@ -529,6 +535,12 @@ namespace GoldLapel
 
         public static string Script(DbConnection conn, string luaCode, params string[] args)
         {
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "CREATE EXTENSION IF NOT EXISTS pllua";
+                cmd.ExecuteNonQuery();
+            }
+
             var funcName = "_gl_lua_" + Guid.NewGuid().ToString("N").Substring(0, 8);
             var paramDefs = string.Join(", ", Enumerable.Range(0, args.Length).Select(i => $"p{i + 1} text"));
 
