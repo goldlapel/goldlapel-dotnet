@@ -852,7 +852,7 @@ namespace GoldLapel
             {
                 cmd.CommandText =
                     "CREATE INDEX IF NOT EXISTS " + name + "_tsq_idx ON " + name +
-                    " USING GIN (tsquery)";
+                    " USING GIST (tsquery)";
                 cmd.ExecuteNonQuery();
             }
 

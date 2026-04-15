@@ -598,7 +598,7 @@ namespace GoldLapel.Tests
 
             var idxCmd = conn.Commands[1];
             Assert.Contains("CREATE INDEX IF NOT EXISTS alerts_tsq_idx", idxCmd.CommandText);
-            Assert.Contains("USING GIN (tsquery)", idxCmd.CommandText);
+            Assert.Contains("USING GIST (tsquery)", idxCmd.CommandText);
         }
 
         [Fact]
