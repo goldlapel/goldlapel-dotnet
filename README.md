@@ -15,8 +15,9 @@ dotnet add package GoldLapel
 ```csharp
 using GoldLapel;
 
-// Start the proxy — returns a database connection with L1 cache built in
-var conn = GoldLapel.Start("postgresql://user:pass@localhost:5432/mydb");
+// Create and start the proxy — IDisposable for automatic cleanup
+using var gl = new GoldLapel("postgresql://user:pass@localhost:5432/mydb");
+var conn = gl.Start();
 
 // Use the connection directly — no NpgsqlConnection needed
 var cmd = conn.CreateCommand();
@@ -27,42 +28,31 @@ var reader = cmd.ExecuteReader();
 
 ## API
 
-### `GoldLapel.Start(upstream)`
-### `GoldLapel.Start(upstream, options)`
+### `new GoldLapel(upstream)` / `new GoldLapel(upstream, options)`
 
-Starts the Gold Lapel proxy and returns a database connection with L1 cache.
+Creates a new Gold Lapel proxy instance. Implements `IDisposable` for automatic cleanup.
 
 - `upstream` — your Postgres connection string (e.g. `postgresql://user:pass@localhost:5432/mydb`)
 - `options.Port` — proxy port (default: 7932)
 - `options.ExtraArgs` — additional CLI flags passed to the binary (e.g. `"--threshold-impact", "5000"`)
 
-### `GoldLapel.Stop()`
+### `gl.Start()`
 
-Stops the proxy. Also called automatically on process exit.
+Starts the proxy and returns a database connection with L1 cache.
 
-### `GoldLapel.ProxyUrl`
+### `gl.Stop()`
+
+Stops the proxy. Also called automatically via `Dispose()`.
+
+### `gl.ProxyUrl`
 
 Returns the current proxy URL, or `null` if not running.
 
-### `GoldLapel.DashboardProxyUrl`
+### `gl.DashboardUrl`
 
 Returns the dashboard URL (e.g. `http://127.0.0.1:7933`), or `null` if not running. Default port is 7933. Set `dashboardPort` in config to customize, or `0` to disable.
 
-### `new GoldLapel(upstream)` / `new GoldLapel(upstream, options)`
-
-Instance API for managing multiple proxies. Implements `IDisposable` for automatic cleanup:
-
-```csharp
-using GoldLapel;
-
-using var proxy = new GoldLapel(
-    "postgresql://user:pass@localhost:5432/mydb",
-    new GoldLapelOptions { Port = 7932 });
-var conn = proxy.StartProxy();
-// proxy.StopProxy() called automatically via Dispose
-```
-
-### `GoldLapel.ConfigKeys()`
+### `gl.ConfigKeys()`
 
 Returns all valid config key names as an `IReadOnlyCollection<string>`.
 
@@ -73,7 +63,7 @@ Pass a config dictionary via options:
 ```csharp
 using GoldLapel;
 
-var conn = GoldLapel.GoldLapel.Start("postgresql://user:pass@localhost/mydb",
+using var gl = new GoldLapel("postgresql://user:pass@localhost/mydb",
     new GoldLapelOptions
     {
         Config = new Dictionary<string, object>
@@ -84,6 +74,7 @@ var conn = GoldLapel.GoldLapel.Start("postgresql://user:pass@localhost/mydb",
             ["replica"] = new List<string> { "postgresql://user:pass@replica1/mydb" },
         }
     });
+var conn = gl.Start();
 ```
 
 Keys use `camelCase` and map to CLI flags (`poolSize` → `--pool-size`). Boolean keys are flags — `true` enables them. List keys produce repeated flags.
@@ -91,7 +82,7 @@ Keys use `camelCase` and map to CLI flags (`poolSize` → `--pool-size`). Boolea
 Unknown keys throw `ArgumentException`. To see all valid keys:
 
 ```csharp
-GoldLapel.GoldLapel.ConfigKeys()
+GoldLapel.ConfigKeys()
 ```
 
 For the full configuration reference, see the [main documentation](https://github.com/goldlapel/goldlapel#setting-reference).
@@ -99,19 +90,20 @@ For the full configuration reference, see the [main documentation](https://githu
 You can also pass raw CLI flags via `ExtraArgs`:
 
 ```csharp
-var conn = GoldLapel.GoldLapel.Start(
+using var gl = new GoldLapel(
     "postgresql://user:pass@localhost:5432/mydb",
     new GoldLapelOptions
     {
         ExtraArgs = new[] { "--threshold-duration-ms", "200", "--refresh-interval-secs", "30" }
     });
+var conn = gl.Start();
 ```
 
 Or set environment variables (`GOLDLAPEL_PROXY_PORT`, `GOLDLAPEL_UPSTREAM`, etc.) — the binary reads them automatically.
 
 ## How It Works
 
-This package bundles the Gold Lapel Rust binary for your platform. When you call `Start()`, it:
+This package bundles the Gold Lapel Rust binary for your platform. When you call `gl.Start()`, it:
 
 1. Locates the binary (bundled in NuGet package, on PATH, or via `GOLDLAPEL_BINARY` env var)
 2. Spawns it as a subprocess listening on localhost
