@@ -26,7 +26,12 @@ namespace Goldlapel
         /// <summary>Proxy listen port (default: 7932).</summary>
         public int Port { get; set; } = GoldLapel.DefaultPort;
 
-        /// <summary>Log level for the proxy (e.g. "info", "debug"). Shortcut for <c>Config["logLevel"]</c>.</summary>
+        /// <summary>
+        /// Log level for the proxy. Accepted values: <c>"trace"</c>, <c>"debug"</c>,
+        /// <c>"info"</c>, <c>"warn"</c>, <c>"error"</c>. Only trace/debug/info produce
+        /// visible output; warn/error are the binary's default level.
+        /// Shortcut for <c>Config["logLevel"]</c>.
+        /// </summary>
         public string LogLevel { get; set; }
 
         /// <summary>Structured config map passed as CLI flags (e.g. {"poolSize", 50}).</summary>
@@ -446,6 +451,20 @@ namespace Goldlapel
                 if (!ValidConfigKeys.Contains(key))
                     throw new ArgumentException("Unknown config key: " + key);
 
+                // logLevel is a wrapper-side concept. The proxy binary uses
+                // count-based verbosity (-v/-vv/-vvv), not --log-level.
+                if (key == "logLevel")
+                {
+                    var levelStr = value as string;
+                    if (levelStr == null)
+                        throw new ArgumentException(
+                            "Config key 'logLevel' must be a string, got " + value.GetType().Name);
+                    var verboseFlag = LogLevelToVerboseFlag(levelStr);
+                    if (verboseFlag != null)
+                        result.Add(verboseFlag);
+                    continue;
+                }
+
                 var flag = "--" + CamelToKebab(key);
 
                 if (BooleanKeys.Contains(key))
@@ -477,6 +496,28 @@ namespace Goldlapel
             }
 
             return result;
+        }
+
+        // Translate the ergonomic log_level string into the proxy binary's
+        // count-based verbosity flag (-v/-vv/-vvv). Returns null when no
+        // flag should be emitted (warn/error map to the default level).
+        // Throws ArgumentException for any other value.
+        internal static string LogLevelToVerboseFlag(string level)
+        {
+            if (string.IsNullOrEmpty(level)) return null;
+            switch (level.ToLowerInvariant())
+            {
+                case "trace":   return "-vvv";
+                case "debug":   return "-vv";
+                case "info":    return "-v";
+                case "warn":
+                case "warning":
+                case "error":
+                    return null;
+                default:
+                    throw new ArgumentException(
+                        "logLevel must be one of: trace, debug, info, warn, error (got '" + level + "')");
+            }
         }
 
         private static string CamelToKebab(string key)

@@ -257,12 +257,64 @@ namespace Goldlapel.Tests
         }
 
         [Fact]
-        public void LogLevelOptionMapsToFlag()
+        public void LogLevelDebugMapsToDoubleVerbose()
         {
-            // LogLevel shortcut merges into config as "logLevel", which becomes --log-level.
+            // The proxy binary accepts -v/-vv/-vvv (count-based), not --log-level.
+            // LogLevel "debug" → -vv.
             var config = new Dictionary<string, object> { { "logLevel", "debug" } };
             var args = GL.ConfigToArgs(config);
-            Assert.Equal(new List<string> { "--log-level", "debug" }, args);
+            Assert.Equal(new List<string> { "-vv" }, args);
+        }
+
+        [Fact]
+        public void LogLevelTraceMapsToTripleVerbose()
+        {
+            var args = GL.ConfigToArgs(new Dictionary<string, object> { { "logLevel", "trace" } });
+            Assert.Equal(new List<string> { "-vvv" }, args);
+        }
+
+        [Fact]
+        public void LogLevelInfoMapsToSingleVerbose()
+        {
+            var args = GL.ConfigToArgs(new Dictionary<string, object> { { "logLevel", "info" } });
+            Assert.Equal(new List<string> { "-v" }, args);
+        }
+
+        [Theory]
+        [InlineData("warn")]
+        [InlineData("warning")]
+        [InlineData("error")]
+        public void LogLevelWarnOrErrorEmitsNoFlag(string level)
+        {
+            // warn/error are the default level — no extra flag needed.
+            var args = GL.ConfigToArgs(new Dictionary<string, object> { { "logLevel", level } });
+            Assert.Empty(args);
+        }
+
+        [Fact]
+        public void LogLevelIsCaseInsensitive()
+        {
+            var args = GL.ConfigToArgs(new Dictionary<string, object> { { "logLevel", "DEBUG" } });
+            Assert.Equal(new List<string> { "-vv" }, args);
+        }
+
+        [Fact]
+        public void LogLevelInvalidRaises()
+        {
+            var ex = Assert.Throws<ArgumentException>(() =>
+                GL.ConfigToArgs(new Dictionary<string, object> { { "logLevel", "loud" } }));
+            Assert.Contains("logLevel must be one of", ex.Message);
+        }
+
+        [Fact]
+        public void LogLevelNeverEmitsLongFlag()
+        {
+            // Regression guard: the proxy binary does not accept --log-level.
+            foreach (var lvl in new[] { "trace", "debug", "info", "warn", "error" })
+            {
+                var args = GL.ConfigToArgs(new Dictionary<string, object> { { "logLevel", lvl } });
+                Assert.DoesNotContain("--log-level", args);
+            }
         }
     }
 
