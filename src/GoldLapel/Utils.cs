@@ -18,6 +18,7 @@ namespace GoldLapel
         /// </summary>
         public static void Publish(DbConnection conn, string channel, string message)
         {
+            ValidateIdentifier(channel);
             using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText = "SELECT pg_notify(@channel, @message)";
@@ -33,6 +34,7 @@ namespace GoldLapel
         /// </summary>
         public static void Enqueue(DbConnection conn, string queueTable, string payloadJson)
         {
+            ValidateIdentifier(queueTable);
             using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText =
@@ -58,6 +60,7 @@ namespace GoldLapel
         /// </summary>
         public static string Dequeue(DbConnection conn, string queueTable)
         {
+            ValidateIdentifier(queueTable);
             using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText =
@@ -82,6 +85,7 @@ namespace GoldLapel
         /// </summary>
         public static long Incr(DbConnection conn, string table, string key, long amount = 1)
         {
+            ValidateIdentifier(table);
             using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText =
@@ -111,6 +115,7 @@ namespace GoldLapel
         /// </summary>
         public static void Zadd(DbConnection conn, string table, string member, double score)
         {
+            ValidateIdentifier(table);
             using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText =
@@ -139,6 +144,7 @@ namespace GoldLapel
         public static List<(string Member, double Score)> Zrange(
             DbConnection conn, string table, int start = 0, int stop = 10, bool desc = true)
         {
+            ValidateIdentifier(table);
             var order = desc ? "DESC" : "ASC";
             var limit = stop - start;
 
@@ -169,6 +175,7 @@ namespace GoldLapel
         /// </summary>
         public static void Hset(DbConnection conn, string table, string key, string field, string valueJson)
         {
+            ValidateIdentifier(table);
             using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText =
@@ -198,6 +205,7 @@ namespace GoldLapel
         /// </summary>
         public static string Hget(DbConnection conn, string table, string key, string field)
         {
+            ValidateIdentifier(table);
             using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText = "SELECT data->>@field FROM " + table + " WHERE key = @key";
@@ -219,6 +227,7 @@ namespace GoldLapel
         /// </summary>
         public static string Hgetall(DbConnection conn, string table, string key)
         {
+            ValidateIdentifier(table);
             using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText = "SELECT data FROM " + table + " WHERE key = @key";
@@ -239,6 +248,7 @@ namespace GoldLapel
         /// </summary>
         public static bool Hdel(DbConnection conn, string table, string key, string field)
         {
+            ValidateIdentifier(table);
             using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText = "SELECT data ? @field AS existed FROM " + table + " WHERE key = @key";
@@ -270,6 +280,9 @@ namespace GoldLapel
         public static void Geoadd(DbConnection conn, string table, string nameColumn,
             string geomColumn, string name, double lon, double lat)
         {
+            ValidateIdentifier(table);
+            ValidateIdentifier(nameColumn);
+            ValidateIdentifier(geomColumn);
             using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText = "CREATE EXTENSION IF NOT EXISTS postgis";
@@ -307,6 +320,8 @@ namespace GoldLapel
         public static List<Dictionary<string, object>> Georadius(DbConnection conn, string table,
             string geomColumn, double lon, double lat, double radiusMeters, int limit = 50)
         {
+            ValidateIdentifier(table);
+            ValidateIdentifier(geomColumn);
             using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText =
@@ -352,6 +367,9 @@ namespace GoldLapel
         public static double? Geodist(DbConnection conn, string table, string geomColumn,
             string nameColumn, string nameA, string nameB)
         {
+            ValidateIdentifier(table);
+            ValidateIdentifier(geomColumn);
+            ValidateIdentifier(nameColumn);
             using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText =
@@ -372,6 +390,7 @@ namespace GoldLapel
 
         public static void Subscribe(DbConnection conn, string channel, Action<string, string> callback, bool blocking = true)
         {
+            ValidateIdentifier(channel);
             if (blocking)
             {
                 ListenLoop(conn, channel, callback);
@@ -438,6 +457,7 @@ namespace GoldLapel
 
         public static long GetCounter(DbConnection conn, string table, string key)
         {
+            ValidateIdentifier(table);
             using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText = "SELECT value FROM " + table + " WHERE key = @key";
@@ -454,6 +474,7 @@ namespace GoldLapel
 
         public static double Zincrby(DbConnection conn, string table, string member, double amount = 1)
         {
+            ValidateIdentifier(table);
             using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText =
@@ -478,6 +499,7 @@ namespace GoldLapel
 
         public static long? Zrank(DbConnection conn, string table, string member, bool desc = true)
         {
+            ValidateIdentifier(table);
             var order = desc ? "DESC" : "ASC";
 
             using (var cmd = conn.CreateCommand())
@@ -500,6 +522,7 @@ namespace GoldLapel
 
         public static double? Zscore(DbConnection conn, string table, string member)
         {
+            ValidateIdentifier(table);
             using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText = "SELECT score FROM " + table + " WHERE member = @member";
@@ -516,6 +539,7 @@ namespace GoldLapel
 
         public static bool Zrem(DbConnection conn, string table, string member)
         {
+            ValidateIdentifier(table);
             using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText = "DELETE FROM " + table + " WHERE member = @member";
@@ -526,6 +550,8 @@ namespace GoldLapel
 
         public static long CountDistinct(DbConnection conn, string table, string column)
         {
+            ValidateIdentifier(table);
+            ValidateIdentifier(column);
             using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText = "SELECT COUNT(DISTINCT " + column + ") FROM " + table;
@@ -565,6 +591,7 @@ namespace GoldLapel
 
         public static long StreamAdd(DbConnection conn, string stream, string payload)
         {
+            ValidateIdentifier(stream);
             using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText =
@@ -585,6 +612,7 @@ namespace GoldLapel
 
         public static void StreamCreateGroup(DbConnection conn, string stream, string group)
         {
+            ValidateIdentifier(stream);
             using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText =
@@ -620,6 +648,7 @@ namespace GoldLapel
         public static List<Dictionary<string, object>> StreamRead(DbConnection conn, string stream,
             string group, string consumer, int count = 1)
         {
+            ValidateIdentifier(stream);
             using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText =
@@ -662,6 +691,7 @@ namespace GoldLapel
 
         public static bool StreamAck(DbConnection conn, string stream, string group, long messageId)
         {
+            ValidateIdentifier(stream);
             using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText =
@@ -676,6 +706,7 @@ namespace GoldLapel
         public static List<Dictionary<string, object>> StreamClaim(DbConnection conn, string stream,
             string group, string consumer, long minIdleMs = 60000)
         {
+            ValidateIdentifier(stream);
             using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText =
