@@ -11,6 +11,11 @@ namespace Goldlapel.Tests
 {
     // ── FindBinary ────────────────────────────────────────────
 
+    // Shares the "EnvVarTests" collection with IntegrationTests so xUnit serializes
+    // them — FindBinaryTest mutates the process-global GOLDLAPEL_BINARY env var,
+    // which IntegrationTests reads via FindBinary() and would otherwise see in a
+    // poisoned state during parallel test runs.
+    [Collection("EnvVarTests")]
     public class FindBinaryTest : IDisposable
     {
         private string? _origBinary;

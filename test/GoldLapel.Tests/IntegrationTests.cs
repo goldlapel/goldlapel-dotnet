@@ -16,6 +16,7 @@ namespace Goldlapel.Tests
     // end-to-end check of StartAsync / await using / UsingAsync / connection:
     // under the new v0.2.0 API.
 
+    [Collection("EnvVarTests")]
     public class IntegrationTests
     {
         private const string Upstream = "postgresql://sgibson@localhost/postgres";
