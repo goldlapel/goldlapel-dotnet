@@ -169,18 +169,22 @@ namespace Goldlapel.Tests
         //
         // Gated on GOLDLAPEL_CLOSECOMPLETE_FIX=1 (opt-in) because stock
         // pre-fix binaries will deterministically fail. Default-skip is
-        // safe — dev/CI sets the env var once the fix ships.
+        // safe — dev/CI sets the env var once the fix ships. Using
+        // SkippableFact (not Fact) so `dotnet test` reports these as
+        // "Skipped" rather than silently passing.
         private static bool CloseCompleteFixConfirmed()
         {
             var v = Environment.GetEnvironmentVariable("GOLDLAPEL_CLOSECOMPLETE_FIX");
             return !string.IsNullOrEmpty(v) && v != "0" && v != "false";
         }
 
-        [Fact]
+        [SkippableFact]
         public async Task PreparedStatement_RoundTrips_AgainstLiveProxy()
         {
             if (!CanRunIntegration()) return;
-            if (!CloseCompleteFixConfirmed()) return;
+            Skip.IfNot(
+                CloseCompleteFixConfirmed(),
+                "Requires a CloseComplete-fixed proxy binary. Set GOLDLAPEL_CLOSECOMPLETE_FIX=1 to run.");
 
             var port = NextPort();
             await using var gl = await GL.StartAsync(Upstream, opts => { opts.Port = port; });
@@ -214,11 +218,13 @@ namespace Goldlapel.Tests
         // resulting burst of CloseComplete frames leaked back to whichever
         // connection next used extended protocol — reliably trashing it
         // with "CloseComplete while expecting ParseCompleteMessage".
-        [Fact]
+        [SkippableFact]
         public async Task PreparedStatement_Survives_DdlOnSecondConnection()
         {
             if (!CanRunIntegration()) return;
-            if (!CloseCompleteFixConfirmed()) return;
+            Skip.IfNot(
+                CloseCompleteFixConfirmed(),
+                "Requires a CloseComplete-fixed proxy binary. Set GOLDLAPEL_CLOSECOMPLETE_FIX=1 to run.");
 
             var port = NextPort();
             await using var gl = await GL.StartAsync(Upstream, opts => { opts.Port = port; });
