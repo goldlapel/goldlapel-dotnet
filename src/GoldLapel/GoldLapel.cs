@@ -215,7 +215,17 @@ namespace Goldlapel
         /// <summary>True while the proxy subprocess is alive.</summary>
         public bool IsRunning => _process != null && !_process.HasExited;
 
-        /// <summary>Dashboard URL (<c>http://127.0.0.1:{dashboardPort}</c>), or null if disabled/stopped.</summary>
+        /// <summary>
+        /// Dashboard URL (<c>http://127.0.0.1:{dashboardPort}</c>) while the proxy
+        /// is running, otherwise <c>null</c>. Returns <c>null</c> pre-start, after
+        /// disposal, or when <c>dashboardPort</c> is 0 (dashboard disabled).
+        /// </summary>
+        /// <remarks>
+        /// This matches the behavior of the Python, Go, Java, and PHP wrappers:
+        /// no live URL is reported until the proxy process is up. If you only
+        /// need the port number at construction time, read it from your
+        /// <c>Config["dashboardPort"]</c> or derive it as <c>Port + 1</c>.
+        /// </remarks>
         public string DashboardUrl =>
             _dashboardPort > 0 && _process != null && !_process.HasExited
                 ? "http://127.0.0.1:" + _dashboardPort

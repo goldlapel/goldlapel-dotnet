@@ -353,7 +353,28 @@ namespace Goldlapel.Tests
         [Fact]
         public void DashboardUrlNullWhenNotRunning()
         {
+            // Cross-wrapper contract: DashboardUrl reports only while the proxy
+            // process is live. Pre-start (and post-dispose), it is null. This
+            // matches Python (dashboard_url), Go (DashboardURL), Java
+            // (getDashboardUrl), and PHP (getDashboardUrl). If this assertion
+            // flips, update the DashboardUrl XML doc too.
             var gl = GL.CreateForTest("postgresql://localhost:5432/mydb");
+            Assert.Null(gl.DashboardUrl);
+        }
+
+        [Fact]
+        public void DashboardUrlNullPreStartEvenWithExplicitPort()
+        {
+            // Regression guard: a user-supplied dashboardPort must not cause
+            // DashboardUrl to synthesize a URL before the proxy is running.
+            // The URL only becomes observable once the process binds the port.
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
+                new GoldLapelOptions
+                {
+                    Port = 17932,
+                    Config = new Dictionary<string, object> { { "dashboardPort", 9999 } }
+                });
+            Assert.False(gl.IsRunning);
             Assert.Null(gl.DashboardUrl);
         }
 
