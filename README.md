@@ -71,7 +71,7 @@ Async factory. Spawns the proxy, waits for it to accept connections, eagerly ope
 
 - `upstream` — Postgres connection string (`postgresql://user:pass@localhost:5432/mydb`)
 - `opts.Port` — proxy port (default: `7932`)
-- `opts.LogLevel` — proxy log level: `"trace"`, `"debug"`, `"info"`, `"warn"`, `"error"` (only trace/debug/info produce visible output; warn/error are the default level)
+- `opts.LogLevel` — proxy log level: `"trace"`, `"debug"`, `"info"`, `"warn"`, `"error"`. The binary defaults to `"warn"` (banner only); `"info"`, `"debug"`, and `"trace"` progressively add detail.
 - `opts.Config` — dictionary of proxy config (see [Configuration](#configuration))
 - `opts.ExtraArgs` — additional raw CLI flags
 
