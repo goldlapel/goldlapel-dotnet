@@ -9,22 +9,45 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
+using System.Threading.Tasks;
+using Npgsql;
 
-namespace GoldLapel
+namespace Goldlapel
 {
+    /// <summary>
+    /// Construction-time options for <see cref="GoldLapel.StartAsync(string, Action{GoldLapelOptions})"/>.
+    /// Populated via a configurator lambda:
+    /// <code>
+    /// await GoldLapel.StartAsync(url, opts => { opts.Port = 7932; opts.LogLevel = "info"; });
+    /// </code>
+    /// </summary>
     public class GoldLapelOptions
     {
-        public int? Port { get; set; }
-        public string[] ExtraArgs { get; set; }
+        /// <summary>Proxy listen port (default: 7932).</summary>
+        public int Port { get; set; } = GoldLapel.DefaultPort;
+
+        /// <summary>Log level for the proxy (e.g. "info", "debug"). Shortcut for <c>Config["logLevel"]</c>.</summary>
+        public string LogLevel { get; set; }
+
+        /// <summary>Structured config map passed as CLI flags (e.g. {"poolSize", 50}).</summary>
         public Dictionary<string, object> Config { get; set; }
+
+        /// <summary>Additional raw CLI flags appended to the binary invocation.</summary>
+        public string[] ExtraArgs { get; set; }
     }
 
-    public class GoldLapel : IDisposable
+    /// <summary>
+    /// Factory + handle for a Gold Lapel proxy process. Construct via
+    /// <see cref="StartAsync(string, Action{GoldLapelOptions})"/>; dispose with
+    /// <c>await using</c> (or call <see cref="DisposeAsync"/> directly) to stop the proxy.
+    /// </summary>
+    public class GoldLapel : IAsyncDisposable, IDisposable
     {
         internal const int DefaultPort = 7932;
         internal const int DefaultDashboardPort = 7933;
         internal const long StartupTimeoutMs = 10000;
         internal const long StartupPollIntervalMs = 50;
+        private const int GracefulTimeoutMs = 5000;
 
         private static readonly HashSet<string> ValidConfigKeys = new HashSet<string>(new[]
         {
@@ -35,6 +58,7 @@ namespace GoldLapel
             "poolMode", "mgmtIdleTimeout", "fallback", "readAfterWriteSecs",
             "n1Threshold", "n1WindowMs", "n1CrossThreshold",
             "tlsCert", "tlsKey", "tlsClientCa", "config", "dashboardPort",
+            "logLevel",
             "disableMatviews", "disableConsolidation", "disableBtreeIndexes",
             "disableTrigramIndexes", "disableExpressionIndexes",
             "disablePartialIndexes", "disableRewrite", "disablePreparedCache",
@@ -59,6 +83,11 @@ namespace GoldLapel
             "replica", "excludeTables"
         });
 
+        // AsyncLocal: scoping connection overrides across awaits within UsingAsync.
+        // Each wrapper method consults _scopedConnection first, then falls back to
+        // the internal _conn opened during StartAsync.
+        private static readonly AsyncLocal<DbConnection> _scopedConnection = new AsyncLocal<DbConnection>();
+
         private readonly string _upstream;
         private readonly int _port;
         private readonly int _dashboardPort;
@@ -67,28 +96,205 @@ namespace GoldLapel
         private Process _process;
         private string _proxyUrl;
         private bool _disposed;
-        private DbConnection _wrappedConn;
-        private DbConnection _conn;
+        private NpgsqlConnection _conn;  // eagerly opened internal connection
 
-        public GoldLapel(string upstream) : this(upstream, null) { }
+        // Test-only factory: returns an instance with config/port state but without
+        // spawning the binary or opening a connection. Unit tests inject a
+        // SpyConnection via _testConn to exercise wrapper methods.
+        internal static GoldLapel CreateForTest(string upstream, GoldLapelOptions options = null)
+        {
+            return new GoldLapel(upstream, options ?? new GoldLapelOptions());
+        }
 
-        public GoldLapel(string upstream, GoldLapelOptions options)
+        // Private: construct via StartAsync.
+        private GoldLapel(string upstream, GoldLapelOptions options)
         {
             if (upstream == null) throw new ArgumentNullException(nameof(upstream));
             _upstream = upstream;
-            _port = options?.Port ?? DefaultPort;
-            _dashboardPort = options?.Config != null && options.Config.ContainsKey("dashboardPort")
-                ? Convert.ToInt32(options.Config["dashboardPort"])
+            _port = options.Port;
+            _extraArgs = options.ExtraArgs ?? Array.Empty<string>();
+            _config = MergeConfig(options);
+            _dashboardPort = _config != null && _config.ContainsKey("dashboardPort")
+                ? Convert.ToInt32(_config["dashboardPort"])
                 : DefaultDashboardPort;
-            _extraArgs = options?.ExtraArgs ?? Array.Empty<string>();
-            _config = options?.Config;
         }
 
-        public string StartProxy()
-        {
-            if (_process != null && !_process.HasExited)
-                return _proxyUrl;
+        // ── Factory ─────────────────────────────────────────────────
 
+        /// <summary>
+        /// Spawn the Gold Lapel proxy for the given upstream URL, wait for it to accept
+        /// connections, eagerly open an internal <see cref="NpgsqlConnection"/> against
+        /// the proxy, and return a ready <see cref="GoldLapel"/> handle.
+        /// </summary>
+        /// <example>
+        /// <code>
+        /// await using var gl = await GoldLapel.StartAsync(
+        ///     "postgresql://user:pass@db/mydb",
+        ///     opts => { opts.Port = 7932; opts.LogLevel = "info"; });
+        /// var hits = await gl.SearchAsync("articles", "body", "postgres");
+        /// </code>
+        /// </example>
+        public static Task<GoldLapel> StartAsync(string upstream)
+        {
+            return StartAsync(upstream, null);
+        }
+
+        /// <inheritdoc cref="StartAsync(string)"/>
+        public static async Task<GoldLapel> StartAsync(string upstream, Action<GoldLapelOptions> configure)
+        {
+            if (upstream == null) throw new ArgumentNullException(nameof(upstream));
+            var options = new GoldLapelOptions();
+            configure?.Invoke(options);
+
+            var gl = new GoldLapel(upstream, options);
+            try
+            {
+                await gl.SpawnAsync().ConfigureAwait(false);
+            }
+            catch
+            {
+                gl.StopProcessInternal();
+                throw;
+            }
+            return gl;
+        }
+
+        private static Dictionary<string, object> MergeConfig(GoldLapelOptions options)
+        {
+            // Merge Config dictionary + LogLevel shortcut into one map.
+            if (options.Config == null && string.IsNullOrEmpty(options.LogLevel))
+                return null;
+
+            var merged = options.Config != null
+                ? new Dictionary<string, object>(options.Config)
+                : new Dictionary<string, object>();
+
+            if (!string.IsNullOrEmpty(options.LogLevel))
+                merged["logLevel"] = options.LogLevel;
+
+            return merged;
+        }
+
+        // ── Properties ──────────────────────────────────────────────
+
+        /// <summary>Proxy connection string (e.g. <c>postgresql://user:pass@localhost:7932/mydb</c>).</summary>
+        public string Url => _proxyUrl;
+
+        /// <summary>Proxy port.</summary>
+        public int Port => _port;
+
+        /// <summary>True while the proxy subprocess is alive.</summary>
+        public bool IsRunning => _process != null && !_process.HasExited;
+
+        /// <summary>Dashboard URL (<c>http://127.0.0.1:{dashboardPort}</c>), or null if disabled/stopped.</summary>
+        public string DashboardUrl =>
+            _dashboardPort > 0 && _process != null && !_process.HasExited
+                ? "http://127.0.0.1:" + _dashboardPort
+                : null;
+
+        /// <summary>
+        /// The internal connection opened by <see cref="StartAsync"/>. Wrapper methods use
+        /// this by default; user code typically opens its own <see cref="NpgsqlConnection"/>
+        /// against <see cref="Url"/> for raw SQL.
+        /// </summary>
+        public NpgsqlConnection Connection => _conn;
+
+        // ── Scoped connection override ──────────────────────────────
+
+        /// <summary>
+        /// Run <paramref name="action"/> with <paramref name="connection"/> bound as the
+        /// active connection for every wrapper method called on the passed handle. The
+        /// binding is scoped via <see cref="AsyncLocal{T}"/>, so it correctly follows
+        /// awaits. Nesting is supported; the inner scope wins and is restored on exit.
+        /// </summary>
+        /// <example>
+        /// <code>
+        /// await gl.UsingAsync(conn, async gl => {
+        ///     await gl.DocInsertAsync("events", new { type = "order.created" });
+        /// });
+        /// </code>
+        /// </example>
+        public async Task UsingAsync(DbConnection connection, Func<GoldLapel, Task> action)
+        {
+            if (connection == null) throw new ArgumentNullException(nameof(connection));
+            if (action == null) throw new ArgumentNullException(nameof(action));
+
+            var previous = _scopedConnection.Value;
+            _scopedConnection.Value = connection;
+            try
+            {
+                await action(this).ConfigureAwait(false);
+            }
+            finally
+            {
+                _scopedConnection.Value = previous;
+            }
+        }
+
+        /// <inheritdoc cref="UsingAsync(DbConnection, Func{GoldLapel, Task})"/>
+        public async Task<T> UsingAsync<T>(DbConnection connection, Func<GoldLapel, Task<T>> action)
+        {
+            if (connection == null) throw new ArgumentNullException(nameof(connection));
+            if (action == null) throw new ArgumentNullException(nameof(action));
+
+            var previous = _scopedConnection.Value;
+            _scopedConnection.Value = connection;
+            try
+            {
+                return await action(this).ConfigureAwait(false);
+            }
+            finally
+            {
+                _scopedConnection.Value = previous;
+            }
+        }
+
+        // ── Dispose ─────────────────────────────────────────────────
+
+        public async ValueTask DisposeAsync()
+        {
+            if (_disposed) return;
+            _disposed = true;
+
+            if (_conn != null)
+            {
+                try { await _conn.CloseAsync().ConfigureAwait(false); } catch { }
+                try { await _conn.DisposeAsync().ConfigureAwait(false); } catch { }
+                _conn = null;
+            }
+            StopProcessInternal();
+        }
+
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+
+            if (_conn != null)
+            {
+                try { _conn.Close(); } catch { }
+                try { _conn.Dispose(); } catch { }
+                _conn = null;
+            }
+            StopProcessInternal();
+        }
+
+        private void StopProcessInternal()
+        {
+            var proc = _process;
+            _process = null;
+            _proxyUrl = null;
+            if (proc != null)
+            {
+                if (!proc.HasExited) GracefulStop(proc);
+                try { proc.Dispose(); } catch { }
+            }
+        }
+
+        // ── Process spawn ───────────────────────────────────────────
+
+        private async Task SpawnAsync()
+        {
             var binary = FindBinary();
             var args = new List<string> { "--upstream", _upstream, "--proxy-port", _port.ToString() };
             args.AddRange(ConfigToArgs(_config));
@@ -117,8 +323,8 @@ namespace GoldLapel
                 throw new InvalidOperationException("Failed to start Gold Lapel process", e);
             }
 
-            // Drain stderr to prevent pipe-buffer deadlock
-            var stderrBuf = new System.Text.StringBuilder();
+            // Drain stderr to prevent pipe-buffer deadlock.
+            var stderrBuf = new StringBuilder();
             var stderrThread = new Thread(() =>
             {
                 try
@@ -129,11 +335,11 @@ namespace GoldLapel
                         stderrBuf.Append(buffer, 0, n);
                 }
                 catch { }
-            });
-            stderrThread.IsBackground = true;
+            })
+            { IsBackground = true };
             stderrThread.Start();
 
-            // Drain stdout
+            // Drain stdout so the child doesn't block writing to it.
             var stdoutThread = new Thread(() =>
             {
                 try
@@ -142,17 +348,17 @@ namespace GoldLapel
                     while (_process.StandardOutput.Read(buffer, 0, buffer.Length) > 0) { }
                 }
                 catch { }
-            });
-            stdoutThread.IsBackground = true;
+            })
+            { IsBackground = true };
             stdoutThread.Start();
 
-            // Poll for port readiness
+            // Poll for port readiness.
             var sw = Stopwatch.StartNew();
             var ready = false;
             while (sw.ElapsedMilliseconds < StartupTimeoutMs)
             {
                 if (_process.HasExited) break;
-                if (WaitForPort("127.0.0.1", _port, 500))
+                if (await WaitForPortAsync("127.0.0.1", _port, 500).ConfigureAwait(false))
                 {
                     ready = true;
                     break;
@@ -168,58 +374,30 @@ namespace GoldLapel
                 try { stderrThread.Join(2000); } catch { }
                 throw new InvalidOperationException(
                     "Gold Lapel failed to start on port " + _port +
-                    " within " + (StartupTimeoutMs / 1000) + "s.\nstderr: " + stderrBuf
-                );
+                    " within " + (StartupTimeoutMs / 1000) + "s.\nstderr: " + stderrBuf);
             }
 
             _proxyUrl = MakeProxyUrl(_upstream, _port);
 
-            // Create the instance connection for convenience methods
-            _conn = TryCreateConnection();
+            // Eagerly open the internal Npgsql connection.
+            _conn = new NpgsqlConnection(_proxyUrl);
+            await _conn.OpenAsync().ConfigureAwait(false);
 
             if (_dashboardPort > 0)
                 Console.WriteLine($"goldlapel \u2192 :{_port} (proxy) | http://127.0.0.1:{_dashboardPort} (dashboard)");
             else
                 Console.WriteLine($"goldlapel \u2192 :{_port} (proxy)");
-
-            return _proxyUrl;
         }
-
-        public void StopProxy()
-        {
-            if (_conn != null)
-            {
-                try { _conn.Close(); } catch { }
-                try { _conn.Dispose(); } catch { }
-                _conn = null;
-            }
-
-            var proc = _process;
-            _process = null;
-            _proxyUrl = null;
-            if (proc != null)
-            {
-                if (!proc.HasExited)
-                {
-                    GracefulStop(proc);
-                }
-                try { proc.Dispose(); } catch { }
-            }
-        }
-
-        private const int GracefulTimeoutMs = 5000;
 
         private static void GracefulStop(Process proc)
         {
-            // On Unix/macOS, send SIGTERM first for graceful shutdown (flush data, close
-            // connections, write telemetry). Fall back to SIGKILL if the process doesn't
-            // exit within the timeout. On Windows, there is no SIGTERM equivalent, so
-            // Kill() is the only option.
+            // Unix: SIGTERM first for clean shutdown (telemetry flush, closes, etc.).
+            // Fall back to Kill on timeout. Windows has no SIGTERM — Kill is the only option.
             if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             {
                 try
                 {
-                    if (SendSignal(proc.Id, 15)) // SIGTERM = 15
+                    if (SendSignal(proc.Id, 15)) // SIGTERM
                     {
                         if (proc.WaitForExit(GracefulTimeoutMs))
                             return;
@@ -228,7 +406,6 @@ namespace GoldLapel
                 catch { }
             }
 
-            // Fallback: forceful kill
             try { proc.Kill(); } catch { }
             try { proc.WaitForExit(GracefulTimeoutMs); } catch { }
         }
@@ -241,461 +418,9 @@ namespace GoldLapel
             return sys_kill(pid, signal) == 0;
         }
 
-        public DbConnection Connection
-        {
-            get
-            {
-                if (_conn == null)
-                    throw new InvalidOperationException(
-                        "No connection available. Call StartProxy() first, and ensure Npgsql " +
-                        "is installed (dotnet add package Npgsql).");
-                return _conn;
-            }
-        }
+        // ── Config helpers ──────────────────────────────────────────
 
-        public string Url => _proxyUrl;
-
-        public int Port => _port;
-
-        public bool IsRunning => _process != null && !_process.HasExited;
-
-        public string DashboardUrl
-        {
-            get
-            {
-                if (_dashboardPort > 0 && _process != null && !_process.HasExited)
-                    return $"http://127.0.0.1:{_dashboardPort}";
-                return null;
-            }
-        }
-
-        public void Dispose()
-        {
-            if (!_disposed)
-            {
-                StopProxy();
-                _disposed = true;
-            }
-        }
-
-        private DbConnection TryCreateConnection()
-        {
-            try
-            {
-                var npgsqlAssembly = System.Reflection.Assembly.Load("Npgsql");
-                var connType = npgsqlAssembly.GetType("Npgsql.NpgsqlConnection");
-                if (connType == null) return null;
-
-                var conn = (DbConnection)Activator.CreateInstance(connType, _proxyUrl);
-                conn.Open();
-                return conn;
-            }
-            catch
-            {
-                return null;
-            }
-        }
-
-        // ── Instance methods (delegate to Utils with stored connection) ──
-
-        // Document store
-        public Dictionary<string, object> DocInsert(string collection, string documentJson)
-            => Utils.DocInsert(Connection, collection, documentJson);
-
-        public List<Dictionary<string, object>> DocInsertMany(string collection, List<string> documents)
-            => Utils.DocInsertMany(Connection, collection, documents);
-
-        public List<Dictionary<string, object>> DocFind(string collection,
-            string filterJson = null, Dictionary<string, int> sort = null, int? limit = null, int? skip = null)
-            => Utils.DocFind(Connection, collection, filterJson, sort, limit, skip);
-
-        public IEnumerable<Dictionary<string, object>> DocFindCursor(string collection,
-            string filterJson = null, string sortJson = null, int? limit = null, int? skip = null, int batchSize = 100)
-            => Utils.DocFindCursor(Connection, collection, filterJson, sortJson, limit, skip, batchSize);
-
-        public Dictionary<string, object> DocFindOne(string collection, string filterJson = null)
-            => Utils.DocFindOne(Connection, collection, filterJson);
-
-        public int DocUpdate(string collection, string filterJson, string updateJson)
-            => Utils.DocUpdate(Connection, collection, filterJson, updateJson);
-
-        public int DocUpdateOne(string collection, string filterJson, string updateJson)
-            => Utils.DocUpdateOne(Connection, collection, filterJson, updateJson);
-
-        public int DocDelete(string collection, string filterJson)
-            => Utils.DocDelete(Connection, collection, filterJson);
-
-        public int DocDeleteOne(string collection, string filterJson)
-            => Utils.DocDeleteOne(Connection, collection, filterJson);
-
-        public long DocCount(string collection, string filterJson = null)
-            => Utils.DocCount(Connection, collection, filterJson);
-
-        public Dictionary<string, object> DocFindOneAndUpdate(string collection, string filterJson, string updateJson)
-            => Utils.DocFindOneAndUpdate(Connection, collection, filterJson, updateJson);
-
-        public Dictionary<string, object> DocFindOneAndDelete(string collection, string filterJson)
-            => Utils.DocFindOneAndDelete(Connection, collection, filterJson);
-
-        public List<string> DocDistinct(string collection, string field, string filterJson = null)
-            => Utils.DocDistinct(Connection, collection, field, filterJson);
-
-        public void DocCreateIndex(string collection, List<string> keys = null)
-            => Utils.DocCreateIndex(Connection, collection, keys);
-
-        public List<Dictionary<string, object>> DocAggregate(string collection, string pipelineJson)
-            => Utils.DocAggregate(Connection, collection, pipelineJson);
-
-        public void DocWatch(string collection, Action<string, string> callback, bool blocking = true)
-            => Utils.DocWatch(Connection, collection, callback, blocking);
-
-        public void DocUnwatch(string collection)
-            => Utils.DocUnwatch(Connection, collection);
-
-        public void DocCreateTtlIndex(string collection, int expireAfterSeconds, string field = "created_at")
-            => Utils.DocCreateTtlIndex(Connection, collection, expireAfterSeconds, field);
-
-        public void DocRemoveTtlIndex(string collection)
-            => Utils.DocRemoveTtlIndex(Connection, collection);
-
-        public void DocCreateCollection(string collection, bool unlogged = false)
-            => Utils.DocCreateCollection(Connection, collection, unlogged);
-
-        public void DocCreateCapped(string collection, int maxDocuments)
-            => Utils.DocCreateCapped(Connection, collection, maxDocuments);
-
-        public void DocRemoveCap(string collection)
-            => Utils.DocRemoveCap(Connection, collection);
-
-        // Search
-        public List<Dictionary<string, object>> Search(string table,
-            string column, string query, int limit = 50, string lang = "english", bool highlight = false)
-            => Utils.Search(Connection, table, column, query, limit, lang, highlight);
-
-        public List<Dictionary<string, object>> Search(string table,
-            string[] columns, string query, int limit = 50, string lang = "english", bool highlight = false)
-            => Utils.Search(Connection, table, columns, query, limit, lang, highlight);
-
-        public List<Dictionary<string, object>> SearchFuzzy(string table,
-            string column, string query, int limit = 50, double threshold = 0.3)
-            => Utils.SearchFuzzy(Connection, table, column, query, limit, threshold);
-
-        public List<Dictionary<string, object>> SearchPhonetic(string table,
-            string column, string query, int limit = 50)
-            => Utils.SearchPhonetic(Connection, table, column, query, limit);
-
-        public List<Dictionary<string, object>> Similar(string table,
-            string column, double[] vector, int limit = 10)
-            => Utils.Similar(Connection, table, column, vector, limit);
-
-        public List<Dictionary<string, object>> Suggest(string table,
-            string column, string prefix, int limit = 10)
-            => Utils.Suggest(Connection, table, column, prefix, limit);
-
-        public List<Dictionary<string, object>> Facets(string table,
-            string column, int limit = 50, string query = null, string queryColumn = null,
-            string lang = "english")
-            => Utils.Facets(Connection, table, column, limit, query, queryColumn, lang);
-
-        public List<Dictionary<string, object>> Facets(string table,
-            string column, int limit = 50, string query = null, string[] queryColumn = null,
-            string lang = "english")
-            => Utils.Facets(Connection, table, column, limit, query, queryColumn, lang);
-
-        public List<Dictionary<string, object>> Aggregate(string table,
-            string column, string func, string groupBy = null, int limit = 50)
-            => Utils.Aggregate(Connection, table, column, func, groupBy, limit);
-
-        public void CreateSearchConfig(string name, string copyFrom = "english")
-            => Utils.CreateSearchConfig(Connection, name, copyFrom);
-
-        // Pub/Sub & Queue
-        public void Publish(string channel, string message)
-            => Utils.Publish(Connection, channel, message);
-
-        public void Subscribe(string channel, Action<string, string> callback, bool blocking = true)
-            => Utils.Subscribe(Connection, channel, callback, blocking);
-
-        public void Enqueue(string queueTable, string payloadJson)
-            => Utils.Enqueue(Connection, queueTable, payloadJson);
-
-        public string Dequeue(string queueTable)
-            => Utils.Dequeue(Connection, queueTable);
-
-        public long Incr(string table, string key, long amount = 1)
-            => Utils.Incr(Connection, table, key, amount);
-
-        public long GetCounter(string table, string key)
-            => Utils.GetCounter(Connection, table, key);
-
-        // Hash
-        public void Hset(string table, string key, string field, string valueJson)
-            => Utils.Hset(Connection, table, key, field, valueJson);
-
-        public string Hget(string table, string key, string field)
-            => Utils.Hget(Connection, table, key, field);
-
-        public string Hgetall(string table, string key)
-            => Utils.Hgetall(Connection, table, key);
-
-        public bool Hdel(string table, string key, string field)
-            => Utils.Hdel(Connection, table, key, field);
-
-        // Sorted set
-        public void Zadd(string table, string member, double score)
-            => Utils.Zadd(Connection, table, member, score);
-
-        public double Zincrby(string table, string member, double amount = 1)
-            => Utils.Zincrby(Connection, table, member, amount);
-
-        public List<(string Member, double Score)> Zrange(string table,
-            int start = 0, int stop = 10, bool desc = true)
-            => Utils.Zrange(Connection, table, start, stop, desc);
-
-        public long? Zrank(string table, string member, bool desc = true)
-            => Utils.Zrank(Connection, table, member, desc);
-
-        public double? Zscore(string table, string member)
-            => Utils.Zscore(Connection, table, member);
-
-        public bool Zrem(string table, string member)
-            => Utils.Zrem(Connection, table, member);
-
-        // Geo
-        public List<Dictionary<string, object>> Georadius(string table,
-            string geomColumn, double lon, double lat, double radiusMeters, int limit = 50)
-            => Utils.Georadius(Connection, table, geomColumn, lon, lat, radiusMeters, limit);
-
-        public void Geoadd(string table, string nameColumn,
-            string geomColumn, string name, double lon, double lat)
-            => Utils.Geoadd(Connection, table, nameColumn, geomColumn, name, lon, lat);
-
-        public double? Geodist(string table, string geomColumn,
-            string nameColumn, string nameA, string nameB)
-            => Utils.Geodist(Connection, table, geomColumn, nameColumn, nameA, nameB);
-
-        // Misc
-        public long CountDistinct(string table, string column)
-            => Utils.CountDistinct(Connection, table, column);
-
-        public string Script(string luaCode, params string[] args)
-            => Utils.Script(Connection, luaCode, args);
-
-        // Streams
-        public long StreamAdd(string stream, string payload)
-            => Utils.StreamAdd(Connection, stream, payload);
-
-        public void StreamCreateGroup(string stream, string group)
-            => Utils.StreamCreateGroup(Connection, stream, group);
-
-        public List<Dictionary<string, object>> StreamRead(string stream,
-            string group, string consumer, int count = 1)
-            => Utils.StreamRead(Connection, stream, group, consumer, count);
-
-        public bool StreamAck(string stream, string group, long messageId)
-            => Utils.StreamAck(Connection, stream, group, messageId);
-
-        public List<Dictionary<string, object>> StreamClaim(string stream,
-            string group, string consumer, long minIdleMs = 60000)
-            => Utils.StreamClaim(Connection, stream, group, consumer, minIdleMs);
-
-        // Percolate
-        public void PercolateAdd(string name, string queryId,
-            string query, string lang = "english", string metadataJson = null)
-            => Utils.PercolateAdd(Connection, name, queryId, query, lang, metadataJson);
-
-        public List<Dictionary<string, object>> Percolate(string name,
-            string text, int limit = 50, string lang = "english")
-            => Utils.Percolate(Connection, name, text, limit, lang);
-
-        public bool PercolateDelete(string name, string queryId)
-            => Utils.PercolateDelete(Connection, name, queryId);
-
-        // Debug
-        public List<Dictionary<string, object>> Analyze(string text, string lang = "english")
-            => Utils.Analyze(Connection, text, lang);
-
-        public Dictionary<string, object> ExplainScore(string table,
-            string column, string query, string idColumn, object idValue, string lang = "english")
-            => Utils.ExplainScore(Connection, table, column, query, idColumn, idValue, lang);
-
-        // ── Singleton ─────────────────────────────────────────
-
-        private static GoldLapel _instance;
-        private static bool _cleanupRegistered;
-        private static readonly object _lock = new object();
-
-        public static string Start(string upstream)
-        {
-            return Start(upstream, null);
-        }
-
-        public static string Start(string upstream, GoldLapelOptions options)
-        {
-            lock (_lock)
-            {
-                if (_instance != null && _instance.IsRunning)
-                {
-                    if (_instance._upstream != upstream)
-                    {
-                        throw new InvalidOperationException(
-                            "Gold Lapel is already running for a different upstream. " +
-                            "Call GoldLapel.Stop() before starting with a new upstream."
-                        );
-                    }
-                    return _instance.Url;
-                }
-                _instance?.Dispose();
-                _instance = new GoldLapel(upstream, options);
-                if (!_cleanupRegistered)
-                {
-                    AppDomain.CurrentDomain.ProcessExit += (s, e) =>
-                    {
-                        lock (_lock)
-                        {
-                            if (_instance != null)
-                            {
-                                _instance.StopProxy();
-                                _instance = null;
-                            }
-                        }
-                    };
-                    _cleanupRegistered = true;
-                }
-                return _instance.StartProxy();
-            }
-        }
-
-        public static DbConnection StartConnection(string upstream)
-        {
-            return StartConnection(upstream, null);
-        }
-
-        public static DbConnection StartConnection(string upstream, GoldLapelOptions options)
-        {
-            lock (_lock)
-            {
-                if (_instance != null && _instance.IsRunning)
-                {
-                    if (_instance._upstream != upstream)
-                    {
-                        throw new InvalidOperationException(
-                            "Gold Lapel is already running for a different upstream. " +
-                            "Call GoldLapel.Stop() before starting with a new upstream."
-                        );
-                    }
-                    if (_instance._wrappedConn != null)
-                        return _instance._wrappedConn;
-                    var existing = TryWrapConnection(_instance);
-                    if (existing == null)
-                    {
-                        throw new InvalidOperationException(
-                            "No supported database driver found. " +
-                            "Add Npgsql to your dependencies (dotnet add package Npgsql) " +
-                            "or use GoldLapel.Start() / GoldLapel.ProxyUrl if you only need the connection string."
-                        );
-                    }
-                    return existing;
-                }
-                _instance?.Dispose();
-                _instance = new GoldLapel(upstream, options);
-                if (!_cleanupRegistered)
-                {
-                    AppDomain.CurrentDomain.ProcessExit += (s, e) =>
-                    {
-                        lock (_lock)
-                        {
-                            if (_instance != null)
-                            {
-                                _instance.StopProxy();
-                                _instance = null;
-                            }
-                        }
-                    };
-                    _cleanupRegistered = true;
-                }
-                _instance.StartProxy();
-                var wrapped = TryWrapConnection(_instance);
-                if (wrapped == null)
-                {
-                    throw new InvalidOperationException(
-                        "No supported database driver found. " +
-                        "Add Npgsql to your dependencies (dotnet add package Npgsql) " +
-                        "or use GoldLapel.Start() / GoldLapel.ProxyUrl if you only need the connection string."
-                    );
-                }
-                return wrapped;
-            }
-        }
-
-        private static DbConnection TryWrapConnection(GoldLapel inst)
-        {
-            try
-            {
-                // Try to load Npgsql dynamically
-                var npgsqlAssembly = System.Reflection.Assembly.Load("Npgsql");
-                var connType = npgsqlAssembly.GetType("Npgsql.NpgsqlConnection");
-                if (connType == null) return null;
-
-                var conn = (DbConnection)Activator.CreateInstance(connType, inst._proxyUrl);
-                conn.Open();
-
-                var cache = NativeCache.GetInstance();
-                int invPort = inst._port + 2;
-                if (inst._config != null && inst._config.ContainsKey("invalidationPort"))
-                    invPort = Convert.ToInt32(inst._config["invalidationPort"]);
-                cache.ConnectInvalidation(invPort);
-
-                var wrapped = new CachedConnection(conn, cache);
-                inst._wrappedConn = wrapped;
-                return wrapped;
-            }
-            catch
-            {
-                return null;
-            }
-        }
-
-        public static void Stop()
-        {
-            lock (_lock)
-            {
-                if (_instance != null)
-                {
-                    _instance.StopProxy();
-                    _instance = null;
-                }
-            }
-        }
-
-        public static string ProxyUrl
-        {
-            get
-            {
-                lock (_lock)
-                {
-                    return _instance?.Url;
-                }
-            }
-        }
-
-        public static string DashboardProxyUrl
-        {
-            get
-            {
-                lock (_lock)
-                {
-                    return _instance?.DashboardUrl;
-                }
-            }
-        }
-
-        public static IReadOnlyCollection<string> ConfigKeys()
-        {
-            return ValidConfigKeys;
-        }
-
-        // ── Internal methods ──────────────────────────────────
+        public static IReadOnlyCollection<string> ConfigKeys() => ValidConfigKeys;
 
         internal static List<string> ConfigToArgs(Dictionary<string, object> config)
         {
@@ -762,6 +487,8 @@ namespace GoldLapel
             return sb.ToString();
         }
 
+        // ── URL / binary / port helpers ─────────────────────────────
+
         private static readonly Regex WithPort =
             new Regex(@"^(postgres(?:ql)?://(?:.*@)?)([^:/?#]+):(\d+)(.*)$");
 
@@ -770,35 +497,29 @@ namespace GoldLapel
 
         internal static string FindBinary()
         {
-            // 1. Explicit override via env var
             var envPath = Environment.GetEnvironmentVariable("GOLDLAPEL_BINARY");
             if (!string.IsNullOrEmpty(envPath))
             {
                 if (File.Exists(envPath)) return envPath;
                 throw new InvalidOperationException(
-                    "GOLDLAPEL_BINARY points to " + envPath + " but file not found"
-                );
+                    "GOLDLAPEL_BINARY points to " + envPath + " but file not found");
             }
 
-            // 2. NuGet runtime asset (binary next to assembly or runtimes/<rid>/native/)
             var bundled = FindBundledBinary();
             if (bundled != null) return bundled;
 
-            // 3. On PATH
             var onPath = FindOnPath();
             if (onPath != null) return onPath;
 
             throw new InvalidOperationException(
                 "Gold Lapel binary not found. Set GOLDLAPEL_BINARY env var, " +
-                "install the NuGet package with bundled binaries, or ensure 'goldlapel' is on PATH."
-            );
+                "install the NuGet package with bundled binaries, or ensure 'goldlapel' is on PATH.");
         }
 
         internal static string MakeProxyUrl(string upstream, int port)
         {
-            // Uses regex instead of System.Uri to avoid decoding percent-encoded
-            // characters in passwords (e.g. %40 for @), which would corrupt the URL.
-
+            // Use regex not System.Uri to preserve percent-encoded characters in passwords
+            // (e.g. %40 for @), which Uri would decode and corrupt the URL.
             var m = WithPort.Match(upstream);
             if (m.Success)
                 return m.Groups[1].Value + "localhost:" + port + m.Groups[4].Value;
@@ -807,11 +528,9 @@ namespace GoldLapel
             if (m.Success)
                 return m.Groups[1].Value + "localhost:" + port + m.Groups[3].Value;
 
-            // bare host:port
             if (!upstream.Contains("://") && upstream.Contains(":"))
                 return "localhost:" + port;
 
-            // bare host
             return "localhost:" + port;
         }
 
@@ -836,12 +555,32 @@ namespace GoldLapel
             return false;
         }
 
+        private static async Task<bool> WaitForPortAsync(string host, int port, long timeoutMs)
+        {
+            var sw = Stopwatch.StartNew();
+            while (sw.ElapsedMilliseconds < timeoutMs)
+            {
+                try
+                {
+                    using (var client = new TcpClient())
+                    {
+                        var connectTask = client.ConnectAsync(host, port);
+                        var finished = await Task.WhenAny(connectTask, Task.Delay(500)).ConfigureAwait(false);
+                        if (finished == connectTask && !connectTask.IsFaulted && client.Connected)
+                            return true;
+                    }
+                }
+                catch { }
+                await Task.Delay((int)StartupPollIntervalMs).ConfigureAwait(false);
+            }
+            return false;
+        }
+
         private static string FindBundledBinary()
         {
             var isWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
             var binaryName = isWindows ? "goldlapel.exe" : "goldlapel";
 
-            // Determine RID
             string rid;
             if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
             {
@@ -863,14 +602,12 @@ namespace GoldLapel
                 return null;
             }
 
-            // Check next to the assembly (NuGet copies runtime assets here)
             var assemblyDir = Path.GetDirectoryName(typeof(GoldLapel).Assembly.Location);
             if (!string.IsNullOrEmpty(assemblyDir))
             {
                 var nextTo = Path.Combine(assemblyDir, binaryName);
                 if (File.Exists(nextTo)) return nextTo;
 
-                // Check runtimes/<rid>/native/ relative to assembly
                 var runtimePath = Path.Combine(assemblyDir, "runtimes", rid, "native", binaryName);
                 if (File.Exists(runtimePath)) return runtimePath;
             }
@@ -913,5 +650,329 @@ namespace GoldLapel
             }
             return string.Join(" ", parts);
         }
+
+        // Test hook: internal injection of a DbConnection so unit tests can exercise
+        // wrapper methods against a SpyConnection without spawning the binary.
+        // Not exposed publicly — tests access via reflection on the field below.
+        internal DbConnection _testConn;
+
+        // Resolve the active connection for a wrapper call.
+        // Precedence: explicit per-call > UsingAsync scope > test hook > internal _conn.
+        private DbConnection ResolveActive(DbConnection perCall)
+        {
+            if (perCall != null) return perCall;
+            var scoped = _scopedConnection.Value;
+            if (scoped != null) return scoped;
+            if (_testConn != null) return _testConn;
+            if (_conn == null)
+                throw new InvalidOperationException(
+                    "No connection available. Did you await GoldLapel.StartAsync(...)?");
+            return _conn;
+        }
+
+        // ── Wrapper methods ─────────────────────────────────────────
+        // All methods:
+        //   - Have an Async suffix (.NET convention)
+        //   - Return Task / Task<T>
+        //   - Accept an optional `connection:` named argument for per-call override
+        //   - Use ResolveActive(connection) to pick the target connection
+        //
+        // Underlying Utils.XXX calls remain synchronous (Npgsql is thread-safe for
+        // a single connection in one request flow). The Task return is a natural
+        // .NET shape; per-method actual async-IO is a future enhancement.
+
+        // Document store
+        public Task<Dictionary<string, object>> DocInsertAsync(string collection, string documentJson, NpgsqlConnection connection = null)
+            => Task.FromResult(Utils.DocInsert(ResolveActive(connection), collection, documentJson));
+
+        public Task<List<Dictionary<string, object>>> DocInsertManyAsync(string collection, List<string> documents, NpgsqlConnection connection = null)
+            => Task.FromResult(Utils.DocInsertMany(ResolveActive(connection), collection, documents));
+
+        public Task<List<Dictionary<string, object>>> DocFindAsync(string collection,
+            string filterJson = null, Dictionary<string, int> sort = null, int? limit = null, int? skip = null,
+            NpgsqlConnection connection = null)
+            => Task.FromResult(Utils.DocFind(ResolveActive(connection), collection, filterJson, sort, limit, skip));
+
+        public IEnumerable<Dictionary<string, object>> DocFindCursor(string collection,
+            string filterJson = null, string sortJson = null, int? limit = null, int? skip = null,
+            int batchSize = 100, NpgsqlConnection connection = null)
+            => Utils.DocFindCursor(ResolveActive(connection), collection, filterJson, sortJson, limit, skip, batchSize);
+
+        public Task<Dictionary<string, object>> DocFindOneAsync(string collection,
+            string filterJson = null, NpgsqlConnection connection = null)
+            => Task.FromResult(Utils.DocFindOne(ResolveActive(connection), collection, filterJson));
+
+        public Task<int> DocUpdateAsync(string collection, string filterJson, string updateJson,
+            NpgsqlConnection connection = null)
+            => Task.FromResult(Utils.DocUpdate(ResolveActive(connection), collection, filterJson, updateJson));
+
+        public Task<int> DocUpdateOneAsync(string collection, string filterJson, string updateJson,
+            NpgsqlConnection connection = null)
+            => Task.FromResult(Utils.DocUpdateOne(ResolveActive(connection), collection, filterJson, updateJson));
+
+        public Task<int> DocDeleteAsync(string collection, string filterJson, NpgsqlConnection connection = null)
+            => Task.FromResult(Utils.DocDelete(ResolveActive(connection), collection, filterJson));
+
+        public Task<int> DocDeleteOneAsync(string collection, string filterJson, NpgsqlConnection connection = null)
+            => Task.FromResult(Utils.DocDeleteOne(ResolveActive(connection), collection, filterJson));
+
+        public Task<long> DocCountAsync(string collection, string filterJson = null, NpgsqlConnection connection = null)
+            => Task.FromResult(Utils.DocCount(ResolveActive(connection), collection, filterJson));
+
+        public Task<Dictionary<string, object>> DocFindOneAndUpdateAsync(string collection, string filterJson,
+            string updateJson, NpgsqlConnection connection = null)
+            => Task.FromResult(Utils.DocFindOneAndUpdate(ResolveActive(connection), collection, filterJson, updateJson));
+
+        public Task<Dictionary<string, object>> DocFindOneAndDeleteAsync(string collection, string filterJson,
+            NpgsqlConnection connection = null)
+            => Task.FromResult(Utils.DocFindOneAndDelete(ResolveActive(connection), collection, filterJson));
+
+        public Task<List<string>> DocDistinctAsync(string collection, string field, string filterJson = null,
+            NpgsqlConnection connection = null)
+            => Task.FromResult(Utils.DocDistinct(ResolveActive(connection), collection, field, filterJson));
+
+        public Task DocCreateIndexAsync(string collection, List<string> keys = null, NpgsqlConnection connection = null)
+        {
+            Utils.DocCreateIndex(ResolveActive(connection), collection, keys);
+            return Task.CompletedTask;
+        }
+
+        public Task<List<Dictionary<string, object>>> DocAggregateAsync(string collection, string pipelineJson,
+            NpgsqlConnection connection = null)
+            => Task.FromResult(Utils.DocAggregate(ResolveActive(connection), collection, pipelineJson));
+
+        public Task DocWatchAsync(string collection, Action<string, string> callback, bool blocking = true,
+            NpgsqlConnection connection = null)
+        {
+            Utils.DocWatch(ResolveActive(connection), collection, callback, blocking);
+            return Task.CompletedTask;
+        }
+
+        public Task DocUnwatchAsync(string collection, NpgsqlConnection connection = null)
+        {
+            Utils.DocUnwatch(ResolveActive(connection), collection);
+            return Task.CompletedTask;
+        }
+
+        public Task DocCreateTtlIndexAsync(string collection, int expireAfterSeconds, string field = "created_at",
+            NpgsqlConnection connection = null)
+        {
+            Utils.DocCreateTtlIndex(ResolveActive(connection), collection, expireAfterSeconds, field);
+            return Task.CompletedTask;
+        }
+
+        public Task DocRemoveTtlIndexAsync(string collection, NpgsqlConnection connection = null)
+        {
+            Utils.DocRemoveTtlIndex(ResolveActive(connection), collection);
+            return Task.CompletedTask;
+        }
+
+        public Task DocCreateCollectionAsync(string collection, bool unlogged = false, NpgsqlConnection connection = null)
+        {
+            Utils.DocCreateCollection(ResolveActive(connection), collection, unlogged);
+            return Task.CompletedTask;
+        }
+
+        public Task DocCreateCappedAsync(string collection, int maxDocuments, NpgsqlConnection connection = null)
+        {
+            Utils.DocCreateCapped(ResolveActive(connection), collection, maxDocuments);
+            return Task.CompletedTask;
+        }
+
+        public Task DocRemoveCapAsync(string collection, NpgsqlConnection connection = null)
+        {
+            Utils.DocRemoveCap(ResolveActive(connection), collection);
+            return Task.CompletedTask;
+        }
+
+        // Search
+        public Task<List<Dictionary<string, object>>> SearchAsync(string table,
+            string column, string query, int limit = 50, string lang = "english", bool highlight = false,
+            NpgsqlConnection connection = null)
+            => Task.FromResult(Utils.Search(ResolveActive(connection), table, column, query, limit, lang, highlight));
+
+        public Task<List<Dictionary<string, object>>> SearchAsync(string table,
+            string[] columns, string query, int limit = 50, string lang = "english", bool highlight = false,
+            NpgsqlConnection connection = null)
+            => Task.FromResult(Utils.Search(ResolveActive(connection), table, columns, query, limit, lang, highlight));
+
+        public Task<List<Dictionary<string, object>>> SearchFuzzyAsync(string table,
+            string column, string query, int limit = 50, double threshold = 0.3,
+            NpgsqlConnection connection = null)
+            => Task.FromResult(Utils.SearchFuzzy(ResolveActive(connection), table, column, query, limit, threshold));
+
+        public Task<List<Dictionary<string, object>>> SearchPhoneticAsync(string table,
+            string column, string query, int limit = 50, NpgsqlConnection connection = null)
+            => Task.FromResult(Utils.SearchPhonetic(ResolveActive(connection), table, column, query, limit));
+
+        public Task<List<Dictionary<string, object>>> SimilarAsync(string table,
+            string column, double[] vector, int limit = 10, NpgsqlConnection connection = null)
+            => Task.FromResult(Utils.Similar(ResolveActive(connection), table, column, vector, limit));
+
+        public Task<List<Dictionary<string, object>>> SuggestAsync(string table,
+            string column, string prefix, int limit = 10, NpgsqlConnection connection = null)
+            => Task.FromResult(Utils.Suggest(ResolveActive(connection), table, column, prefix, limit));
+
+        public Task<List<Dictionary<string, object>>> FacetsAsync(string table,
+            string column, int limit = 50, string query = null, string queryColumn = null,
+            string lang = "english", NpgsqlConnection connection = null)
+            => Task.FromResult(Utils.Facets(ResolveActive(connection), table, column, limit, query, queryColumn, lang));
+
+        public Task<List<Dictionary<string, object>>> FacetsAsync(string table,
+            string column, string[] queryColumns, int limit = 50, string query = null,
+            string lang = "english", NpgsqlConnection connection = null)
+            => Task.FromResult(Utils.Facets(ResolveActive(connection), table, column, limit, query, queryColumns, lang));
+
+        public Task<List<Dictionary<string, object>>> AggregateAsync(string table,
+            string column, string func, string groupBy = null, int limit = 50,
+            NpgsqlConnection connection = null)
+            => Task.FromResult(Utils.Aggregate(ResolveActive(connection), table, column, func, groupBy, limit));
+
+        public Task CreateSearchConfigAsync(string name, string copyFrom = "english", NpgsqlConnection connection = null)
+        {
+            Utils.CreateSearchConfig(ResolveActive(connection), name, copyFrom);
+            return Task.CompletedTask;
+        }
+
+        // Pub/Sub & Queue
+        public Task PublishAsync(string channel, string message, NpgsqlConnection connection = null)
+        {
+            Utils.Publish(ResolveActive(connection), channel, message);
+            return Task.CompletedTask;
+        }
+
+        public Task SubscribeAsync(string channel, Action<string, string> callback, bool blocking = true,
+            NpgsqlConnection connection = null)
+        {
+            Utils.Subscribe(ResolveActive(connection), channel, callback, blocking);
+            return Task.CompletedTask;
+        }
+
+        public Task EnqueueAsync(string queueTable, string payloadJson, NpgsqlConnection connection = null)
+        {
+            Utils.Enqueue(ResolveActive(connection), queueTable, payloadJson);
+            return Task.CompletedTask;
+        }
+
+        public Task<string> DequeueAsync(string queueTable, NpgsqlConnection connection = null)
+            => Task.FromResult(Utils.Dequeue(ResolveActive(connection), queueTable));
+
+        public Task<long> IncrAsync(string table, string key, long amount = 1, NpgsqlConnection connection = null)
+            => Task.FromResult(Utils.Incr(ResolveActive(connection), table, key, amount));
+
+        public Task<long> GetCounterAsync(string table, string key, NpgsqlConnection connection = null)
+            => Task.FromResult(Utils.GetCounter(ResolveActive(connection), table, key));
+
+        // Hash
+        public Task HsetAsync(string table, string key, string field, string valueJson, NpgsqlConnection connection = null)
+        {
+            Utils.Hset(ResolveActive(connection), table, key, field, valueJson);
+            return Task.CompletedTask;
+        }
+
+        public Task<string> HgetAsync(string table, string key, string field, NpgsqlConnection connection = null)
+            => Task.FromResult(Utils.Hget(ResolveActive(connection), table, key, field));
+
+        public Task<string> HgetallAsync(string table, string key, NpgsqlConnection connection = null)
+            => Task.FromResult(Utils.Hgetall(ResolveActive(connection), table, key));
+
+        public Task<bool> HdelAsync(string table, string key, string field, NpgsqlConnection connection = null)
+            => Task.FromResult(Utils.Hdel(ResolveActive(connection), table, key, field));
+
+        // Sorted set
+        public Task ZaddAsync(string table, string member, double score, NpgsqlConnection connection = null)
+        {
+            Utils.Zadd(ResolveActive(connection), table, member, score);
+            return Task.CompletedTask;
+        }
+
+        public Task<double> ZincrbyAsync(string table, string member, double amount = 1,
+            NpgsqlConnection connection = null)
+            => Task.FromResult(Utils.Zincrby(ResolveActive(connection), table, member, amount));
+
+        public Task<List<(string Member, double Score)>> ZrangeAsync(string table,
+            int start = 0, int stop = 10, bool desc = true, NpgsqlConnection connection = null)
+            => Task.FromResult(Utils.Zrange(ResolveActive(connection), table, start, stop, desc));
+
+        public Task<long?> ZrankAsync(string table, string member, bool desc = true,
+            NpgsqlConnection connection = null)
+            => Task.FromResult(Utils.Zrank(ResolveActive(connection), table, member, desc));
+
+        public Task<double?> ZscoreAsync(string table, string member, NpgsqlConnection connection = null)
+            => Task.FromResult(Utils.Zscore(ResolveActive(connection), table, member));
+
+        public Task<bool> ZremAsync(string table, string member, NpgsqlConnection connection = null)
+            => Task.FromResult(Utils.Zrem(ResolveActive(connection), table, member));
+
+        // Geo
+        public Task<List<Dictionary<string, object>>> GeoradiusAsync(string table,
+            string geomColumn, double lon, double lat, double radiusMeters, int limit = 50,
+            NpgsqlConnection connection = null)
+            => Task.FromResult(Utils.Georadius(ResolveActive(connection), table, geomColumn, lon, lat, radiusMeters, limit));
+
+        public Task GeoaddAsync(string table, string nameColumn, string geomColumn,
+            string name, double lon, double lat, NpgsqlConnection connection = null)
+        {
+            Utils.Geoadd(ResolveActive(connection), table, nameColumn, geomColumn, name, lon, lat);
+            return Task.CompletedTask;
+        }
+
+        public Task<double?> GeodistAsync(string table, string geomColumn, string nameColumn,
+            string nameA, string nameB, NpgsqlConnection connection = null)
+            => Task.FromResult(Utils.Geodist(ResolveActive(connection), table, geomColumn, nameColumn, nameA, nameB));
+
+        // Misc
+        public Task<long> CountDistinctAsync(string table, string column, NpgsqlConnection connection = null)
+            => Task.FromResult(Utils.CountDistinct(ResolveActive(connection), table, column));
+
+        public Task<string> ScriptAsync(string luaCode, string[] args = null, NpgsqlConnection connection = null)
+            => Task.FromResult(Utils.Script(ResolveActive(connection), luaCode, args ?? Array.Empty<string>()));
+
+        // Streams
+        public Task<long> StreamAddAsync(string stream, string payload, NpgsqlConnection connection = null)
+            => Task.FromResult(Utils.StreamAdd(ResolveActive(connection), stream, payload));
+
+        public Task StreamCreateGroupAsync(string stream, string group, NpgsqlConnection connection = null)
+        {
+            Utils.StreamCreateGroup(ResolveActive(connection), stream, group);
+            return Task.CompletedTask;
+        }
+
+        public Task<List<Dictionary<string, object>>> StreamReadAsync(string stream,
+            string group, string consumer, int count = 1, NpgsqlConnection connection = null)
+            => Task.FromResult(Utils.StreamRead(ResolveActive(connection), stream, group, consumer, count));
+
+        public Task<bool> StreamAckAsync(string stream, string group, long messageId,
+            NpgsqlConnection connection = null)
+            => Task.FromResult(Utils.StreamAck(ResolveActive(connection), stream, group, messageId));
+
+        public Task<List<Dictionary<string, object>>> StreamClaimAsync(string stream,
+            string group, string consumer, long minIdleMs = 60000, NpgsqlConnection connection = null)
+            => Task.FromResult(Utils.StreamClaim(ResolveActive(connection), stream, group, consumer, minIdleMs));
+
+        // Percolate
+        public Task PercolateAddAsync(string name, string queryId, string query,
+            string lang = "english", string metadataJson = null, NpgsqlConnection connection = null)
+        {
+            Utils.PercolateAdd(ResolveActive(connection), name, queryId, query, lang, metadataJson);
+            return Task.CompletedTask;
+        }
+
+        public Task<List<Dictionary<string, object>>> PercolateAsync(string name,
+            string text, int limit = 50, string lang = "english", NpgsqlConnection connection = null)
+            => Task.FromResult(Utils.Percolate(ResolveActive(connection), name, text, limit, lang));
+
+        public Task<bool> PercolateDeleteAsync(string name, string queryId, NpgsqlConnection connection = null)
+            => Task.FromResult(Utils.PercolateDelete(ResolveActive(connection), name, queryId));
+
+        // Debug
+        public Task<List<Dictionary<string, object>>> AnalyzeAsync(string text, string lang = "english",
+            NpgsqlConnection connection = null)
+            => Task.FromResult(Utils.Analyze(ResolveActive(connection), text, lang));
+
+        public Task<Dictionary<string, object>> ExplainScoreAsync(string table,
+            string column, string query, string idColumn, object idValue, string lang = "english",
+            NpgsqlConnection connection = null)
+            => Task.FromResult(Utils.ExplainScore(ResolveActive(connection), table, column, query, idColumn, idValue, lang));
     }
 }

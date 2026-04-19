@@ -7,7 +7,7 @@ using System.Net.Sockets;
 using System.Threading;
 using Xunit;
 
-namespace GoldLapel.Tests
+namespace Goldlapel.Tests
 {
     // ── DetectWrite ──────────────────────────────────────────
 

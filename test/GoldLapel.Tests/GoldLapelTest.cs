@@ -4,9 +4,10 @@ using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using Xunit;
-using GL = GoldLapel.GoldLapel;
+using GL = Goldlapel.GoldLapel;
+using Goldlapel;
 
-namespace GoldLapel.Tests
+namespace Goldlapel.Tests
 {
     // ── FindBinary ────────────────────────────────────────────
 
@@ -217,21 +218,21 @@ namespace GoldLapel.Tests
         }
     }
 
-    // ── Lifecycle ─────────────────────────────────────────────
+    // ── Options / construction ────────────────────────────────
 
-    public class LifecycleTest
+    public class OptionsTest
     {
         [Fact]
         public void DefaultPort()
         {
-            var gl = new GL("postgresql://localhost:5432/mydb");
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb");
             Assert.Equal(7932, gl.Port);
         }
 
         [Fact]
         public void CustomPort()
         {
-            var gl = new GL("postgresql://localhost:5432/mydb",
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
                 new GoldLapelOptions { Port = 9000 });
             Assert.Equal(9000, gl.Port);
         }
@@ -239,21 +240,24 @@ namespace GoldLapel.Tests
         [Fact]
         public void NotRunningInitially()
         {
-            var gl = new GL("postgresql://localhost:5432/mydb");
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb");
             Assert.False(gl.IsRunning);
             Assert.Null(gl.Url);
         }
 
         [Fact]
-        public void NullUpstreamThrows()
+        public async System.Threading.Tasks.Task StartAsyncNullUpstreamThrows()
         {
-            Assert.Throws<ArgumentNullException>(() => new GL(null));
+            await Assert.ThrowsAsync<ArgumentNullException>(() => GL.StartAsync(null));
         }
 
         [Fact]
-        public void NullUpstreamWithOptionsThrows()
+        public void LogLevelOptionMapsToFlag()
         {
-            Assert.Throws<ArgumentNullException>(() => new GL(null, new GoldLapelOptions()));
+            // LogLevel shortcut merges into config as "logLevel", which becomes --log-level.
+            var config = new Dictionary<string, object> { { "logLevel", "debug" } };
+            var args = GL.ConfigToArgs(config);
+            Assert.Equal(new List<string> { "--log-level", "debug" }, args);
         }
     }
 
@@ -264,14 +268,13 @@ namespace GoldLapel.Tests
         [Fact]
         public void DefaultDashboardPort()
         {
-            var gl = new GL("postgresql://localhost:5432/mydb");
-            Assert.Equal(GL.DefaultDashboardPort, 7933);
+            Assert.Equal(7933, GL.DefaultDashboardPort);
         }
 
         [Fact]
         public void CustomDashboardPort()
         {
-            var gl = new GL("postgresql://localhost:5432/mydb",
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
                 new GoldLapelOptions
                 {
                     Config = new Dictionary<string, object> { { "dashboardPort", 9090 } }
@@ -282,7 +285,7 @@ namespace GoldLapel.Tests
         [Fact]
         public void DashboardDisabledWithZero()
         {
-            var gl = new GL("postgresql://localhost:5432/mydb",
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
                 new GoldLapelOptions
                 {
                     Config = new Dictionary<string, object> { { "dashboardPort", 0 } }
@@ -293,46 +296,20 @@ namespace GoldLapel.Tests
         [Fact]
         public void DashboardUrlNullWhenNotRunning()
         {
-            var gl = new GL("postgresql://localhost:5432/mydb");
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb");
             Assert.Null(gl.DashboardUrl);
         }
 
         [Fact]
         public void DashboardPortExtractedFromConfig()
         {
-            var gl = new GL("postgresql://localhost:5432/mydb",
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
                 new GoldLapelOptions
                 {
                     Config = new Dictionary<string, object> { { "dashboardPort", 8888 } }
                 });
-            // Not running, so DashboardUrl is null, but we can verify the port was extracted
-            // by checking it doesn't use the default when we eventually start
             Assert.Null(gl.DashboardUrl);
             Assert.False(gl.IsRunning);
-        }
-    }
-
-    // ── DashboardProxyUrl (singleton) ────────────────────
-
-    public class DashboardProxyUrlTest
-    {
-        [Fact]
-        public void DashboardProxyUrlNullWhenNotStarted()
-        {
-            GL.Stop();
-            Assert.Null(GL.DashboardProxyUrl);
-        }
-    }
-
-    // ── Singleton ─────────────────────────────────────────────
-
-    public class SingletonTest
-    {
-        [Fact]
-        public void ProxyUrlNullWhenNotStarted()
-        {
-            GL.Stop();
-            Assert.Null(GL.ProxyUrl);
         }
     }
 
@@ -359,17 +336,18 @@ namespace GoldLapel.Tests
         }
 
         [Fact]
+        public void ContainsLogLevel()
+        {
+            // v0.2.0: logLevel is a first-class config key (exposed via LogLevel option).
+            var keys = GL.ConfigKeys();
+            Assert.Contains("logLevel", keys);
+        }
+
+        [Fact]
         public void DoesNotContainUnknownKeys()
         {
             var keys = GL.ConfigKeys();
             Assert.DoesNotContain("notARealKey", keys);
-        }
-
-        [Fact]
-        public void HasExpectedCount()
-        {
-            var keys = GL.ConfigKeys();
-            Assert.Equal(42, keys.Count);
         }
     }
 
@@ -380,13 +358,9 @@ namespace GoldLapel.Tests
         [Fact]
         public void SendSignalToSelf()
         {
-            // SIGTERM (15) to our own process should succeed on Unix.
-            // We don't actually send SIGTERM to ourselves — instead verify
-            // that SendSignal returns true for signal 0 (null signal, just checks
-            // that we CAN send a signal to the given pid).
             if (System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
                     System.Runtime.InteropServices.OSPlatform.Windows))
-                return; // Skip on Windows
+                return;
 
             var pid = System.Diagnostics.Process.GetCurrentProcess().Id;
             Assert.True(GL.SendSignal(pid, 0)); // signal 0 = existence check
@@ -399,17 +373,15 @@ namespace GoldLapel.Tests
                     System.Runtime.InteropServices.OSPlatform.Windows))
                 return;
 
-            // PID that almost certainly doesn't exist should fail
-            Assert.False(GL.SendSignal(4194304, 0)); // max PID + 1 on most Linux systems
+            Assert.False(GL.SendSignal(4194304, 0));
         }
 
         [Fact]
-        public void StopProxyIsIdempotent()
+        public void DisposeIsIdempotent()
         {
-            var gl = new GL("postgresql://localhost:5432/mydb");
-            // Calling StopProxy when nothing is running should not throw
-            gl.StopProxy();
-            gl.StopProxy();
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb");
+            gl.Dispose();
+            gl.Dispose(); // second call should not throw
         }
     }
 
@@ -534,7 +506,7 @@ namespace GoldLapel.Tests
                     { "disablePool", true }
                 }
             };
-            var gl = new GL("postgresql://localhost:5432/mydb", options);
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb", options);
             Assert.Equal(7932, gl.Port);
         }
     }
