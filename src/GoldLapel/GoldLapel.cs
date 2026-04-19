@@ -177,8 +177,15 @@ namespace Goldlapel
 
         // ── Properties ──────────────────────────────────────────────
 
-        /// <summary>Proxy connection string (e.g. <c>postgresql://user:pass@localhost:7932/mydb</c>).</summary>
-        public string Url => _proxyUrl;
+        /// <summary>
+        /// Proxy connection string in Npgsql keyword form (<c>Host=localhost;Port=7932;...</c>).
+        /// Pass directly to <c>new NpgsqlConnection(gl.Url)</c>.
+        /// For the URL form, use <see cref="ProxyUrl"/>.
+        /// </summary>
+        public string Url => _proxyUrl != null ? UrlToNpgsqlConnectionString(_proxyUrl) : null;
+
+        /// <summary>URL form of the proxy connection string (<c>postgresql://user:pass@localhost:7932/db</c>).</summary>
+        public string ProxyUrl => _proxyUrl;
 
         /// <summary>Proxy port.</summary>
         public int Port => _port;
@@ -379,8 +386,9 @@ namespace Goldlapel
 
             _proxyUrl = MakeProxyUrl(_upstream, _port);
 
-            // Eagerly open the internal Npgsql connection.
-            _conn = new NpgsqlConnection(_proxyUrl);
+            // Eagerly open the internal Npgsql connection. Npgsql does not accept
+            // URL-style connection strings, so convert to key-value form.
+            _conn = new NpgsqlConnection(UrlToNpgsqlConnectionString(_proxyUrl));
             await _conn.OpenAsync().ConfigureAwait(false);
 
             if (_dashboardPort > 0)
@@ -532,6 +540,106 @@ namespace Goldlapel
                 return "localhost:" + port;
 
             return "localhost:" + port;
+        }
+
+        /// <summary>
+        /// Convert a postgres URL (e.g. <c>postgresql://user:pass@host:port/db?sslmode=require</c>)
+        /// into the key-value form Npgsql expects (<c>Host=host;Port=port;Username=user;Password=pass;Database=db;SslMode=Require</c>).
+        /// If the input is already key-value form (contains <c>=</c>) it is returned unchanged.
+        /// </summary>
+        public static string UrlToNpgsqlConnectionString(string url)
+        {
+            if (string.IsNullOrEmpty(url)) return url;
+
+            // Already key-value form — pass through.
+            if (!url.StartsWith("postgres://", StringComparison.OrdinalIgnoreCase) &&
+                !url.StartsWith("postgresql://", StringComparison.OrdinalIgnoreCase))
+                return url;
+
+            // Strip scheme.
+            var schemeIdx = url.IndexOf("://", StringComparison.Ordinal);
+            var rest = url.Substring(schemeIdx + 3);
+
+            // Split query string off.
+            string query = null;
+            var qIdx = rest.IndexOf('?');
+            if (qIdx >= 0)
+            {
+                query = rest.Substring(qIdx + 1);
+                rest = rest.Substring(0, qIdx);
+            }
+
+            // userinfo@host-stuff — rightmost @ separates (since passwords can contain @).
+            string userinfo = null;
+            var atIdx = rest.LastIndexOf('@');
+            if (atIdx >= 0)
+            {
+                userinfo = rest.Substring(0, atIdx);
+                rest = rest.Substring(atIdx + 1);
+            }
+
+            // host[:port][/database]
+            string database = null;
+            var slashIdx = rest.IndexOf('/');
+            if (slashIdx >= 0)
+            {
+                database = rest.Substring(slashIdx + 1);
+                rest = rest.Substring(0, slashIdx);
+            }
+
+            string host = rest;
+            string port = null;
+            var colonIdx = rest.LastIndexOf(':');
+            if (colonIdx >= 0)
+            {
+                host = rest.Substring(0, colonIdx);
+                port = rest.Substring(colonIdx + 1);
+            }
+
+            string user = null;
+            string password = null;
+            if (userinfo != null)
+            {
+                var uColon = userinfo.IndexOf(':');
+                if (uColon >= 0)
+                {
+                    user = Uri.UnescapeDataString(userinfo.Substring(0, uColon));
+                    password = Uri.UnescapeDataString(userinfo.Substring(uColon + 1));
+                }
+                else
+                {
+                    user = Uri.UnescapeDataString(userinfo);
+                }
+            }
+
+            var sb = new StringBuilder();
+            sb.Append("Host=").Append(host).Append(';');
+            if (!string.IsNullOrEmpty(port)) sb.Append("Port=").Append(port).Append(';');
+            if (!string.IsNullOrEmpty(user)) sb.Append("Username=").Append(user).Append(';');
+            if (!string.IsNullOrEmpty(password)) sb.Append("Password=").Append(password).Append(';');
+            if (!string.IsNullOrEmpty(database)) sb.Append("Database=").Append(database).Append(';');
+
+            // Query params map 1:1 to Npgsql keywords (sslmode -> SslMode, etc.).
+            if (!string.IsNullOrEmpty(query))
+            {
+                foreach (var pair in query.Split('&'))
+                {
+                    if (string.IsNullOrEmpty(pair)) continue;
+                    var eq = pair.IndexOf('=');
+                    if (eq < 0)
+                    {
+                        sb.Append(pair).Append(';');
+                    }
+                    else
+                    {
+                        var k = pair.Substring(0, eq);
+                        var v = Uri.UnescapeDataString(pair.Substring(eq + 1));
+                        sb.Append(k).Append('=').Append(v).Append(';');
+                    }
+                }
+            }
+
+            return sb.ToString();
         }
 
         internal static bool WaitForPort(string host, int port, long timeoutMs)
