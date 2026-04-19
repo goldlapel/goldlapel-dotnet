@@ -32,7 +32,13 @@ namespace Goldlapel.Tests
         {
             // Randomized high-numbered port in a test-friendly range to avoid
             // collisions with the default 7932 or other parallel tests.
-            return 17900 + new Random().Next(0, 1000);
+            //
+            // Use Random.Shared (process-wide, thread-safe, seeded once) rather
+            // than `new Random()`, which seeds from Environment.TickCount and
+            // collides when two test instances construct in the same ms-tick —
+            // producing identical "random" port sequences and flaky conflicts
+            // on fast parallel runs.
+            return 17900 + Random.Shared.Next(0, 1000);
         }
 
         [Fact]
