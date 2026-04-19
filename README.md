@@ -165,7 +165,8 @@ v0.2.0 is a hard break. Migration:
 | `GoldLapel.Start(url)` / `GoldLapel.StartConnection(url)` (singletons) | `await GoldLapel.StartAsync(url)` |
 | `gl.DocInsert(collection, doc)` | `await gl.DocInsertAsync(collection, doc)` |
 | `new GoldLapelOptions { Port = 7932 }` | `opts => { opts.Port = 7932; }` |
-| `gl.ProxyUrl` (URL form, was named `Url`) | `gl.Url` (now Npgsql keyword form) or `gl.ProxyUrl` (URL form) |
+| `gl.Url` (URL form, e.g. `postgresql://…`) | `gl.ProxyUrl` (URL form) or `gl.Url` (Npgsql keyword form) |
+| `GoldLapel.ProxyUrl` (static singleton accessor) | `gl.ProxyUrl` (per-instance) |
 | `new NpgsqlConnection(gl.Url)` required manual conversion | `new NpgsqlConnection(gl.Url)` works directly |
 
 Notable:
