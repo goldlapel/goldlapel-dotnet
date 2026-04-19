@@ -121,9 +121,14 @@ namespace Goldlapel
             _port = options.Port;
             _extraArgs = options.ExtraArgs ?? Array.Empty<string>();
             _config = MergeConfig(options);
+            // Dashboard defaults to proxy port + 1 (matches what the Rust binary
+            // binds when no --dashboard-port is passed). Only when the user
+            // supplies an explicit dashboardPort via Config does that value
+            // override the derivation. This ensures Port=17932 correctly
+            // reports the dashboard at :17933 rather than the hardcoded 7933.
             _dashboardPort = _config != null && _config.ContainsKey("dashboardPort")
                 ? Convert.ToInt32(_config["dashboardPort"])
-                : DefaultDashboardPort;
+                : _port + 1;
         }
 
         // ── Factory ─────────────────────────────────────────────────

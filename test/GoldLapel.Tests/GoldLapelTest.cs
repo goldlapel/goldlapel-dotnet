@@ -368,6 +368,36 @@ namespace Goldlapel.Tests
             Assert.Null(gl.DashboardUrl);
             Assert.False(gl.IsRunning);
         }
+
+        [Fact]
+        public void DashboardPortDerivesFromCustomProxyPort()
+        {
+            // When only Port is set, dashboard defaults to port + 1 (not the
+            // hardcoded 7933). The internal _dashboardPort isn't public, but
+            // DashboardUrl exposes it when the process is running; since we
+            // can't spawn a real process here, we reach in via reflection.
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
+                new GoldLapelOptions { Port = 17932 });
+            var field = typeof(GL).GetField("_dashboardPort",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            Assert.NotNull(field);
+            Assert.Equal(17933, (int)field.GetValue(gl));
+        }
+
+        [Fact]
+        public void ExplicitDashboardPortOverridesDerivation()
+        {
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
+                new GoldLapelOptions
+                {
+                    Port = 17932,
+                    Config = new Dictionary<string, object> { { "dashboardPort", 9999 } }
+                });
+            var field = typeof(GL).GetField("_dashboardPort",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            Assert.NotNull(field);
+            Assert.Equal(9999, (int)field.GetValue(gl));
+        }
     }
 
     // ── ConfigKeys ────────────────────────────────────────────
