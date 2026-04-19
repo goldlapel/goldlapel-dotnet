@@ -1,15 +1,23 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
+using System.Threading.Tasks;
 using Xunit;
-using GL = GoldLapel.GoldLapel;
+using GL = Goldlapel.GoldLapel;
+using Goldlapel;
 
-namespace GoldLapel.Tests
+namespace Goldlapel.Tests
 {
     // ── FindBinary ────────────────────────────────────────────
 
+    // Shares the "EnvVarTests" collection with IntegrationTests so xUnit serializes
+    // them — FindBinaryTest mutates the process-global GOLDLAPEL_BINARY env var,
+    // which IntegrationTests reads via FindBinary() and would otherwise see in a
+    // poisoned state during parallel test runs.
+    [Collection("EnvVarTests")]
     public class FindBinaryTest : IDisposable
     {
         private string? _origBinary;
@@ -217,21 +225,91 @@ namespace GoldLapel.Tests
         }
     }
 
-    // ── Lifecycle ─────────────────────────────────────────────
+    // ── PollForPortAsync ──────────────────────────────────────
+    //
+    // PollForPortAsync is the startup-readiness loop extracted from SpawnAsync.
+    // Regression coverage for the v0.2 double-budget bug: the previous
+    // SpawnAsync wrapped a looping WaitForPortAsync inside its own outer
+    // stopwatch loop, so total elapsed time could reach budget * N (each
+    // outer iteration consumed another full inner budget). These tests
+    // assert the single-budget contract: total elapsed <= budget (+ small
+    // slack for the final per-attempt connect + thread scheduling).
 
-    public class LifecycleTest
+    public class PollForPortAsyncTest
+    {
+        [Fact]
+        public async Task ReachablePortSucceedsInsideBudget()
+        {
+            var listener = new TcpListener(IPAddress.Loopback, 0);
+            listener.Start();
+            var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+            try
+            {
+                var sw = Stopwatch.StartNew();
+                var ok = await GL.PollForPortAsync("127.0.0.1", port, 2000);
+                sw.Stop();
+
+                Assert.True(ok);
+                // Should return almost immediately for a listening port.
+                Assert.True(sw.ElapsedMilliseconds < 2000,
+                    $"expected fast success, took {sw.ElapsedMilliseconds}ms");
+            }
+            finally
+            {
+                listener.Stop();
+            }
+        }
+
+        [Fact]
+        public async Task UnreachablePortFailsAtApproximatelyBudget()
+        {
+            // Budget of 600ms. The old bug allowed total elapsed to reach
+            // several multiples of the budget (each outer iteration ran a
+            // full inner 500ms loop). With the single-loop fix, total time
+            // is bounded by budget + one per-attempt connect timeout.
+            const long budgetMs = 600;
+            var sw = Stopwatch.StartNew();
+            var ok = await GL.PollForPortAsync("127.0.0.1", 19999, budgetMs);
+            sw.Stop();
+
+            Assert.False(ok);
+            // Upper bound: budget + one per-attempt connect timeout (capped at
+            // 500ms by PollForPortAsync) + generous scheduling slack. The old
+            // bug would have produced elapsed >= budget * 2 here.
+            Assert.True(sw.ElapsedMilliseconds < budgetMs + 1500,
+                $"expected failure near {budgetMs}ms budget, took {sw.ElapsedMilliseconds}ms");
+        }
+
+        [Fact]
+        public async Task AbortCallbackShortCircuits()
+        {
+            // Simulate the "child process exited" abort path: the loop must
+            // return false promptly without waiting out the full budget.
+            var sw = Stopwatch.StartNew();
+            var ok = await GL.PollForPortAsync("127.0.0.1", 19999, 5000, () => true);
+            sw.Stop();
+
+            Assert.False(ok);
+            Assert.True(sw.ElapsedMilliseconds < 1000,
+                $"expected fast abort, took {sw.ElapsedMilliseconds}ms");
+        }
+    }
+
+    // ── Options / construction ────────────────────────────────
+
+    public class OptionsTest
     {
         [Fact]
         public void DefaultPort()
         {
-            var gl = new GL("postgresql://localhost:5432/mydb");
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb");
             Assert.Equal(7932, gl.Port);
         }
 
         [Fact]
         public void CustomPort()
         {
-            var gl = new GL("postgresql://localhost:5432/mydb",
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
                 new GoldLapelOptions { Port = 9000 });
             Assert.Equal(9000, gl.Port);
         }
@@ -239,21 +317,76 @@ namespace GoldLapel.Tests
         [Fact]
         public void NotRunningInitially()
         {
-            var gl = new GL("postgresql://localhost:5432/mydb");
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb");
             Assert.False(gl.IsRunning);
             Assert.Null(gl.Url);
         }
 
         [Fact]
-        public void NullUpstreamThrows()
+        public async System.Threading.Tasks.Task StartAsyncNullUpstreamThrows()
         {
-            Assert.Throws<ArgumentNullException>(() => new GL(null));
+            await Assert.ThrowsAsync<ArgumentNullException>(() => GL.StartAsync(null));
         }
 
         [Fact]
-        public void NullUpstreamWithOptionsThrows()
+        public void LogLevelDebugMapsToDoubleVerbose()
         {
-            Assert.Throws<ArgumentNullException>(() => new GL(null, new GoldLapelOptions()));
+            // The proxy binary accepts -v/-vv/-vvv (count-based), not --log-level.
+            // LogLevel "debug" → -vv.
+            var config = new Dictionary<string, object> { { "logLevel", "debug" } };
+            var args = GL.ConfigToArgs(config);
+            Assert.Equal(new List<string> { "-vv" }, args);
+        }
+
+        [Fact]
+        public void LogLevelTraceMapsToTripleVerbose()
+        {
+            var args = GL.ConfigToArgs(new Dictionary<string, object> { { "logLevel", "trace" } });
+            Assert.Equal(new List<string> { "-vvv" }, args);
+        }
+
+        [Fact]
+        public void LogLevelInfoMapsToSingleVerbose()
+        {
+            var args = GL.ConfigToArgs(new Dictionary<string, object> { { "logLevel", "info" } });
+            Assert.Equal(new List<string> { "-v" }, args);
+        }
+
+        [Theory]
+        [InlineData("warn")]
+        [InlineData("warning")]
+        [InlineData("error")]
+        public void LogLevelWarnOrErrorEmitsNoFlag(string level)
+        {
+            // warn/error are the default level — no extra flag needed.
+            var args = GL.ConfigToArgs(new Dictionary<string, object> { { "logLevel", level } });
+            Assert.Empty(args);
+        }
+
+        [Fact]
+        public void LogLevelIsCaseInsensitive()
+        {
+            var args = GL.ConfigToArgs(new Dictionary<string, object> { { "logLevel", "DEBUG" } });
+            Assert.Equal(new List<string> { "-vv" }, args);
+        }
+
+        [Fact]
+        public void LogLevelInvalidRaises()
+        {
+            var ex = Assert.Throws<ArgumentException>(() =>
+                GL.ConfigToArgs(new Dictionary<string, object> { { "logLevel", "loud" } }));
+            Assert.Contains("logLevel must be one of", ex.Message);
+        }
+
+        [Fact]
+        public void LogLevelNeverEmitsLongFlag()
+        {
+            // Regression guard: the proxy binary does not accept --log-level.
+            foreach (var lvl in new[] { "trace", "debug", "info", "warn", "error" })
+            {
+                var args = GL.ConfigToArgs(new Dictionary<string, object> { { "logLevel", lvl } });
+                Assert.DoesNotContain("--log-level", args);
+            }
         }
     }
 
@@ -264,14 +397,13 @@ namespace GoldLapel.Tests
         [Fact]
         public void DefaultDashboardPort()
         {
-            var gl = new GL("postgresql://localhost:5432/mydb");
-            Assert.Equal(GL.DefaultDashboardPort, 7933);
+            Assert.Equal(7933, GL.DefaultDashboardPort);
         }
 
         [Fact]
         public void CustomDashboardPort()
         {
-            var gl = new GL("postgresql://localhost:5432/mydb",
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
                 new GoldLapelOptions
                 {
                     Config = new Dictionary<string, object> { { "dashboardPort", 9090 } }
@@ -282,7 +414,7 @@ namespace GoldLapel.Tests
         [Fact]
         public void DashboardDisabledWithZero()
         {
-            var gl = new GL("postgresql://localhost:5432/mydb",
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
                 new GoldLapelOptions
                 {
                     Config = new Dictionary<string, object> { { "dashboardPort", 0 } }
@@ -293,46 +425,71 @@ namespace GoldLapel.Tests
         [Fact]
         public void DashboardUrlNullWhenNotRunning()
         {
-            var gl = new GL("postgresql://localhost:5432/mydb");
+            // Cross-wrapper contract: DashboardUrl reports only while the proxy
+            // process is live. Pre-start (and post-dispose), it is null. This
+            // matches Python (dashboard_url), Go (DashboardURL), Java
+            // (getDashboardUrl), and PHP (getDashboardUrl). If this assertion
+            // flips, update the DashboardUrl XML doc too.
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb");
+            Assert.Null(gl.DashboardUrl);
+        }
+
+        [Fact]
+        public void DashboardUrlNullPreStartEvenWithExplicitPort()
+        {
+            // Regression guard: a user-supplied dashboardPort must not cause
+            // DashboardUrl to synthesize a URL before the proxy is running.
+            // The URL only becomes observable once the process binds the port.
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
+                new GoldLapelOptions
+                {
+                    Port = 17932,
+                    Config = new Dictionary<string, object> { { "dashboardPort", 9999 } }
+                });
+            Assert.False(gl.IsRunning);
             Assert.Null(gl.DashboardUrl);
         }
 
         [Fact]
         public void DashboardPortExtractedFromConfig()
         {
-            var gl = new GL("postgresql://localhost:5432/mydb",
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
                 new GoldLapelOptions
                 {
                     Config = new Dictionary<string, object> { { "dashboardPort", 8888 } }
                 });
-            // Not running, so DashboardUrl is null, but we can verify the port was extracted
-            // by checking it doesn't use the default when we eventually start
             Assert.Null(gl.DashboardUrl);
             Assert.False(gl.IsRunning);
         }
-    }
 
-    // ── DashboardProxyUrl (singleton) ────────────────────
-
-    public class DashboardProxyUrlTest
-    {
         [Fact]
-        public void DashboardProxyUrlNullWhenNotStarted()
+        public void DashboardPortDerivesFromCustomProxyPort()
         {
-            GL.Stop();
-            Assert.Null(GL.DashboardProxyUrl);
+            // When only Port is set, dashboard defaults to port + 1 (not the
+            // hardcoded 7933). The internal _dashboardPort isn't public, but
+            // DashboardUrl exposes it when the process is running; since we
+            // can't spawn a real process here, we reach in via reflection.
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
+                new GoldLapelOptions { Port = 17932 });
+            var field = typeof(GL).GetField("_dashboardPort",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            Assert.NotNull(field);
+            Assert.Equal(17933, (int)field.GetValue(gl));
         }
-    }
 
-    // ── Singleton ─────────────────────────────────────────────
-
-    public class SingletonTest
-    {
         [Fact]
-        public void ProxyUrlNullWhenNotStarted()
+        public void ExplicitDashboardPortOverridesDerivation()
         {
-            GL.Stop();
-            Assert.Null(GL.ProxyUrl);
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
+                new GoldLapelOptions
+                {
+                    Port = 17932,
+                    Config = new Dictionary<string, object> { { "dashboardPort", 9999 } }
+                });
+            var field = typeof(GL).GetField("_dashboardPort",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            Assert.NotNull(field);
+            Assert.Equal(9999, (int)field.GetValue(gl));
         }
     }
 
@@ -359,17 +516,18 @@ namespace GoldLapel.Tests
         }
 
         [Fact]
+        public void ContainsLogLevel()
+        {
+            // v0.2.0: logLevel is a first-class config key (exposed via LogLevel option).
+            var keys = GL.ConfigKeys();
+            Assert.Contains("logLevel", keys);
+        }
+
+        [Fact]
         public void DoesNotContainUnknownKeys()
         {
             var keys = GL.ConfigKeys();
             Assert.DoesNotContain("notARealKey", keys);
-        }
-
-        [Fact]
-        public void HasExpectedCount()
-        {
-            var keys = GL.ConfigKeys();
-            Assert.Equal(42, keys.Count);
         }
     }
 
@@ -380,13 +538,9 @@ namespace GoldLapel.Tests
         [Fact]
         public void SendSignalToSelf()
         {
-            // SIGTERM (15) to our own process should succeed on Unix.
-            // We don't actually send SIGTERM to ourselves — instead verify
-            // that SendSignal returns true for signal 0 (null signal, just checks
-            // that we CAN send a signal to the given pid).
             if (System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
                     System.Runtime.InteropServices.OSPlatform.Windows))
-                return; // Skip on Windows
+                return;
 
             var pid = System.Diagnostics.Process.GetCurrentProcess().Id;
             Assert.True(GL.SendSignal(pid, 0)); // signal 0 = existence check
@@ -399,17 +553,15 @@ namespace GoldLapel.Tests
                     System.Runtime.InteropServices.OSPlatform.Windows))
                 return;
 
-            // PID that almost certainly doesn't exist should fail
-            Assert.False(GL.SendSignal(4194304, 0)); // max PID + 1 on most Linux systems
+            Assert.False(GL.SendSignal(4194304, 0));
         }
 
         [Fact]
-        public void StopProxyIsIdempotent()
+        public void DisposeIsIdempotent()
         {
-            var gl = new GL("postgresql://localhost:5432/mydb");
-            // Calling StopProxy when nothing is running should not throw
-            gl.StopProxy();
-            gl.StopProxy();
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb");
+            gl.Dispose();
+            gl.Dispose(); // second call should not throw
         }
     }
 
@@ -534,7 +686,7 @@ namespace GoldLapel.Tests
                     { "disablePool", true }
                 }
             };
-            var gl = new GL("postgresql://localhost:5432/mydb", options);
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb", options);
             Assert.Equal(7932, gl.Port);
         }
     }
