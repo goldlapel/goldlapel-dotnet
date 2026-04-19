@@ -391,18 +391,14 @@ namespace Goldlapel
             { IsBackground = true };
             stdoutThread.Start();
 
-            // Poll for port readiness.
-            var sw = Stopwatch.StartNew();
-            var ready = false;
-            while (sw.ElapsedMilliseconds < StartupTimeoutMs)
-            {
-                if (_process.HasExited) break;
-                if (await WaitForPortAsync("127.0.0.1", _port, 500).ConfigureAwait(false))
-                {
-                    ready = true;
-                    break;
-                }
-            }
+            // Poll for port readiness within a single StartupTimeoutMs budget.
+            // Earlier versions wrapped a looping WaitForPortAsync in this loop,
+            // which double-budgeted the timeout (each outer iteration consumed
+            // up to 500ms of inner retries inside a 500ms per-attempt budget,
+            // so total elapsed could exceed StartupTimeoutMs).
+            var ready = await PollForPortAsync(
+                "127.0.0.1", _port, StartupTimeoutMs,
+                () => _process.HasExited).ConfigureAwait(false);
 
             if (!ready)
             {
@@ -737,22 +733,47 @@ namespace Goldlapel
             return false;
         }
 
-        private static async Task<bool> WaitForPortAsync(string host, int port, long timeoutMs)
+        // Single TCP connect attempt with a per-attempt timeout. Returns true on
+        // successful connect, false on timeout/error. The caller is responsible
+        // for retrying against an overall startup budget.
+        internal static async Task<bool> TryConnectOnceAsync(string host, int port, int timeoutMs)
         {
-            var sw = Stopwatch.StartNew();
-            while (sw.ElapsedMilliseconds < timeoutMs)
+            try
             {
-                try
+                using (var client = new TcpClient())
                 {
-                    using (var client = new TcpClient())
-                    {
-                        var connectTask = client.ConnectAsync(host, port);
-                        var finished = await Task.WhenAny(connectTask, Task.Delay(500)).ConfigureAwait(false);
-                        if (finished == connectTask && !connectTask.IsFaulted && client.Connected)
-                            return true;
-                    }
+                    var connectTask = client.ConnectAsync(host, port);
+                    var finished = await Task.WhenAny(connectTask, Task.Delay(timeoutMs)).ConfigureAwait(false);
+                    if (finished == connectTask && !connectTask.IsFaulted && client.Connected)
+                        return true;
                 }
-                catch { }
+            }
+            catch { }
+            return false;
+        }
+
+        // Poll the given port with a per-attempt connect timeout and a small
+        // delay between attempts. Returns true when the port accepts a
+        // connection before <paramref name="budgetMs"/> elapses; otherwise
+        // false. <paramref name="abort"/> is consulted each iteration and
+        // short-circuits the loop when it returns true (e.g. the child
+        // process has already exited). The total elapsed time is bounded by
+        // <paramref name="budgetMs"/> plus at most one per-attempt connect
+        // timeout — not <c>budgetMs * N</c>.
+        internal static async Task<bool> PollForPortAsync(
+            string host, int port, long budgetMs, Func<bool> abort = null)
+        {
+            // Per-attempt connect timeout scales to the budget so very short
+            // budgets (used in tests) don't spend their entire time inside a
+            // single connect call.
+            var attemptMs = (int)Math.Min(500, Math.Max(50, budgetMs / 4));
+            var sw = Stopwatch.StartNew();
+            while (sw.ElapsedMilliseconds < budgetMs)
+            {
+                if (abort != null && abort()) return false;
+                if (await TryConnectOnceAsync(host, port, attemptMs).ConfigureAwait(false))
+                    return true;
+                if (sw.ElapsedMilliseconds >= budgetMs) break;
                 await Task.Delay((int)StartupPollIntervalMs).ConfigureAwait(false);
             }
             return false;

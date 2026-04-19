@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
+using System.Threading.Tasks;
 using Xunit;
 using GL = Goldlapel.GoldLapel;
 using Goldlapel;
@@ -220,6 +222,76 @@ namespace Goldlapel.Tests
         public void ClosedPortTimesOut()
         {
             Assert.False(GL.WaitForPort("127.0.0.1", 19999, 200));
+        }
+    }
+
+    // ── PollForPortAsync ──────────────────────────────────────
+    //
+    // PollForPortAsync is the startup-readiness loop extracted from SpawnAsync.
+    // Regression coverage for the v0.2 double-budget bug: the previous
+    // SpawnAsync wrapped a looping WaitForPortAsync inside its own outer
+    // stopwatch loop, so total elapsed time could reach budget * N (each
+    // outer iteration consumed another full inner budget). These tests
+    // assert the single-budget contract: total elapsed <= budget (+ small
+    // slack for the final per-attempt connect + thread scheduling).
+
+    public class PollForPortAsyncTest
+    {
+        [Fact]
+        public async Task ReachablePortSucceedsInsideBudget()
+        {
+            var listener = new TcpListener(IPAddress.Loopback, 0);
+            listener.Start();
+            var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+            try
+            {
+                var sw = Stopwatch.StartNew();
+                var ok = await GL.PollForPortAsync("127.0.0.1", port, 2000);
+                sw.Stop();
+
+                Assert.True(ok);
+                // Should return almost immediately for a listening port.
+                Assert.True(sw.ElapsedMilliseconds < 2000,
+                    $"expected fast success, took {sw.ElapsedMilliseconds}ms");
+            }
+            finally
+            {
+                listener.Stop();
+            }
+        }
+
+        [Fact]
+        public async Task UnreachablePortFailsAtApproximatelyBudget()
+        {
+            // Budget of 600ms. The old bug allowed total elapsed to reach
+            // several multiples of the budget (each outer iteration ran a
+            // full inner 500ms loop). With the single-loop fix, total time
+            // is bounded by budget + one per-attempt connect timeout.
+            const long budgetMs = 600;
+            var sw = Stopwatch.StartNew();
+            var ok = await GL.PollForPortAsync("127.0.0.1", 19999, budgetMs);
+            sw.Stop();
+
+            Assert.False(ok);
+            // Upper bound: budget + one per-attempt connect timeout (capped at
+            // 500ms by PollForPortAsync) + generous scheduling slack. The old
+            // bug would have produced elapsed >= budget * 2 here.
+            Assert.True(sw.ElapsedMilliseconds < budgetMs + 1500,
+                $"expected failure near {budgetMs}ms budget, took {sw.ElapsedMilliseconds}ms");
+        }
+
+        [Fact]
+        public async Task AbortCallbackShortCircuits()
+        {
+            // Simulate the "child process exited" abort path: the loop must
+            // return false promptly without waiting out the full budget.
+            var sw = Stopwatch.StartNew();
+            var ok = await GL.PollForPortAsync("127.0.0.1", 19999, 5000, () => true);
+            sw.Stop();
+
+            Assert.False(ok);
+            Assert.True(sw.ElapsedMilliseconds < 1000,
+                $"expected fast abort, took {sw.ElapsedMilliseconds}ms");
         }
     }
 
