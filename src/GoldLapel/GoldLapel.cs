@@ -39,6 +39,14 @@ namespace Goldlapel
 
         /// <summary>Additional raw CLI flags appended to the binary invocation.</summary>
         public string[] ExtraArgs { get; set; }
+
+        /// <summary>
+        /// When <c>true</c>, suppress the startup banner entirely. When <c>false</c>
+        /// (the default), the banner is written to <c>Console.Error</c> (stderr) so
+        /// it doesn't pollute stdout consumers (ASP.NET Core logs, piped app output,
+        /// shells redirecting stdout, etc.).
+        /// </summary>
+        public bool Silent { get; set; }
     }
 
     /// <summary>
@@ -100,6 +108,7 @@ namespace Goldlapel
         private readonly int _dashboardPort;
         private readonly string[] _extraArgs;
         private readonly Dictionary<string, object> _config;
+        private readonly bool _silent;
         private Process _process;
         private string _proxyUrl;
         private bool _disposed;
@@ -121,6 +130,7 @@ namespace Goldlapel
             _port = options.Port;
             _extraArgs = options.ExtraArgs ?? Array.Empty<string>();
             _config = MergeConfig(options);
+            _silent = options.Silent;
             // Dashboard defaults to proxy port + 1 (matches what the Rust binary
             // binds when no --dashboard-port is passed). Only when the user
             // supplies an explicit dashboardPort via Config does that value
@@ -403,10 +413,16 @@ namespace Goldlapel
             _conn = new NpgsqlConnection(UrlToNpgsqlConnectionString(_proxyUrl));
             await _conn.OpenAsync().ConfigureAwait(false);
 
-            if (_dashboardPort > 0)
-                Console.WriteLine($"goldlapel \u2192 :{_port} (proxy) | http://127.0.0.1:{_dashboardPort} (dashboard)");
-            else
-                Console.WriteLine($"goldlapel \u2192 :{_port} (proxy)");
+            // Write the startup banner to stderr (not stdout) so it doesn't pollute
+            // application stdout — ASP.NET Core logs, CLI app output, shells that
+            // redirect stdout, etc. Opt out entirely via GoldLapelOptions.Silent.
+            if (!_silent)
+            {
+                if (_dashboardPort > 0)
+                    Console.Error.WriteLine($"goldlapel \u2192 :{_port} (proxy) | http://127.0.0.1:{_dashboardPort} (dashboard)");
+                else
+                    Console.Error.WriteLine($"goldlapel \u2192 :{_port} (proxy)");
+            }
         }
 
         private static void GracefulStop(Process proc)

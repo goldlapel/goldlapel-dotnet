@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using System.Threading.Tasks;
 using Npgsql;
 using Xunit;
@@ -112,6 +113,77 @@ namespace Goldlapel.Tests
             await clean.OpenAsync();
             await using var drop = new NpgsqlCommand($"DROP TABLE {collection}", clean);
             await drop.ExecuteNonQueryAsync();
+        }
+
+        // Banner routing: the startup banner must go to stderr (not stdout) so
+        // it doesn't pollute app output (ASP.NET Core logs, piped CLI output,
+        // shells redirecting stdout). Regression test for wrapper-v0.2 review
+        // finding "Banner to stdout pollutes library output".
+        [Fact]
+        public async Task Banner_WritesToStderr_NotStdout()
+        {
+            if (!CanRunIntegration()) return;
+
+            var origOut = Console.Out;
+            var origErr = Console.Error;
+            var capturedOut = new StringWriter();
+            var capturedErr = new StringWriter();
+            Console.SetOut(capturedOut);
+            Console.SetError(capturedErr);
+            try
+            {
+                var port = NextPort();
+                await using (await GL.StartAsync(Upstream, opts => { opts.Port = port; }))
+                {
+                }
+            }
+            finally
+            {
+                Console.SetOut(origOut);
+                Console.SetError(origErr);
+            }
+
+            var stdout = capturedOut.ToString();
+            var stderr = capturedErr.ToString();
+
+            Assert.Contains("goldlapel", stderr);
+            Assert.Contains("(proxy)", stderr);
+            Assert.DoesNotContain("goldlapel", stdout);
+        }
+
+        // Silent=true must suppress the banner entirely — nothing on stdout OR
+        // stderr. Useful for embedded/daemon scenarios where even stderr is
+        // inspected (structured-log tooling, test runners, etc.).
+        [Fact]
+        public async Task Silent_Suppresses_Banner()
+        {
+            if (!CanRunIntegration()) return;
+
+            var origOut = Console.Out;
+            var origErr = Console.Error;
+            var capturedOut = new StringWriter();
+            var capturedErr = new StringWriter();
+            Console.SetOut(capturedOut);
+            Console.SetError(capturedErr);
+            try
+            {
+                var port = NextPort();
+                await using (await GL.StartAsync(Upstream, opts =>
+                {
+                    opts.Port = port;
+                    opts.Silent = true;
+                }))
+                {
+                }
+            }
+            finally
+            {
+                Console.SetOut(origOut);
+                Console.SetError(origErr);
+            }
+
+            Assert.DoesNotContain("goldlapel", capturedOut.ToString());
+            Assert.DoesNotContain("goldlapel", capturedErr.ToString());
         }
     }
 }
