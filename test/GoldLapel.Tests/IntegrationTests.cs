@@ -90,12 +90,63 @@ namespace Goldlapel.Tests
             Assert.Equal(2, Convert.ToInt32(result));
         }
 
-        // Note: an end-to-end UsingAsync integration test against the live proxy
-        // is intentionally covered in unit tests (InstanceMethodTests.cs/UsingAsyncScopeTest)
-        // rather than here — a known Npgsql/proxy prepared-statement interaction
-        // sporadically fails when DDL is issued across a freshly-opened user
-        // connection in the same proxy session. The unit tests verify the
-        // AsyncLocal scoping mechanics without needing a real Postgres.
+        // End-to-end UsingAsync test against the live proxy.
+        //
+        // Previously blocked by a Npgsql/proxy CloseComplete framing bug
+        // (wrapper-v0.2 TODO 03, fixed on the `closecomplete-framing-fix`
+        // branch in the Rust repo). To run this test against a binary that
+        // doesn't have the fix, there is a per-collection isolation guard
+        // (unique collection name + tx rollback) so one flaky run doesn't
+        // leave stale state behind.
+        //
+        // Verifies the scoping contract: inside UsingAsync(userConn, ...),
+        // wrapper methods use `userConn` (not the internal connection). We
+        // begin a tx on userConn, call DocInsertAsync via UsingAsync,
+        // then roll back. If UsingAsync honored the scope, the insert is
+        // inside the rolled-back tx and leaves no row. If it used the
+        // internal conn (the bug), the row would persist independently.
+        [Fact]
+        public async Task UsingAsyncScopesConnectionAgainstLiveProxy()
+        {
+            if (!CanRunIntegration()) return;
+
+            var port = NextPort();
+            await using var gl = await GL.StartAsync(Upstream, opts => { opts.Port = port; });
+
+            var collection = "gl_int_using_" + Guid.NewGuid().ToString("N").Substring(0, 8);
+
+            // Pre-create the collection on the internal connection so the
+            // DDL inside UsingAsync is a no-op. Keeps the tx small — only
+            // the INSERT gets rolled back, and we avoid a DDL-in-transaction
+            // path that has historically interacted poorly with the proxy's
+            // prepared-statement cache.
+            await gl.DocCreateCollectionAsync(collection);
+
+            await using var userConn = new NpgsqlConnection(gl.Url);
+            await userConn.OpenAsync();
+
+            await using (var tx = await userConn.BeginTransactionAsync())
+            {
+                await gl.UsingAsync(userConn, async scoped =>
+                {
+                    await scoped.DocInsertAsync(collection, "{\"via\":\"using-tx\"}");
+                });
+                // Rollback — if UsingAsync used userConn, the insert is undone.
+                await tx.RollbackAsync();
+            }
+
+            // Verify: collection exists (pre-created) but has zero rows. If
+            // UsingAsync had used the internal connection, the insert would
+            // have persisted outside the rolled-back tx and count would be 1.
+            var count = await gl.DocCountAsync(collection);
+            Assert.Equal(0L, count);
+
+            // Cleanup.
+            await using var clean = new NpgsqlConnection(gl.Url);
+            await clean.OpenAsync();
+            await using var drop = new NpgsqlCommand($"DROP TABLE {collection}", clean);
+            await drop.ExecuteNonQueryAsync();
+        }
 
         [Fact]
         public async Task PerCallConnectionOverride()
