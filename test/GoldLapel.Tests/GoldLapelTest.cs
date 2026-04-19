@@ -535,23 +535,29 @@ namespace GoldLapel.Tests
 
     public class GracefulStopTest
     {
-        [Fact]
+        // SendSignal relies on POSIX kill(2); the underlying P/Invoke is only
+        // wired up for non-Windows platforms. Mark as SkippableFact so a
+        // Windows run reports "Skipped" rather than a silent Fact pass that
+        // never exercises any assertion.
+        [SkippableFact]
         public void SendSignalToSelf()
         {
-            if (System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
-                    System.Runtime.InteropServices.OSPlatform.Windows))
-                return;
+            Skip.If(
+                System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
+                    System.Runtime.InteropServices.OSPlatform.Windows),
+                "POSIX-only: SendSignal uses kill(2), unavailable on Windows");
 
             var pid = System.Diagnostics.Process.GetCurrentProcess().Id;
             Assert.True(GL.SendSignal(pid, 0)); // signal 0 = existence check
         }
 
-        [Fact]
+        [SkippableFact]
         public void SendSignalToNonexistentPid()
         {
-            if (System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
-                    System.Runtime.InteropServices.OSPlatform.Windows))
-                return;
+            Skip.If(
+                System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
+                    System.Runtime.InteropServices.OSPlatform.Windows),
+                "POSIX-only: SendSignal uses kill(2), unavailable on Windows");
 
             Assert.False(GL.SendSignal(4194304, 0));
         }
