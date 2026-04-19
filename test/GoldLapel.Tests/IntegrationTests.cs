@@ -148,6 +148,128 @@ namespace Goldlapel.Tests
             await drop.ExecuteNonQueryAsync();
         }
 
+        // Regression test for the CloseComplete framing bug fixed by
+        // goldlapel commits c74748d (eviction-CloseComplete counter) and
+        // 77d7dfd (invalidate ext-cache client mapping on every Parse).
+        //
+        // Pre-fix symptom on Npgsql: when the Rust proxy's ext prepared-
+        // statement cache evicts entries (LRU on write, or full `.clear()`
+        // on DDL-detected-in-simple-query), it forwards one or more stray
+        // `CloseComplete` frames to the client. Npgsql's extended-protocol
+        // parser aborts with:
+        //
+        //     CloseComplete while expecting ParseCompleteMessage
+        //
+        // The bug only fires on drivers that take the extended/Parse-Bind
+        // path — which is exactly what `NpgsqlCommand.Prepare()` triggers.
+        // The pre-existing UsingAsyncScopesConnectionAgainstLiveProxy test
+        // deliberately avoids Prepare() so it can run against any binary;
+        // THIS test exists specifically to exercise Parse/Bind so future
+        // regressions in the proxy's framing logic are caught.
+        //
+        // Gated on GOLDLAPEL_CLOSECOMPLETE_FIX=1 (opt-in) because stock
+        // pre-fix binaries will deterministically fail. Default-skip is
+        // safe — dev/CI sets the env var once the fix ships.
+        private static bool CloseCompleteFixConfirmed()
+        {
+            var v = Environment.GetEnvironmentVariable("GOLDLAPEL_CLOSECOMPLETE_FIX");
+            return !string.IsNullOrEmpty(v) && v != "0" && v != "false";
+        }
+
+        [Fact]
+        public async Task PreparedStatement_RoundTrips_AgainstLiveProxy()
+        {
+            if (!CanRunIntegration()) return;
+            if (!CloseCompleteFixConfirmed()) return;
+
+            var port = NextPort();
+            await using var gl = await GL.StartAsync(Upstream, opts => { opts.Port = port; });
+
+            await using var conn = new NpgsqlConnection(gl.Url);
+            await conn.OpenAsync();
+
+            // Parameterized query + Prepare() forces Npgsql into its
+            // extended-protocol Parse/Bind/Describe/Execute flow — the
+            // exact path that pre-fix tripped the CloseComplete framing
+            // bug. Assert the full round-trip returns the expected value.
+            await using var cmd = new NpgsqlCommand("SELECT $1::int AS x", conn);
+            cmd.Parameters.AddWithValue(42);
+            await cmd.PrepareAsync();
+
+            var first = await cmd.ExecuteScalarAsync();
+            Assert.Equal(42, Convert.ToInt32(first));
+
+            // Re-execute the prepared statement to cover statement reuse
+            // (different param value, same prepared plan).
+            cmd.Parameters[0].Value = 1337;
+            var second = await cmd.ExecuteScalarAsync();
+            Assert.Equal(1337, Convert.ToInt32(second));
+        }
+
+        // Second regression shape from the original .NET bug report: DDL
+        // issued over a second user connection in the same proxy session,
+        // while a first connection has primed the proxy's ext prepared-
+        // statement cache. The DDL path (simple-query `CREATE TABLE`)
+        // triggers `ext_prep_cache.clear()` on the proxy; pre-fix, the
+        // resulting burst of CloseComplete frames leaked back to whichever
+        // connection next used extended protocol — reliably trashing it
+        // with "CloseComplete while expecting ParseCompleteMessage".
+        [Fact]
+        public async Task PreparedStatement_Survives_DdlOnSecondConnection()
+        {
+            if (!CanRunIntegration()) return;
+            if (!CloseCompleteFixConfirmed()) return;
+
+            var port = NextPort();
+            await using var gl = await GL.StartAsync(Upstream, opts => { opts.Port = port; });
+
+            var table = "gl_cc_" + Guid.NewGuid().ToString("N").Substring(0, 8);
+
+            // Connection A: prime the proxy's ext prepared cache by
+            // preparing + executing a parameterized statement a few times.
+            await using var connA = new NpgsqlConnection(gl.Url);
+            await connA.OpenAsync();
+            await using (var prime = new NpgsqlCommand("SELECT $1::int AS x", connA))
+            {
+                prime.Parameters.AddWithValue(1);
+                await prime.PrepareAsync();
+                for (int i = 0; i < 3; i++)
+                {
+                    prime.Parameters[0].Value = i;
+                    await prime.ExecuteScalarAsync();
+                }
+            }
+
+            // Connection B: issue DDL. This is the CREATE TABLE path that
+            // pre-fix triggered ext_prep_cache.clear() on the proxy and
+            // spilled CloseCompletes back toward extended-protocol users.
+            await using (var connB = new NpgsqlConnection(gl.Url))
+            {
+                await connB.OpenAsync();
+                await using var ddl = new NpgsqlCommand(
+                    $"CREATE TABLE {table} (id int)", connB);
+                await ddl.ExecuteNonQueryAsync();
+            }
+
+            // Connection A again: run a fresh parameterized + Prepare()d
+            // query. Pre-fix, this is where Npgsql would observe the stray
+            // CloseComplete and throw. Post-fix, it should round-trip.
+            await using (var follow = new NpgsqlCommand("SELECT $1::int AS y", connA))
+            {
+                follow.Parameters.AddWithValue(99);
+                await follow.PrepareAsync();
+                var result = await follow.ExecuteScalarAsync();
+                Assert.Equal(99, Convert.ToInt32(result));
+            }
+
+            // Cleanup.
+            await using var clean = new NpgsqlConnection(gl.Url);
+            await clean.OpenAsync();
+            await using var drop = new NpgsqlCommand(
+                $"DROP TABLE IF EXISTS {table}", clean);
+            await drop.ExecuteNonQueryAsync();
+        }
+
         [Fact]
         public async Task PerCallConnectionOverride()
         {
