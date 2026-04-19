@@ -11,7 +11,7 @@
     <PackageProjectUrl>https://goldlapel.com</PackageProjectUrl>
     <RepositoryUrl>https://github.com/goldlapel/goldlapel-dotnet</RepositoryUrl>
     <PackageTags>postgres;postgresql;proxy;optimization;database</PackageTags>
-    <RootNamespace>Goldlapel</RootNamespace>
+    <RootNamespace>GoldLapel</RootNamespace>
     <AssemblyName>GoldLapel</AssemblyName>
   </PropertyGroup>
 
@@ -23,7 +23,7 @@
   <ItemGroup>
     <!-- Grant the test project access to internal members. The value is the
          test *assembly* name (GoldLapel.Tests.csproj → GoldLapel.Tests.dll),
-         not a CLR namespace. The runtime namespace is `Goldlapel`. -->
+         not a CLR namespace. The runtime namespace is `GoldLapel`. -->
     <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleTo">
       <_Parameter1>GoldLapel.Tests</_Parameter1>
     </AssemblyAttribute>

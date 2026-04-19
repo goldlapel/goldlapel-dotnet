@@ -12,7 +12,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Npgsql;
 
-namespace Goldlapel
+namespace GoldLapel
 {
     /// <summary>
     /// Construction-time options for <see cref="GoldLapel.StartAsync(string, Action{GoldLapelOptions})"/>.

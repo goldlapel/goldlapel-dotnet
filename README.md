@@ -15,7 +15,7 @@ dotnet add package GoldLapel
 ## Quick Start
 
 ```csharp
-using Goldlapel;
+using GoldLapel;
 using Npgsql;
 
 // Factory — spawns the proxy, opens an internal Npgsql connection, returns an instance.

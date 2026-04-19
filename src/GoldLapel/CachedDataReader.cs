@@ -4,7 +4,7 @@ using System.Collections.Generic;
 using System.Data;
 using System.Data.Common;
 
-namespace Goldlapel
+namespace GoldLapel
 {
     public class CachedDataReader : DbDataReader
     {

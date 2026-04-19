@@ -5,7 +5,7 @@ using System.Data.Common;
 using System.Linq;
 using Xunit;
 
-namespace Goldlapel.Tests
+namespace GoldLapel.Tests
 {
     // ── Search ──────────────────────────────────────────────────
 

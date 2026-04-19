@@ -5,7 +5,7 @@ using System.Data.Common;
 using System.Threading;
 using Xunit;
 
-namespace Goldlapel.Tests
+namespace GoldLapel.Tests
 {
     // ── CachedDataReader ─────────────────────────────────────
 

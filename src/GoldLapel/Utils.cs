@@ -8,7 +8,7 @@ using System.Reflection;
 using System.Text.RegularExpressions;
 using System.Threading;
 
-namespace Goldlapel
+namespace GoldLapel
 {
     public static class Utils
     {

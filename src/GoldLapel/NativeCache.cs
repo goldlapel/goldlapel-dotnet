@@ -7,7 +7,7 @@ using System.Net.Sockets;
 using System.Text.RegularExpressions;
 using System.Threading;
 
-namespace Goldlapel
+namespace GoldLapel
 {
     public class CacheEntry
     {

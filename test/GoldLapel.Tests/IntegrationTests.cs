@@ -3,10 +3,10 @@ using System.IO;
 using System.Threading.Tasks;
 using Npgsql;
 using Xunit;
-using GL = Goldlapel.GoldLapel;
-using Goldlapel;
+using GL = GoldLapel.GoldLapel;
+using GoldLapel;
 
-namespace Goldlapel.Tests
+namespace GoldLapel.Tests
 {
     // Integration tests — spawn the real Rust binary against a live Postgres at
     // postgresql://sgibson@localhost/postgres. Each test picks a unique port so

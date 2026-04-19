@@ -5,10 +5,10 @@ using System.Linq;
 using System.Reflection;
 using System.Threading.Tasks;
 using Xunit;
-using GL = Goldlapel.GoldLapel;
-using Goldlapel;
+using GL = GoldLapel.GoldLapel;
+using GoldLapel;
 
-namespace Goldlapel.Tests
+namespace GoldLapel.Tests
 {
     // Helper: create a test GoldLapel with an injected SpyConnection so wrapper
     // methods can run without spawning the binary.
