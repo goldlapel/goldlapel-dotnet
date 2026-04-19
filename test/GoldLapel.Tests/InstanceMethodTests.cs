@@ -790,6 +790,38 @@ namespace Goldlapel.Tests
             });
             Assert.Equal(42, result);
         }
+
+        [Fact]
+        public async Task UsingAsyncScopeIsPerInstance()
+        {
+            // Regression: _scopedConnection used to be static, so opening a scope on
+            // gl1 would leak into gl2 and hijack wrapper calls on the second handle.
+            // With an instance-scoped AsyncLocal, gl2 must ignore gl1's scope entirely.
+            var gl1Default = new SpyConnection();
+            var gl1Scoped = new SpyConnection();
+            var gl2Default = new SpyConnection();
+
+            var gl1 = GL.CreateForTest("postgresql://localhost:5432/mydb");
+            InjectTestConn(gl1, gl1Default);
+
+            var gl2 = GL.CreateForTest("postgresql://localhost:5432/mydb");
+            InjectTestConn(gl2, gl2Default);
+
+            await gl1.UsingAsync(gl1Scoped, async _ =>
+            {
+                // Inside gl1's scope — a wrapper call on gl2 must hit gl2's default,
+                // NOT gl1Scoped (which would happen if the scope field were static).
+                await gl2.DocInsertAsync("events", "{\"n\":1}");
+            });
+
+            // gl1's scoped conn saw no traffic — gl2 correctly ignored it.
+            Assert.Empty(gl1Scoped.Commands);
+            // gl1's default also untouched — nothing ran through gl1 at all.
+            Assert.Empty(gl1Default.Commands);
+            // gl2 routed to its own default (CREATE TABLE + INSERT).
+            Assert.Equal(2, gl2Default.Commands.Count);
+            Assert.Contains("INSERT INTO events", gl2Default.Commands[1].CommandText);
+        }
     }
 
     // ── v0.2.0 — ResolveActive fail-fast ──────────────────────────

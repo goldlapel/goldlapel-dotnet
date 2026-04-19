@@ -86,7 +86,9 @@ namespace Goldlapel
         // AsyncLocal: scoping connection overrides across awaits within UsingAsync.
         // Each wrapper method consults _scopedConnection first, then falls back to
         // the internal _conn opened during StartAsync.
-        private static readonly AsyncLocal<DbConnection> _scopedConnection = new AsyncLocal<DbConnection>();
+        // Instance-scoped (not static): when two GoldLapel instances coexist, a scope
+        // opened on one must not bleed into the other.
+        private readonly AsyncLocal<DbConnection> _scopedConnection = new AsyncLocal<DbConnection>();
 
         private readonly string _upstream;
         private readonly int _port;
