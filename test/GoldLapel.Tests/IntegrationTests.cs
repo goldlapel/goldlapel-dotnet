@@ -8,10 +8,12 @@ using GoldLapel;
 
 namespace GoldLapel.Tests
 {
-    // Integration tests — spawn the real Rust binary against a live Postgres at
-    // postgresql://sgibson@localhost/postgres. Each test picks a unique port so
-    // they can run in parallel (xUnit runs Facts in different classes concurrently
-    // by default). Set GOLDLAPEL_BINARY=/path/to/goldlapel to override discovery.
+    // Integration tests — spawn the real Rust binary against a live Postgres.
+    // The upstream URL is read from GOLDLAPEL_TEST_UPSTREAM (matches goldlapel-go)
+    // with a sensible fallback for stock-Postgres dev setups. Each test picks a
+    // unique port so they can run in parallel (xUnit runs Facts in different
+    // classes concurrently by default). Set GOLDLAPEL_BINARY=/path/to/goldlapel
+    // to override discovery.
     //
     // Tests skip gracefully if the binary is not available, but we want a real
     // end-to-end check of StartAsync / await using / UsingAsync / connection:
@@ -20,7 +22,9 @@ namespace GoldLapel.Tests
     [Collection("EnvVarTests")]
     public class IntegrationTests
     {
-        private const string Upstream = "postgresql://sgibson@localhost/postgres";
+        private static readonly string Upstream =
+            Environment.GetEnvironmentVariable("GOLDLAPEL_TEST_UPSTREAM")
+            ?? "postgresql://postgres:postgres@localhost/postgres";
 
         private static bool CanRunIntegration()
         {

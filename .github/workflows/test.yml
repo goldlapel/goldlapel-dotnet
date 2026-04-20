@@ -34,17 +34,6 @@ jobs:
         with:
           dotnet-version: '8.0'
 
-      - name: Configure Postgres (trust auth + sgibson role)
-        # The .NET integration tests hardcode upstream `postgresql://sgibson@
-        # localhost/postgres` (matching the dev machine). Create a matching
-        # role with trust auth so the tests can run on CI without touching
-        # production code.
-        run: |
-          docker exec ${{ job.services.postgres.id }} bash -c "sed -i 's/scram-sha-256/trust/g; s/md5/trust/g' /var/lib/postgresql/data/pg_hba.conf"
-          docker restart ${{ job.services.postgres.id }}
-          until PGPASSWORD=postgres pg_isready -h localhost -U postgres; do sleep 1; done
-          PGPASSWORD=postgres psql -h localhost -U postgres -c "CREATE ROLE sgibson WITH LOGIN SUPERUSER"
-
       - name: Download goldlapel binary
         # Download the latest release asset from the private goldlapel/goldlapel
         # repo using the org-level RELEASE_TOKEN PAT (same token used by all
@@ -67,4 +56,5 @@ jobs:
           PGUSER: postgres
           PGPASSWORD: postgres
           PGDATABASE: postgres
+          GOLDLAPEL_TEST_UPSTREAM: postgresql://postgres:postgres@localhost/postgres
         run: dotnet test --no-restore --verbosity normal
