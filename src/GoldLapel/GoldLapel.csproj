@@ -29,6 +29,14 @@
     </AssemblyAttribute>
   </ItemGroup>
 
+  <!-- Third-party license attribution for the bundled Rust proxy binary. The
+       release workflow drops this file into src/GoldLapel/ at publish time;
+       Pack="true" with no PackagePath places it at the root of the .nupkg
+       so downstream consumers can inspect attributions. -->
+  <ItemGroup Condition="Exists('THIRD-PARTY-NOTICES.md')">
+    <None Include="THIRD-PARTY-NOTICES.md" Pack="true" PackagePath="" Visible="false" />
+  </ItemGroup>
+
   <ItemGroup Condition="Exists('runtimes')">
     <None Include="runtimes\linux-x64\native\goldlapel" Pack="true" PackagePath="runtimes\linux-x64\native\" Visible="false" />
     <None Include="runtimes\linux-arm64\native\goldlapel" Pack="true" PackagePath="runtimes\linux-arm64\native\" Visible="false" />
