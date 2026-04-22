@@ -6,7 +6,7 @@ The .NET wrapper for [Gold Lapel](https://goldlapel.com) — a self-optimizing P
 
 ## Install
 
-```
+```bash
 dotnet add package GoldLapel
 ```
 
