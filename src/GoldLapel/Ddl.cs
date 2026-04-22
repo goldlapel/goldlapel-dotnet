@@ -37,7 +37,7 @@ namespace GoldLapel
 
         /// <summary>
         /// Resolve the dashboard token for externally-launched proxies.
-        /// Priority: GOLDLAPEL_DASHBOARD_TOKEN env > ~/.goldlapel/dashboard_token.
+        /// Priority: GOLDLAPEL_DASHBOARD_TOKEN env > ~/.goldlapel/dashboard-token.
         /// </summary>
         public static string TokenFromEnvOrFile()
         {
@@ -47,7 +47,7 @@ namespace GoldLapel
             var home = Environment.GetEnvironmentVariable("HOME")
                 ?? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
             if (string.IsNullOrEmpty(home)) return null;
-            var path = Path.Combine(home, ".goldlapel", "dashboard_token");
+            var path = Path.Combine(home, ".goldlapel", "dashboard-token");
             if (!File.Exists(path)) return null;
             try
             {
@@ -148,7 +148,7 @@ namespace GoldLapel
                     throw new InvalidOperationException(
                         "Gold Lapel dashboard rejected the DDL request (403). "
                         + "The dashboard token is missing or incorrect — check "
-                        + "GOLDLAPEL_DASHBOARD_TOKEN or ~/.goldlapel/dashboard_token.");
+                        + "GOLDLAPEL_DASHBOARD_TOKEN or ~/.goldlapel/dashboard-token.");
                 throw new InvalidOperationException(
                     "Gold Lapel DDL API " + family + "/" + name
                     + " failed with " + status + " " + error + ": " + detail);
