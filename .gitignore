@@ -11,3 +11,8 @@ obj/
 
 # Runtime binaries (CI-only)
 src/GoldLapel/runtimes/
+
+# Local secrets
+.env
+.env.local
+.env.*.local
