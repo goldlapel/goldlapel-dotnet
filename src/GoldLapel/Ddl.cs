@@ -172,20 +172,11 @@ namespace GoldLapel
 
         /// <summary>
         /// Translate the proxy's $1, $2, ... placeholders to Npgsql's @p1, @p2.
-        /// Returns (sql, paramNames) so callers can bind in order.
+        /// Callers bind by index (see BindNumbered in Utils).
         /// </summary>
-        public static (string Sql, List<string> ParamNames) ToNpgsqlPlaceholders(string sql)
+        public static string ToNpgsqlPlaceholders(string sql)
         {
-            var names = new List<string>();
-            var rewritten = _positional.Replace(sql, match =>
-            {
-                var n = match.Groups[1].Value;
-                var pn = "p" + n;
-                if (!names.Contains(pn)) names.Add(pn);
-                return "@" + pn;
-            });
-            names.Sort((a, b) => int.Parse(a.Substring(1)).CompareTo(int.Parse(b.Substring(1))));
-            return (rewritten, names);
+            return _positional.Replace(sql, match => "@p" + match.Groups[1].Value);
         }
     }
 }

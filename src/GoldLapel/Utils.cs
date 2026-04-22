@@ -615,7 +615,7 @@ namespace GoldLapel
         {
             ValidateIdentifier(stream);
             var rawSql = RequireStreamPattern(patterns, "insert", "StreamAdd");
-            var (sql, _) = Ddl.ToNpgsqlPlaceholders(rawSql);
+            var sql = Ddl.ToNpgsqlPlaceholders(rawSql);
             // JSONB binding: cast @p1 to jsonb at SQL site.
             sql = sql.Replace("VALUES (@p1)", "VALUES (@p1::jsonb)");
             using (var cmd = conn.CreateCommand())
@@ -635,7 +635,7 @@ namespace GoldLapel
         {
             ValidateIdentifier(stream);
             var rawSql = RequireStreamPattern(patterns, "create_group", "StreamCreateGroup");
-            var (sql, _) = Ddl.ToNpgsqlPlaceholders(rawSql);
+            var sql = Ddl.ToNpgsqlPlaceholders(rawSql);
             using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText = sql;
@@ -648,10 +648,10 @@ namespace GoldLapel
             string group, string consumer, int count, DdlEntry patterns)
         {
             ValidateIdentifier(stream);
-            var cursorSql = Ddl.ToNpgsqlPlaceholders(RequireStreamPattern(patterns, "group_get_cursor", "StreamRead")).Sql;
-            var readSql = Ddl.ToNpgsqlPlaceholders(RequireStreamPattern(patterns, "read_since", "StreamRead")).Sql;
-            var advanceSql = Ddl.ToNpgsqlPlaceholders(RequireStreamPattern(patterns, "group_advance_cursor", "StreamRead")).Sql;
-            var pendingSql = Ddl.ToNpgsqlPlaceholders(RequireStreamPattern(patterns, "pending_insert", "StreamRead")).Sql;
+            var cursorSql = Ddl.ToNpgsqlPlaceholders(RequireStreamPattern(patterns, "group_get_cursor", "StreamRead"));
+            var readSql = Ddl.ToNpgsqlPlaceholders(RequireStreamPattern(patterns, "read_since", "StreamRead"));
+            var advanceSql = Ddl.ToNpgsqlPlaceholders(RequireStreamPattern(patterns, "group_advance_cursor", "StreamRead"));
+            var pendingSql = Ddl.ToNpgsqlPlaceholders(RequireStreamPattern(patterns, "pending_insert", "StreamRead"));
 
             // Wrap in an explicit transaction so the FOR UPDATE lock from
             // group_get_cursor is held until we've advanced the cursor and
@@ -738,7 +738,7 @@ namespace GoldLapel
         public static bool StreamAck(DbConnection conn, string stream, string group, long messageId, DdlEntry patterns)
         {
             ValidateIdentifier(stream);
-            var sql = Ddl.ToNpgsqlPlaceholders(RequireStreamPattern(patterns, "ack", "StreamAck")).Sql;
+            var sql = Ddl.ToNpgsqlPlaceholders(RequireStreamPattern(patterns, "ack", "StreamAck"));
             using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText = sql;
@@ -751,8 +751,8 @@ namespace GoldLapel
             string group, string consumer, long minIdleMs, DdlEntry patterns)
         {
             ValidateIdentifier(stream);
-            var claimSql = Ddl.ToNpgsqlPlaceholders(RequireStreamPattern(patterns, "claim", "StreamClaim")).Sql;
-            var readByIdSql = Ddl.ToNpgsqlPlaceholders(RequireStreamPattern(patterns, "read_by_id", "StreamClaim")).Sql;
+            var claimSql = Ddl.ToNpgsqlPlaceholders(RequireStreamPattern(patterns, "claim", "StreamClaim"));
+            var readByIdSql = Ddl.ToNpgsqlPlaceholders(RequireStreamPattern(patterns, "read_by_id", "StreamClaim"));
 
             var ids = new List<long>();
             using (var cmd = conn.CreateCommand())

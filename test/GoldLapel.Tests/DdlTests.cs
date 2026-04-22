@@ -155,15 +155,14 @@ namespace GoldLapel.Tests
         [Fact]
         public void ToNpgsqlPlaceholders_ConvertsNumberedPlaceholders()
         {
-            var (sql, names) = Ddl.ToNpgsqlPlaceholders("INSERT INTO t (a, b) VALUES ($1, $2) RETURNING $3");
+            var sql = Ddl.ToNpgsqlPlaceholders("INSERT INTO t (a, b) VALUES ($1, $2) RETURNING $3");
             Assert.Equal("INSERT INTO t (a, b) VALUES (@p1, @p2) RETURNING @p3", sql);
-            Assert.Equal(new[] { "p1", "p2", "p3" }, names);
         }
 
         [Fact]
         public void ToNpgsqlPlaceholders_HandlesDoubleDigit()
         {
-            var (sql, _) = Ddl.ToNpgsqlPlaceholders("SELECT $10, $11");
+            var sql = Ddl.ToNpgsqlPlaceholders("SELECT $10, $11");
             Assert.Equal("SELECT @p10, @p11", sql);
         }
     }
