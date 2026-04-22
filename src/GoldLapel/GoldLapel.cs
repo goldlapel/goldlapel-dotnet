@@ -1183,7 +1183,7 @@ namespace GoldLapel
         private async Task<DdlEntry> StreamPatternsAsync(string stream)
         {
             var token = _dashboardToken ?? Ddl.TokenFromEnvOrFile();
-            return await Ddl.FetchAsync(_ddlCache, "stream", stream, _dashboardPort, token).ConfigureAwait(false);
+            return await Ddl.FetchPatternsAsync(_ddlCache, "stream", stream, _dashboardPort, token).ConfigureAwait(false);
         }
 
         public async Task<long> StreamAddAsync(string stream, string payload, NpgsqlConnection connection = null)

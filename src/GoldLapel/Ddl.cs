@@ -13,7 +13,7 @@ namespace GoldLapel
 {
     /// <summary>
     /// Canonical DDL + query-pattern entry for a single helper instance
-    /// (e.g. stream "events"). Returned by <see cref="Ddl.FetchAsync"/>.
+    /// (e.g. stream "events"). Returned by <see cref="Ddl.FetchPatternsAsync"/>.
     /// </summary>
     public sealed class DdlEntry
     {
@@ -103,7 +103,7 @@ namespace GoldLapel
         /// <summary>
         /// Fetch (and cache) the canonical DDL + query patterns for a helper.
         /// </summary>
-        public static async Task<DdlEntry> FetchAsync(
+        public static async Task<DdlEntry> FetchPatternsAsync(
             ConcurrentDictionary<string, DdlEntry> cache,
             string family, string name,
             int dashboardPort, string dashboardToken,

@@ -45,14 +45,14 @@ namespace GoldLapel.Tests
         }
 
         [Fact]
-        public async Task FetchAsync_HappyPath_PostsCorrectBodyAndHeaders()
+        public async Task FetchPatternsAsync_HappyPath_PostsCorrectBodyAndHeaders()
         {
             Queue(200,
                 "{\"accepted\":true,\"family\":\"stream\",\"schema_version\":\"v1\"," +
                 "\"tables\":{\"main\":\"_goldlapel.stream_events\"}," +
                 "\"query_patterns\":{\"insert\":\"INSERT ...\"}}");
             var cache = new ConcurrentDictionary<string, DdlEntry>();
-            var entry = await Ddl.FetchAsync(cache, "stream", "events", 9999, "tok");
+            var entry = await Ddl.FetchPatternsAsync(cache, "stream", "events", 9999, "tok");
             Assert.Equal("_goldlapel.stream_events", entry.Tables["main"]);
             Assert.Equal("INSERT ...", entry.QueryPatterns["insert"]);
 
@@ -64,91 +64,91 @@ namespace GoldLapel.Tests
         }
 
         [Fact]
-        public async Task FetchAsync_CacheHit_SkipsRepost()
+        public async Task FetchPatternsAsync_CacheHit_SkipsRepost()
         {
             Queue(200, "{\"tables\":{\"main\":\"x\"},\"query_patterns\":{\"insert\":\"X\"}}");
             var cache = new ConcurrentDictionary<string, DdlEntry>();
-            var r1 = await Ddl.FetchAsync(cache, "stream", "events", 9999, "tok");
-            var r2 = await Ddl.FetchAsync(cache, "stream", "events", 9999, "tok");
+            var r1 = await Ddl.FetchPatternsAsync(cache, "stream", "events", 9999, "tok");
+            var r2 = await Ddl.FetchPatternsAsync(cache, "stream", "events", 9999, "tok");
             Assert.Same(r1, r2);
             Assert.Single(_captured);
         }
 
         [Fact]
-        public async Task FetchAsync_DifferentOwners_Isolated()
+        public async Task FetchPatternsAsync_DifferentOwners_Isolated()
         {
             Queue(200, "{\"tables\":{\"main\":\"_goldlapel.stream_events\"},\"query_patterns\":{\"insert\":\"X\"}}");
             Queue(200, "{\"tables\":{\"main\":\"_goldlapel.stream_events\"},\"query_patterns\":{\"insert\":\"X\"}}");
             var cacheA = new ConcurrentDictionary<string, DdlEntry>();
             var cacheB = new ConcurrentDictionary<string, DdlEntry>();
-            await Ddl.FetchAsync(cacheA, "stream", "events", 9999, "tok");
-            await Ddl.FetchAsync(cacheB, "stream", "events", 9999, "tok");
+            await Ddl.FetchPatternsAsync(cacheA, "stream", "events", 9999, "tok");
+            await Ddl.FetchPatternsAsync(cacheB, "stream", "events", 9999, "tok");
             Assert.Equal(2, _captured.Count);
         }
 
         [Fact]
-        public async Task FetchAsync_DifferentNames_MissCache()
+        public async Task FetchPatternsAsync_DifferentNames_MissCache()
         {
             Queue(200, "{\"tables\":{\"main\":\"_goldlapel.stream_events\"},\"query_patterns\":{\"insert\":\"INSERT events\"}}");
             Queue(200, "{\"tables\":{\"main\":\"_goldlapel.stream_orders\"},\"query_patterns\":{\"insert\":\"INSERT orders\"}}");
             var cache = new ConcurrentDictionary<string, DdlEntry>();
-            await Ddl.FetchAsync(cache, "stream", "events", 9999, "tok");
-            await Ddl.FetchAsync(cache, "stream", "orders", 9999, "tok");
+            await Ddl.FetchPatternsAsync(cache, "stream", "events", 9999, "tok");
+            await Ddl.FetchPatternsAsync(cache, "stream", "orders", 9999, "tok");
             Assert.Equal(2, _captured.Count);
         }
 
         [Fact]
-        public async Task FetchAsync_Invalidate_DropsCache()
+        public async Task FetchPatternsAsync_Invalidate_DropsCache()
         {
             Queue(200, "{\"tables\":{\"main\":\"_goldlapel.stream_events\"},\"query_patterns\":{\"insert\":\"X\"}}");
             Queue(200, "{\"tables\":{\"main\":\"_goldlapel.stream_events\"},\"query_patterns\":{\"insert\":\"X\"}}");
             var cache = new ConcurrentDictionary<string, DdlEntry>();
-            await Ddl.FetchAsync(cache, "stream", "events", 9999, "tok");
+            await Ddl.FetchPatternsAsync(cache, "stream", "events", 9999, "tok");
             // Dispose()/DisposeAsync() on GoldLapel clears the cache via
             // _ddlCache.Clear(); simulate that directly so we don't need a
             // running proxy.
             cache.Clear();
-            await Ddl.FetchAsync(cache, "stream", "events", 9999, "tok");
+            await Ddl.FetchPatternsAsync(cache, "stream", "events", 9999, "tok");
             Assert.Equal(2, _captured.Count);
         }
 
         [Fact]
-        public async Task FetchAsync_VersionMismatch_ActionableError()
+        public async Task FetchPatternsAsync_VersionMismatch_ActionableError()
         {
             Queue(409,
                 "{\"error\":\"version_mismatch\",\"detail\":\"wrapper requested v1; proxy speaks v2 — upgrade proxy\"}");
             var cache = new ConcurrentDictionary<string, DdlEntry>();
             var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
-                Ddl.FetchAsync(cache, "stream", "events", 9999, "tok"));
+                Ddl.FetchPatternsAsync(cache, "stream", "events", 9999, "tok"));
             Assert.Contains("schema version mismatch", ex.Message);
         }
 
         [Fact]
-        public async Task FetchAsync_Forbidden_TokenError()
+        public async Task FetchPatternsAsync_Forbidden_TokenError()
         {
             Queue(403, "{\"error\":\"forbidden\"}");
             var cache = new ConcurrentDictionary<string, DdlEntry>();
             var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
-                Ddl.FetchAsync(cache, "stream", "events", 9999, "tok"));
+                Ddl.FetchPatternsAsync(cache, "stream", "events", 9999, "tok"));
             Assert.Contains("dashboard token", ex.Message);
         }
 
         [Fact]
-        public async Task FetchAsync_MissingToken_ErrsBeforeHttp()
+        public async Task FetchPatternsAsync_MissingToken_ErrsBeforeHttp()
         {
             var cache = new ConcurrentDictionary<string, DdlEntry>();
             var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
-                Ddl.FetchAsync(cache, "stream", "events", 9999, null));
+                Ddl.FetchPatternsAsync(cache, "stream", "events", 9999, null));
             Assert.Contains("No dashboard token", ex.Message);
             Assert.Empty(_captured);
         }
 
         [Fact]
-        public async Task FetchAsync_MissingPort_Errs()
+        public async Task FetchPatternsAsync_MissingPort_Errs()
         {
             var cache = new ConcurrentDictionary<string, DdlEntry>();
             var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
-                Ddl.FetchAsync(cache, "stream", "events", 0, "tok"));
+                Ddl.FetchPatternsAsync(cache, "stream", "events", 0, "tok"));
             Assert.Contains("No dashboard port", ex.Message);
         }
 
