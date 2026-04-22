@@ -653,58 +653,86 @@ namespace GoldLapel
             var advanceSql = Ddl.ToNpgsqlPlaceholders(RequireStreamPattern(patterns, "group_advance_cursor", "StreamRead")).Sql;
             var pendingSql = Ddl.ToNpgsqlPlaceholders(RequireStreamPattern(patterns, "pending_insert", "StreamRead")).Sql;
 
-            long lastId;
-            using (var cmd = conn.CreateCommand())
+            // Wrap in an explicit transaction so the FOR UPDATE lock from
+            // group_get_cursor is held until we've advanced the cursor and
+            // inserted pending rows. Under autocommit the row lock is
+            // released immediately, allowing concurrent consumers to read
+            // the same cursor and claim the same messages. Mirrors the
+            // pattern in goldlapel-python and goldlapel-php.
+            var tx = conn.BeginTransaction();
+            try
             {
-                cmd.CommandText = cursorSql;
-                BindNumbered(cmd, group);
-                var obj = cmd.ExecuteScalar();
-                if (obj == null || obj == DBNull.Value) return new List<Dictionary<string, object>>();
-                lastId = Convert.ToInt64(obj);
-            }
-
-            var messages = new List<Dictionary<string, object>>();
-            using (var cmd = conn.CreateCommand())
-            {
-                cmd.CommandText = readSql;
-                BindNumbered(cmd, lastId, count);
-                using (var reader = cmd.ExecuteReader())
-                {
-                    while (reader.Read())
-                    {
-                        var row = new Dictionary<string, object>();
-                        for (int i = 0; i < reader.FieldCount; i++)
-                            row[reader.GetName(i)] = reader.IsDBNull(i) ? null : reader.GetValue(i);
-                        messages.Add(row);
-                    }
-                }
-            }
-
-            if (messages.Count > 0)
-            {
-                long maxId = 0;
-                foreach (var m in messages)
-                {
-                    var id = Convert.ToInt64(m["id"]);
-                    if (id > maxId) maxId = id;
-                }
+                long lastId;
                 using (var cmd = conn.CreateCommand())
                 {
-                    cmd.CommandText = advanceSql;
-                    BindNumbered(cmd, maxId, group);
-                    cmd.ExecuteNonQuery();
-                }
-                foreach (var m in messages)
-                {
-                    using (var cmd = conn.CreateCommand())
+                    cmd.Transaction = tx;
+                    cmd.CommandText = cursorSql;
+                    BindNumbered(cmd, group);
+                    var obj = cmd.ExecuteScalar();
+                    if (obj == null || obj == DBNull.Value)
                     {
-                        cmd.CommandText = pendingSql;
-                        BindNumbered(cmd, Convert.ToInt64(m["id"]), group, consumer);
-                        cmd.ExecuteNonQuery();
+                        tx.Commit();
+                        return new List<Dictionary<string, object>>();
+                    }
+                    lastId = Convert.ToInt64(obj);
+                }
+
+                var messages = new List<Dictionary<string, object>>();
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.Transaction = tx;
+                    cmd.CommandText = readSql;
+                    BindNumbered(cmd, lastId, count);
+                    using (var reader = cmd.ExecuteReader())
+                    {
+                        while (reader.Read())
+                        {
+                            var row = new Dictionary<string, object>();
+                            for (int i = 0; i < reader.FieldCount; i++)
+                                row[reader.GetName(i)] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+                            messages.Add(row);
+                        }
                     }
                 }
+
+                if (messages.Count > 0)
+                {
+                    long maxId = 0;
+                    foreach (var m in messages)
+                    {
+                        var id = Convert.ToInt64(m["id"]);
+                        if (id > maxId) maxId = id;
+                    }
+                    using (var cmd = conn.CreateCommand())
+                    {
+                        cmd.Transaction = tx;
+                        cmd.CommandText = advanceSql;
+                        BindNumbered(cmd, maxId, group);
+                        cmd.ExecuteNonQuery();
+                    }
+                    foreach (var m in messages)
+                    {
+                        using (var cmd = conn.CreateCommand())
+                        {
+                            cmd.Transaction = tx;
+                            cmd.CommandText = pendingSql;
+                            BindNumbered(cmd, Convert.ToInt64(m["id"]), group, consumer);
+                            cmd.ExecuteNonQuery();
+                        }
+                    }
+                }
+                tx.Commit();
+                return messages;
             }
-            return messages;
+            catch
+            {
+                try { tx.Rollback(); } catch { /* swallow; surface original exception */ }
+                throw;
+            }
+            finally
+            {
+                tx.Dispose();
+            }
         }
 
         public static bool StreamAck(DbConnection conn, string stream, string group, long messageId, DdlEntry patterns)
