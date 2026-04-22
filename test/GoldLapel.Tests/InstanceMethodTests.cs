@@ -822,6 +822,81 @@ namespace GoldLapel.Tests
             Assert.Equal(2, gl2Default.Commands.Count);
             Assert.Contains("INSERT INTO events", gl2Default.Commands[1].CommandText);
         }
+
+        [Fact(DisplayName = "UsingAsync scope does not leak across sibling Task.WhenAll tasks")]
+        public async Task UsingAsyncScopeDoesNotLeakToSiblingTask()
+        {
+            // Regression: if UsingAsync stored scope in a shared instance field
+            // (e.g. `this._scopeConn = connection`) instead of `AsyncLocal<T>`,
+            // a wrapper call on a *sibling* Task running concurrently with an
+            // in-flight UsingAsync block would observe the scoped connection
+            // and misroute its SQL. AsyncLocal<T> is THE .NET primitive for
+            // async-flow-local state — this test pins it down.
+            //
+            // Ruby's equivalent (test_async_native.rb::test_using_scope_under_async_reactor)
+            // revealed a real bug once in the Ruby wrapper. The .NET wrapper
+            // has always used AsyncLocal<DbConnection>, but we want explicit
+            // coverage so a future refactor can't regress silently.
+            //
+            // Deterministic sync via TaskCompletionSource (NO Task.Delay).
+
+            var spyDefault = new SpyConnection();
+            var spyScoped = new SpyConnection();
+
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb");
+            InjectTestConn(gl, spyDefault);
+
+            var enterUsing = new TaskCompletionSource();
+            var bFinished = new TaskCompletionSource();
+
+            async Task TaskA()
+            {
+                await gl.UsingAsync(spyScoped, async scoped =>
+                {
+                    // Signal B it's safe to run — we're inside the scope.
+                    enterUsing.SetResult();
+                    // Hold the scope open until B has observed its own routing.
+                    await bFinished.Task;
+                    // Still inside using: a call on `scoped` must go to spyScoped.
+                    await scoped.DocInsertAsync("scoped_events", "{\"from\":\"A\"}");
+                });
+            }
+
+            async Task TaskB()
+            {
+                // Wait until A is definitely inside its UsingAsync block.
+                await enterUsing.Task;
+                try
+                {
+                    // Sibling task — must NOT see A's scope. This call must
+                    // route to spyDefault. If UsingAsync used instance state,
+                    // this would route to spyScoped and the assertions below
+                    // on spyScoped.Commands / spyDefault.Commands would flip.
+                    await gl.DocInsertAsync("sibling_events", "{\"from\":\"B\"}");
+                }
+                finally
+                {
+                    // Always release A — even on failure — so the test can
+                    // complete and the WhenAll won't hang indefinitely.
+                    bFinished.SetResult();
+                }
+            }
+
+            await Task.WhenAll(TaskA(), TaskB());
+
+            // B's insert landed on spyDefault — scope did NOT leak.
+            Assert.Contains(spyDefault.Commands,
+                c => c.CommandText.Contains("INSERT INTO sibling_events"));
+            Assert.DoesNotContain(spyScoped.Commands,
+                c => c.CommandText.Contains("INSERT INTO sibling_events"));
+
+            // A's insert (issued while still inside UsingAsync) landed on spyScoped —
+            // scope held on A's own async flow across the TCS await.
+            Assert.Contains(spyScoped.Commands,
+                c => c.CommandText.Contains("INSERT INTO scoped_events"));
+            Assert.DoesNotContain(spyDefault.Commands,
+                c => c.CommandText.Contains("INSERT INTO scoped_events"));
+        }
     }
 
     // ── v0.2.0 — ResolveActive fail-fast ──────────────────────────
