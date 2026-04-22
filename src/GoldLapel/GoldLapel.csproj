@@ -10,10 +10,16 @@
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageProjectUrl>https://goldlapel.com</PackageProjectUrl>
     <RepositoryUrl>https://github.com/goldlapel/goldlapel-dotnet</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
     <PackageTags>postgres;postgresql;proxy;optimization;database</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
     <RootNamespace>GoldLapel</RootNamespace>
     <AssemblyName>GoldLapel</AssemblyName>
   </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" Visible="false" />
+  </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="Npgsql" Version="6.0.11" />
