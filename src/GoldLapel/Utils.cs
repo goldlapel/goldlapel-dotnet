@@ -2466,7 +2466,13 @@ namespace GoldLapel
             return string.Join(", ", parts);
         }
 
-        private static readonly Regex IdentifierPattern = new Regex(@"^[a-zA-Z_][a-zA-Z0-9_]*$");
+        // IdentifierPattern is bound to 63 chars (Postgres NAMEDATALEN-1) so
+        // identifiers match the proxy's server-side regex exactly:
+        // ^[A-Za-z_][A-Za-z0-9_]{0,62}$.
+        //
+        // FieldPartPattern validates JSONB field-path parts which are not
+        // Postgres identifiers (they're JSON keys), so no length cap applies.
+        private static readonly Regex IdentifierPattern = new Regex(@"^[a-zA-Z_][a-zA-Z0-9_]{0,62}$");
         private static readonly Regex FieldPartPattern = new Regex(@"^[a-zA-Z_][a-zA-Z0-9_]*$");
 
         private static readonly Dictionary<string, string> ComparisonOps = new Dictionary<string, string>
