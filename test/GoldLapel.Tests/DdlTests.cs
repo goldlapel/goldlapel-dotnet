@@ -75,6 +75,44 @@ namespace GoldLapel.Tests
         }
 
         [Fact]
+        public async Task FetchAsync_DifferentOwners_Isolated()
+        {
+            Queue(200, "{\"tables\":{\"main\":\"_goldlapel.stream_events\"},\"query_patterns\":{\"insert\":\"X\"}}");
+            Queue(200, "{\"tables\":{\"main\":\"_goldlapel.stream_events\"},\"query_patterns\":{\"insert\":\"X\"}}");
+            var cacheA = new ConcurrentDictionary<string, DdlEntry>();
+            var cacheB = new ConcurrentDictionary<string, DdlEntry>();
+            await Ddl.FetchAsync(cacheA, "stream", "events", 9999, "tok");
+            await Ddl.FetchAsync(cacheB, "stream", "events", 9999, "tok");
+            Assert.Equal(2, _captured.Count);
+        }
+
+        [Fact]
+        public async Task FetchAsync_DifferentNames_MissCache()
+        {
+            Queue(200, "{\"tables\":{\"main\":\"_goldlapel.stream_events\"},\"query_patterns\":{\"insert\":\"INSERT events\"}}");
+            Queue(200, "{\"tables\":{\"main\":\"_goldlapel.stream_orders\"},\"query_patterns\":{\"insert\":\"INSERT orders\"}}");
+            var cache = new ConcurrentDictionary<string, DdlEntry>();
+            await Ddl.FetchAsync(cache, "stream", "events", 9999, "tok");
+            await Ddl.FetchAsync(cache, "stream", "orders", 9999, "tok");
+            Assert.Equal(2, _captured.Count);
+        }
+
+        [Fact]
+        public async Task FetchAsync_Invalidate_DropsCache()
+        {
+            Queue(200, "{\"tables\":{\"main\":\"_goldlapel.stream_events\"},\"query_patterns\":{\"insert\":\"X\"}}");
+            Queue(200, "{\"tables\":{\"main\":\"_goldlapel.stream_events\"},\"query_patterns\":{\"insert\":\"X\"}}");
+            var cache = new ConcurrentDictionary<string, DdlEntry>();
+            await Ddl.FetchAsync(cache, "stream", "events", 9999, "tok");
+            // Dispose()/DisposeAsync() on GoldLapel clears the cache via
+            // _ddlCache.Clear(); simulate that directly so we don't need a
+            // running proxy.
+            cache.Clear();
+            await Ddl.FetchAsync(cache, "stream", "events", 9999, "tok");
+            Assert.Equal(2, _captured.Count);
+        }
+
+        [Fact]
         public async Task FetchAsync_VersionMismatch_ActionableError()
         {
             Queue(409,
