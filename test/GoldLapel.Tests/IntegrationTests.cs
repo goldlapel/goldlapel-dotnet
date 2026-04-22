@@ -9,25 +9,30 @@ using GoldLapel;
 namespace GoldLapel.Tests
 {
     // Integration tests — spawn the real Rust binary against a live Postgres.
-    // The upstream URL is read from GOLDLAPEL_TEST_UPSTREAM (matches goldlapel-go)
-    // with a sensible fallback for stock-Postgres dev setups. Each test picks a
-    // unique port so they can run in parallel (xUnit runs Facts in different
-    // classes concurrently by default). Set GOLDLAPEL_BINARY=/path/to/goldlapel
-    // to override discovery.
     //
-    // Tests skip gracefully if the binary is not available, but we want a real
-    // end-to-end check of StartAsync / await using / UsingAsync / connection:
-    // under the new v0.2.0 API.
+    // Gated on the standardized Gold Lapel integration-test convention
+    // shared across all 7 wrapper repos: GOLDLAPEL_INTEGRATION=1 +
+    // GOLDLAPEL_TEST_UPSTREAM must both be set. If GOLDLAPEL_INTEGRATION=1
+    // is set but the upstream is missing, IntegrationGate.Upstream() throws
+    // loudly — preventing a half-configured CI from silently skipping.
+    // See IntegrationGate.cs.
+    //
+    // Also set GOLDLAPEL_BINARY=/path/to/goldlapel to override discovery.
+    // Each test picks a unique port so they can run in parallel (xUnit runs
+    // Facts in different classes concurrently by default).
 
     [Collection("EnvVarTests")]
     public class IntegrationTests
     {
-        private static readonly string Upstream =
-            Environment.GetEnvironmentVariable("GOLDLAPEL_TEST_UPSTREAM")
-            ?? "postgresql://postgres:postgres@localhost/postgres";
+        // Upstream is non-empty iff the integration gate allows these tests
+        // to run. When the gate is closed (opt-in flag not set), Upstream is
+        // an empty string and CanRunIntegration() returns false, so every
+        // [Fact] exits early without touching the URL.
+        private static readonly string Upstream = IntegrationGate.Upstream() ?? string.Empty;
 
         private static bool CanRunIntegration()
         {
+            if (string.IsNullOrEmpty(Upstream)) return false;
             try { GL.FindBinary(); return true; }
             catch { return false; }
         }

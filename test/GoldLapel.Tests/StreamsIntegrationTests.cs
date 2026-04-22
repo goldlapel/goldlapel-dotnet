@@ -16,19 +16,18 @@ namespace GoldLapel.Tests
     [Collection("EnvVarTests")]
     public class StreamsIntegrationTests
     {
-        private static readonly string Upstream =
-            Environment.GetEnvironmentVariable("GOLDLAPEL_TEST_UPSTREAM")
-            ?? "postgresql://postgres:postgres@localhost/postgres";
+        // Gated on the standardized Gold Lapel integration-test convention
+        // (GOLDLAPEL_INTEGRATION=1 + GOLDLAPEL_TEST_UPSTREAM) — see
+        // IntegrationGate.cs. Upstream is empty iff the gate is closed, which
+        // makes CanRunIntegration() return false (every [Fact] exits early).
+        private static readonly string Upstream = IntegrationGate.Upstream() ?? string.Empty;
 
         private static bool CanRunIntegration()
         {
-            // Require explicit GOLDLAPEL_TEST_UPSTREAM + GOLDLAPEL_BINARY to
-            // run — skip if either is absent (keeps `dotnet test` on a clean
-            // dev box / CI without postgres hermetic).
-            if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("GOLDLAPEL_TEST_UPSTREAM")))
-                return false;
-            if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("GOLDLAPEL_BINARY")))
-                return false;
+            if (string.IsNullOrEmpty(Upstream)) return false;
+            // GOLDLAPEL_BINARY is the canonical way to pin the binary; fall
+            // back to FindBinary() if it isn't set (e.g. dev machine with the
+            // binary on PATH).
             try { GL.FindBinary(); return true; }
             catch { return false; }
         }
