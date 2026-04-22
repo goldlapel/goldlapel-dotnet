@@ -3298,15 +3298,17 @@ namespace GoldLapel
                 cmd.ExecuteNonQuery();
             }
 
+            // CREATE OR REPLACE TRIGGER (Postgres 14+) is atomic — no
+            // window where the trigger is missing, and a redefinition
+            // cleanly replaces the old one instead of being silently
+            // swallowed by `EXCEPTION WHEN duplicate_object`. GL targets
+            // PG14+, so this is safe and matches the Go wrapper.
             using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText =
-                    "DO $$ BEGIN " +
-                    "CREATE TRIGGER " + triggerName +
+                    "CREATE OR REPLACE TRIGGER " + triggerName +
                     " AFTER INSERT OR UPDATE OR DELETE ON " + collection +
-                    " FOR EACH ROW EXECUTE FUNCTION " + funcName + "(); " +
-                    "EXCEPTION WHEN duplicate_object THEN NULL; " +
-                    "END $$";
+                    " FOR EACH ROW EXECUTE FUNCTION " + funcName + "()";
                 cmd.ExecuteNonQuery();
             }
 
@@ -3383,15 +3385,14 @@ namespace GoldLapel
                 cmd.ExecuteNonQuery();
             }
 
+            // CREATE OR REPLACE TRIGGER (Postgres 14+): atomic and
+            // redefinable. See DocWatch for rationale.
             using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText =
-                    "DO $$ BEGIN " +
-                    "CREATE TRIGGER " + funcName + "_trigger" +
+                    "CREATE OR REPLACE TRIGGER " + funcName + "_trigger" +
                     " BEFORE INSERT ON " + collection +
-                    " FOR EACH STATEMENT EXECUTE FUNCTION " + funcName + "(); " +
-                    "EXCEPTION WHEN duplicate_object THEN NULL; " +
-                    "END $$";
+                    " FOR EACH STATEMENT EXECUTE FUNCTION " + funcName + "()";
                 cmd.ExecuteNonQuery();
             }
         }
@@ -3465,15 +3466,14 @@ namespace GoldLapel
                 cmd.ExecuteNonQuery();
             }
 
+            // CREATE OR REPLACE TRIGGER (Postgres 14+): atomic and
+            // redefinable. See DocWatch for rationale.
             using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText =
-                    "DO $$ BEGIN " +
-                    "CREATE TRIGGER " + funcName + "_trigger" +
+                    "CREATE OR REPLACE TRIGGER " + funcName + "_trigger" +
                     " AFTER INSERT ON " + collection +
-                    " FOR EACH STATEMENT EXECUTE FUNCTION " + funcName + "(); " +
-                    "EXCEPTION WHEN duplicate_object THEN NULL; " +
-                    "END $$";
+                    " FOR EACH STATEMENT EXECUTE FUNCTION " + funcName + "()";
                 cmd.ExecuteNonQuery();
             }
         }
