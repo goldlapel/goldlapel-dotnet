@@ -65,10 +65,11 @@ namespace GoldLapel
         }
 
         /// <summary>
-        /// Swappable HTTP layer — tests replace this with a counting/faking
-        /// implementation.
+        /// Swappable HTTP layer — test-only seam the unit tests replace with
+        /// a counting/faking implementation. Exposed via InternalsVisibleTo
+        /// on GoldLapel.Tests so it is not part of the public API surface.
         /// </summary>
-        public static Func<string, string, byte[], CancellationToken, Task<(int status, string body)>> PostAsync =
+        internal static Func<string, string, byte[], CancellationToken, Task<(int status, string body)>> PostAsync =
             DefaultPostAsync;
 
         private static readonly HttpClient _http = new HttpClient { Timeout = TimeSpan.FromSeconds(10) };
