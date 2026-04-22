@@ -22,6 +22,39 @@ namespace GoldLapel.Tests
             field.SetValue(gl, spy);
             return gl;
         }
+
+        /// <summary>
+        /// Pre-populate the instance's DDL cache with canonical stream patterns
+        /// so stream* methods can run without hitting the dashboard.
+        /// </summary>
+        public static void InjectStreamPatterns(GL gl, string name)
+        {
+            var tbl = "_goldlapel.stream_" + name;
+            var entry = new DdlEntry
+            {
+                Tables = new Dictionary<string, string>
+                {
+                    ["main"] = tbl,
+                    ["groups"] = tbl + "_groups",
+                    ["pending"] = tbl + "_pending",
+                },
+                QueryPatterns = new Dictionary<string, string>
+                {
+                    ["insert"] = "INSERT INTO " + tbl + " (payload) VALUES ($1) RETURNING id, created_at",
+                    ["read_since"] = "SELECT id, payload, created_at FROM " + tbl + " WHERE id > $1 ORDER BY id LIMIT $2",
+                    ["read_by_id"] = "SELECT id, payload, created_at FROM " + tbl + " WHERE id = $1",
+                    ["group_get_cursor"] = "SELECT last_delivered_id FROM " + tbl + "_groups WHERE group_name = $1 FOR UPDATE",
+                    ["group_advance_cursor"] = "UPDATE " + tbl + "_groups SET last_delivered_id = $1 WHERE group_name = $2",
+                    ["pending_insert"] = "INSERT INTO " + tbl + "_pending (message_id, group_name, consumer) VALUES ($1, $2, $3) ON CONFLICT (group_name, message_id) DO NOTHING",
+                    ["create_group"] = "INSERT INTO " + tbl + "_groups (group_name) VALUES ($1) ON CONFLICT DO NOTHING",
+                    ["ack"] = "DELETE FROM " + tbl + "_pending WHERE group_name = $1 AND message_id = $2",
+                    ["claim"] = "UPDATE " + tbl + "_pending SET consumer = $1, claimed_at = NOW(), delivery_count = delivery_count + 1 WHERE group_name = $2 AND claimed_at < NOW() - INTERVAL '1 millisecond' * $3 RETURNING message_id",
+                },
+            };
+            var cacheField = typeof(GL).GetField("_ddlCache", BindingFlags.NonPublic | BindingFlags.Instance);
+            var cache = (System.Collections.Concurrent.ConcurrentDictionary<string, DdlEntry>) cacheField.GetValue(gl);
+            cache["stream:" + name] = entry;
+        }
     }
 
     // ── Instance method delegation ───────────────────────────
@@ -484,44 +517,59 @@ namespace GoldLapel.Tests
         [Fact]
         public async Task StreamAddAsyncDelegates()
         {
-            _spy.NextScalarResult = 1L;
+            TestHelpers.InjectStreamPatterns(_gl, "events");
+            // StreamAdd now reads (id, created_at) from a DataReader — the
+            // canonical RETURNING pattern. Queue a 1-row reader on the spy.
+            _spy.NextReaderFactory = () => new FakeDataReader(
+                new object[][] { new object[] { 1L, DateTime.UtcNow } },
+                new[] { "id", "created_at" }
+            );
             var id = await _gl.StreamAddAsync("events", "{\"type\":\"click\"}");
 
             Assert.Equal(1L, id);
-            Assert.Contains("INSERT INTO events", _spy.LastCommandText);
+            Assert.Contains("INSERT INTO _goldlapel.stream_events", _spy.LastCommandText);
+            // No in-wrapper CREATE TABLE — proxy owns DDL.
+            Assert.DoesNotContain("CREATE TABLE", _spy.LastCommandText);
         }
 
         [Fact]
         public async Task StreamCreateGroupAsyncDelegates()
         {
+            TestHelpers.InjectStreamPatterns(_gl, "events");
             await _gl.StreamCreateGroupAsync("events", "workers");
 
-            Assert.Contains("events_groups", _spy.Commands[0].CommandText);
-            Assert.Contains("events_cursors", _spy.Commands[1].CommandText);
+            // Only one statement should run (the INSERT into groups); the
+            // CREATE TABLEs that used to live here are now proxy-side.
+            Assert.Single(_spy.Commands);
+            Assert.Contains("INSERT INTO _goldlapel.stream_events_groups", _spy.Commands[0].CommandText);
         }
 
         [Fact]
         public async Task StreamReadAsyncDelegates()
         {
+            TestHelpers.InjectStreamPatterns(_gl, "events");
+            // cursor lookup returns no row → streamRead returns early.
             await _gl.StreamReadAsync("events", "workers", "w1");
 
-            Assert.Contains("SELECT id, payload, created_at FROM new_msgs", _spy.LastCommandText);
+            Assert.Contains("last_delivered_id FROM _goldlapel.stream_events_groups", _spy.LastCommandText);
         }
 
         [Fact]
         public async Task StreamAckAsyncDelegates()
         {
+            TestHelpers.InjectStreamPatterns(_gl, "events");
             await _gl.StreamAckAsync("events", "workers", 1);
 
-            Assert.Contains("acked = TRUE", _spy.LastCommandText);
+            Assert.Contains("DELETE FROM _goldlapel.stream_events_pending", _spy.LastCommandText);
         }
 
         [Fact]
         public async Task StreamClaimAsyncDelegates()
         {
+            TestHelpers.InjectStreamPatterns(_gl, "events");
             await _gl.StreamClaimAsync("events", "workers", "w2");
 
-            Assert.Contains("claimed_at = NOW()", _spy.LastCommandText);
+            Assert.Contains("delivery_count + 1", _spy.LastCommandText);
         }
     }
 

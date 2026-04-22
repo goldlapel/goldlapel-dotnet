@@ -113,6 +113,10 @@ namespace GoldLapel
         private string _proxyUrl;
         private bool _disposed;
         private NpgsqlConnection _conn;  // eagerly opened internal connection
+        // Dashboard token + DDL cache — see Ddl.cs.
+        internal string _dashboardToken;
+        internal readonly System.Collections.Concurrent.ConcurrentDictionary<string, DdlEntry> _ddlCache
+            = new System.Collections.Concurrent.ConcurrentDictionary<string, DdlEntry>();
 
         // Test-only factory: returns an instance with config/port state but without
         // spawning the binary or opening a connection. Unit tests inject a
@@ -232,6 +236,20 @@ namespace GoldLapel
                 : null;
 
         /// <summary>
+        /// Dashboard port (always proxy port + 1 unless overridden via
+        /// Config["dashboardPort"]). Used by the DDL API client to POST to
+        /// <c>/api/ddl/stream/create</c> and friends.
+        /// </summary>
+        public int DashboardPort => _dashboardPort;
+
+        /// <summary>
+        /// Dashboard token this instance provisioned for the proxy subprocess.
+        /// Returns null when the proxy was launched externally — in that case
+        /// <see cref="Ddl.TokenFromEnvOrFile"/> falls back to env / file.
+        /// </summary>
+        public string DashboardToken => _dashboardToken;
+
+        /// <summary>
         /// The internal connection opened by <see cref="StartAsync"/>. Wrapper methods use
         /// this by default; user code typically opens its own <see cref="NpgsqlConnection"/>
         /// against <see cref="Url"/> for raw SQL.
@@ -295,6 +313,11 @@ namespace GoldLapel
             if (_disposed) return;
             _disposed = true;
 
+            // Drop cached DDL patterns — they're tied to the proxy we're
+            // about to terminate.
+            _ddlCache.Clear();
+            _dashboardToken = null;
+
             if (_conn != null)
             {
                 try { await _conn.CloseAsync().ConfigureAwait(false); } catch { }
@@ -308,6 +331,9 @@ namespace GoldLapel
         {
             if (_disposed) return;
             _disposed = true;
+
+            _ddlCache.Clear();
+            _dashboardToken = null;
 
             if (_conn != null)
             {
@@ -351,6 +377,25 @@ namespace GoldLapel
             };
             if (!psi.EnvironmentVariables.ContainsKey("GOLDLAPEL_CLIENT"))
                 psi.EnvironmentVariables["GOLDLAPEL_CLIENT"] = "dotnet";
+            // Provision a session-scoped dashboard token for /api/ddl/* calls.
+            // Pre-set env wins; otherwise generate a fresh one per session.
+            string envToken = psi.EnvironmentVariables.ContainsKey("GOLDLAPEL_DASHBOARD_TOKEN")
+                ? psi.EnvironmentVariables["GOLDLAPEL_DASHBOARD_TOKEN"]
+                : null;
+            if (!string.IsNullOrEmpty(envToken))
+            {
+                _dashboardToken = envToken;
+            }
+            else
+            {
+                var buf = new byte[32];
+                using (var rng = System.Security.Cryptography.RandomNumberGenerator.Create())
+                {
+                    rng.GetBytes(buf);
+                }
+                _dashboardToken = BitConverter.ToString(buf).Replace("-", "").ToLowerInvariant();
+                psi.EnvironmentVariables["GOLDLAPEL_DASHBOARD_TOKEN"] = _dashboardToken;
+            }
 
             try
             {
@@ -1131,27 +1176,48 @@ namespace GoldLapel
         public Task<string> ScriptAsync(string luaCode, string[] args = null, NpgsqlConnection connection = null)
             => Task.FromResult(Utils.Script(ResolveActive(connection), luaCode, args ?? Array.Empty<string>()));
 
-        // Streams
-        public Task<long> StreamAddAsync(string stream, string payload, NpgsqlConnection connection = null)
-            => Task.FromResult(Utils.StreamAdd(ResolveActive(connection), stream, payload));
+        // Streams — proxy-owned DDL. First call per (family, name) fetches
+        // canonical query patterns from /api/ddl/stream/create; subsequent
+        // calls reuse the ConcurrentDictionary cache on this instance.
 
-        public Task StreamCreateGroupAsync(string stream, string group, NpgsqlConnection connection = null)
+        private async Task<DdlEntry> StreamPatternsAsync(string stream)
         {
-            Utils.StreamCreateGroup(ResolveActive(connection), stream, group);
-            return Task.CompletedTask;
+            var token = _dashboardToken ?? Ddl.TokenFromEnvOrFile();
+            return await Ddl.FetchAsync(_ddlCache, "stream", stream, _dashboardPort, token).ConfigureAwait(false);
         }
 
-        public Task<List<Dictionary<string, object>>> StreamReadAsync(string stream,
+        public async Task<long> StreamAddAsync(string stream, string payload, NpgsqlConnection connection = null)
+        {
+            var patterns = await StreamPatternsAsync(stream).ConfigureAwait(false);
+            return Utils.StreamAdd(ResolveActive(connection), stream, payload, patterns);
+        }
+
+        public async Task StreamCreateGroupAsync(string stream, string group, NpgsqlConnection connection = null)
+        {
+            var patterns = await StreamPatternsAsync(stream).ConfigureAwait(false);
+            Utils.StreamCreateGroup(ResolveActive(connection), stream, group, patterns);
+        }
+
+        public async Task<List<Dictionary<string, object>>> StreamReadAsync(string stream,
             string group, string consumer, int count = 1, NpgsqlConnection connection = null)
-            => Task.FromResult(Utils.StreamRead(ResolveActive(connection), stream, group, consumer, count));
+        {
+            var patterns = await StreamPatternsAsync(stream).ConfigureAwait(false);
+            return Utils.StreamRead(ResolveActive(connection), stream, group, consumer, count, patterns);
+        }
 
-        public Task<bool> StreamAckAsync(string stream, string group, long messageId,
+        public async Task<bool> StreamAckAsync(string stream, string group, long messageId,
             NpgsqlConnection connection = null)
-            => Task.FromResult(Utils.StreamAck(ResolveActive(connection), stream, group, messageId));
+        {
+            var patterns = await StreamPatternsAsync(stream).ConfigureAwait(false);
+            return Utils.StreamAck(ResolveActive(connection), stream, group, messageId, patterns);
+        }
 
-        public Task<List<Dictionary<string, object>>> StreamClaimAsync(string stream,
+        public async Task<List<Dictionary<string, object>>> StreamClaimAsync(string stream,
             string group, string consumer, long minIdleMs = 60000, NpgsqlConnection connection = null)
-            => Task.FromResult(Utils.StreamClaim(ResolveActive(connection), stream, group, consumer, minIdleMs));
+        {
+            var patterns = await StreamPatternsAsync(stream).ConfigureAwait(false);
+            return Utils.StreamClaim(ResolveActive(connection), stream, group, consumer, minIdleMs, patterns);
+        }
 
         // Percolate
         public Task PercolateAddAsync(string name, string queryId, string query,

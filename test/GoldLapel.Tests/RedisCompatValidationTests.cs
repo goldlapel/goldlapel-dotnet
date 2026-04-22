@@ -83,19 +83,21 @@ namespace GoldLapel.Tests
         [Fact] public void GeodistRejectsBadTable()
             => Assert.Throws<ArgumentException>(() => Utils.Geodist(new SpyConnection(), Bad, "geom", "name", "a", "b"));
 
+        // Stream validation runs before the DDL pattern check, so a null
+        // DdlEntry is fine here — the ArgumentException fires first.
         [Fact] public void StreamAddRejectsBad()
-            => Assert.Throws<ArgumentException>(() => Utils.StreamAdd(new SpyConnection(), Bad, "{}"));
+            => Assert.Throws<ArgumentException>(() => Utils.StreamAdd(new SpyConnection(), Bad, "{}", null));
 
         [Fact] public void StreamCreateGroupRejectsBad()
-            => Assert.Throws<ArgumentException>(() => Utils.StreamCreateGroup(new SpyConnection(), Bad, "g"));
+            => Assert.Throws<ArgumentException>(() => Utils.StreamCreateGroup(new SpyConnection(), Bad, "g", null));
 
         [Fact] public void StreamReadRejectsBad()
-            => Assert.Throws<ArgumentException>(() => Utils.StreamRead(new SpyConnection(), Bad, "g", "c"));
+            => Assert.Throws<ArgumentException>(() => Utils.StreamRead(new SpyConnection(), Bad, "g", "c", 1, null));
 
         [Fact] public void StreamAckRejectsBad()
-            => Assert.Throws<ArgumentException>(() => Utils.StreamAck(new SpyConnection(), Bad, "g", 1L));
+            => Assert.Throws<ArgumentException>(() => Utils.StreamAck(new SpyConnection(), Bad, "g", 1L, null));
 
         [Fact] public void StreamClaimRejectsBad()
-            => Assert.Throws<ArgumentException>(() => Utils.StreamClaim(new SpyConnection(), Bad, "g", "c"));
+            => Assert.Throws<ArgumentException>(() => Utils.StreamClaim(new SpyConnection(), Bad, "g", "c", 60000L, null));
     }
 }

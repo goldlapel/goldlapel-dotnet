@@ -589,153 +589,174 @@ namespace GoldLapel
             }
         }
 
-        public static long StreamAdd(DbConnection conn, string stream, string payload)
+        private static string RequireStreamPattern(DdlEntry patterns, string key, string fn)
+        {
+            if (patterns == null || patterns.QueryPatterns == null)
+                throw new InvalidOperationException(
+                    fn + " requires DDL patterns from the proxy — call via "
+                    + "gl." + fn + "(...) rather than Utils." + fn + " directly.");
+            if (!patterns.QueryPatterns.TryGetValue(key, out var sql))
+                throw new InvalidOperationException(
+                    "DDL API response missing pattern '" + key + "' for " + fn);
+            return sql;
+        }
+
+        /// <summary>
+        /// Bind an ordered args list to a command whose SQL uses @p1, @p2, ...
+        /// placeholders (see <see cref="Ddl.ToNpgsqlPlaceholders"/>).
+        /// </summary>
+        private static void BindNumbered(DbCommand cmd, params object[] args)
+        {
+            for (int i = 0; i < args.Length; i++)
+                AddParameter(cmd, "@p" + (i + 1), args[i]);
+        }
+
+        public static long StreamAdd(DbConnection conn, string stream, string payload, DdlEntry patterns)
         {
             ValidateIdentifier(stream);
+            var rawSql = RequireStreamPattern(patterns, "insert", "StreamAdd");
+            var (sql, _) = Ddl.ToNpgsqlPlaceholders(rawSql);
+            // JSONB binding: cast @p1 to jsonb at SQL site.
+            sql = sql.Replace("VALUES (@p1)", "VALUES (@p1::jsonb)");
             using (var cmd = conn.CreateCommand())
             {
-                cmd.CommandText =
-                    "CREATE TABLE IF NOT EXISTS " + stream + " (" +
-                    "id BIGSERIAL PRIMARY KEY, " +
-                    "payload JSONB NOT NULL, " +
-                    "created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())";
-                cmd.ExecuteNonQuery();
-            }
-
-            using (var cmd = conn.CreateCommand())
-            {
-                cmd.CommandText = "INSERT INTO " + stream + " (payload) VALUES (@payload::jsonb) RETURNING id";
-                AddParameter(cmd, "@payload", payload);
-                return (long)cmd.ExecuteScalar();
+                cmd.CommandText = sql;
+                BindNumbered(cmd, payload);
+                // Pattern returns (id, created_at); we only need id.
+                using (var reader = cmd.ExecuteReader())
+                {
+                    reader.Read();
+                    return reader.GetInt64(0);
+                }
             }
         }
 
-        public static void StreamCreateGroup(DbConnection conn, string stream, string group)
+        public static void StreamCreateGroup(DbConnection conn, string stream, string group, DdlEntry patterns)
         {
             ValidateIdentifier(stream);
+            var rawSql = RequireStreamPattern(patterns, "create_group", "StreamCreateGroup");
+            var (sql, _) = Ddl.ToNpgsqlPlaceholders(rawSql);
             using (var cmd = conn.CreateCommand())
             {
-                cmd.CommandText =
-                    "CREATE TABLE IF NOT EXISTS " + stream + "_groups (" +
-                    "group_name TEXT NOT NULL, " +
-                    "consumer TEXT NOT NULL DEFAULT '', " +
-                    "message_id BIGINT NOT NULL, " +
-                    "acked BOOLEAN NOT NULL DEFAULT FALSE, " +
-                    "claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), " +
-                    "PRIMARY KEY (group_name, message_id))";
-                cmd.ExecuteNonQuery();
-            }
-
-            using (var cmd = conn.CreateCommand())
-            {
-                cmd.CommandText =
-                    "CREATE TABLE IF NOT EXISTS " + stream + "_cursors (" +
-                    "group_name TEXT PRIMARY KEY, " +
-                    "last_id BIGINT NOT NULL DEFAULT 0)";
-                cmd.ExecuteNonQuery();
-            }
-
-            using (var cmd = conn.CreateCommand())
-            {
-                cmd.CommandText =
-                    "INSERT INTO " + stream + "_cursors (group_name, last_id) VALUES (@group, 0) " +
-                    "ON CONFLICT (group_name) DO NOTHING";
-                AddParameter(cmd, "@group", group);
+                cmd.CommandText = sql;
+                BindNumbered(cmd, group);
                 cmd.ExecuteNonQuery();
             }
         }
 
         public static List<Dictionary<string, object>> StreamRead(DbConnection conn, string stream,
-            string group, string consumer, int count = 1)
+            string group, string consumer, int count, DdlEntry patterns)
         {
             ValidateIdentifier(stream);
+            var cursorSql = Ddl.ToNpgsqlPlaceholders(RequireStreamPattern(patterns, "group_get_cursor", "StreamRead")).Sql;
+            var readSql = Ddl.ToNpgsqlPlaceholders(RequireStreamPattern(patterns, "read_since", "StreamRead")).Sql;
+            var advanceSql = Ddl.ToNpgsqlPlaceholders(RequireStreamPattern(patterns, "group_advance_cursor", "StreamRead")).Sql;
+            var pendingSql = Ddl.ToNpgsqlPlaceholders(RequireStreamPattern(patterns, "pending_insert", "StreamRead")).Sql;
+
+            long lastId;
             using (var cmd = conn.CreateCommand())
             {
-                cmd.CommandText =
-                    "WITH cursor AS (" +
-                    "SELECT last_id FROM " + stream + "_cursors WHERE group_name = @group1 FOR UPDATE" +
-                    "), new_msgs AS (" +
-                    "SELECT id, payload, created_at FROM " + stream +
-                    " WHERE id > (SELECT last_id FROM cursor)" +
-                    " ORDER BY id LIMIT @count" +
-                    "), updated_cursor AS (" +
-                    "UPDATE " + stream + "_cursors SET last_id = COALESCE((SELECT MAX(id) FROM new_msgs), last_id)" +
-                    " WHERE group_name = @group2" +
-                    "), inserted AS (" +
-                    "INSERT INTO " + stream + "_groups (group_name, consumer, message_id)" +
-                    " SELECT @group3, @consumer, id FROM new_msgs" +
-                    " ON CONFLICT (group_name, message_id) DO NOTHING" +
-                    ") SELECT id, payload, created_at FROM new_msgs ORDER BY id";
-                AddParameter(cmd, "@group1", group);
-                AddParameter(cmd, "@count", count);
-                AddParameter(cmd, "@group2", group);
-                AddParameter(cmd, "@group3", group);
-                AddParameter(cmd, "@consumer", consumer);
+                cmd.CommandText = cursorSql;
+                BindNumbered(cmd, group);
+                var obj = cmd.ExecuteScalar();
+                if (obj == null || obj == DBNull.Value) return new List<Dictionary<string, object>>();
+                lastId = Convert.ToInt64(obj);
+            }
 
-                var results = new List<Dictionary<string, object>>();
+            var messages = new List<Dictionary<string, object>>();
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = readSql;
+                BindNumbered(cmd, lastId, count);
                 using (var reader = cmd.ExecuteReader())
                 {
                     while (reader.Read())
                     {
                         var row = new Dictionary<string, object>();
                         for (int i = 0; i < reader.FieldCount; i++)
-                        {
                             row[reader.GetName(i)] = reader.IsDBNull(i) ? null : reader.GetValue(i);
-                        }
-                        results.Add(row);
+                        messages.Add(row);
                     }
                 }
-                return results;
             }
+
+            if (messages.Count > 0)
+            {
+                long maxId = 0;
+                foreach (var m in messages)
+                {
+                    var id = Convert.ToInt64(m["id"]);
+                    if (id > maxId) maxId = id;
+                }
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.CommandText = advanceSql;
+                    BindNumbered(cmd, maxId, group);
+                    cmd.ExecuteNonQuery();
+                }
+                foreach (var m in messages)
+                {
+                    using (var cmd = conn.CreateCommand())
+                    {
+                        cmd.CommandText = pendingSql;
+                        BindNumbered(cmd, Convert.ToInt64(m["id"]), group, consumer);
+                        cmd.ExecuteNonQuery();
+                    }
+                }
+            }
+            return messages;
         }
 
-        public static bool StreamAck(DbConnection conn, string stream, string group, long messageId)
+        public static bool StreamAck(DbConnection conn, string stream, string group, long messageId, DdlEntry patterns)
         {
             ValidateIdentifier(stream);
+            var sql = Ddl.ToNpgsqlPlaceholders(RequireStreamPattern(patterns, "ack", "StreamAck")).Sql;
             using (var cmd = conn.CreateCommand())
             {
-                cmd.CommandText =
-                    "UPDATE " + stream + "_groups SET acked = TRUE " +
-                    "WHERE group_name = @group AND message_id = @messageId AND acked = FALSE";
-                AddParameter(cmd, "@group", group);
-                AddParameter(cmd, "@messageId", messageId);
+                cmd.CommandText = sql;
+                BindNumbered(cmd, group, messageId);
                 return cmd.ExecuteNonQuery() > 0;
             }
         }
 
         public static List<Dictionary<string, object>> StreamClaim(DbConnection conn, string stream,
-            string group, string consumer, long minIdleMs = 60000)
+            string group, string consumer, long minIdleMs, DdlEntry patterns)
         {
             ValidateIdentifier(stream);
+            var claimSql = Ddl.ToNpgsqlPlaceholders(RequireStreamPattern(patterns, "claim", "StreamClaim")).Sql;
+            var readByIdSql = Ddl.ToNpgsqlPlaceholders(RequireStreamPattern(patterns, "read_by_id", "StreamClaim")).Sql;
+
+            var ids = new List<long>();
             using (var cmd = conn.CreateCommand())
             {
-                cmd.CommandText =
-                    "WITH claimed AS (" +
-                    "UPDATE " + stream + "_groups SET consumer = @consumer, claimed_at = NOW()" +
-                    " WHERE group_name = @group AND acked = FALSE" +
-                    " AND claimed_at < NOW() - (@minIdleMs || ' milliseconds')::interval" +
-                    " RETURNING message_id" +
-                    ") SELECT s.id, s.payload, s.created_at FROM " + stream + " s" +
-                    " INNER JOIN claimed c ON c.message_id = s.id ORDER BY s.id";
-                AddParameter(cmd, "@consumer", consumer);
-                AddParameter(cmd, "@group", group);
-                AddParameter(cmd, "@minIdleMs", minIdleMs.ToString());
-
-                var results = new List<Dictionary<string, object>>();
+                cmd.CommandText = claimSql;
+                BindNumbered(cmd, consumer, group, minIdleMs);
                 using (var reader = cmd.ExecuteReader())
                 {
-                    while (reader.Read())
+                    while (reader.Read()) ids.Add(reader.GetInt64(0));
+                }
+            }
+
+            var messages = new List<Dictionary<string, object>>();
+            foreach (var id in ids)
+            {
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.CommandText = readByIdSql;
+                    BindNumbered(cmd, id);
+                    using (var reader = cmd.ExecuteReader())
                     {
-                        var row = new Dictionary<string, object>();
-                        for (int i = 0; i < reader.FieldCount; i++)
+                        if (reader.Read())
                         {
-                            row[reader.GetName(i)] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+                            var row = new Dictionary<string, object>();
+                            for (int i = 0; i < reader.FieldCount; i++)
+                                row[reader.GetName(i)] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+                            messages.Add(row);
                         }
-                        results.Add(row);
                     }
                 }
-                return results;
             }
+            return messages;
         }
 
         public static List<Dictionary<string, object>> Search(DbConnection conn, string table,
