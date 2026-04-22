@@ -3,7 +3,7 @@
   <PropertyGroup>
     <TargetFramework>netstandard2.0</TargetFramework>
     <LangVersion>8.0</LangVersion>
-    <Version>0.2.0</Version>
+    <Version>0.0.0</Version>
     <PackageId>GoldLapel</PackageId>
     <Authors>Gold Lapel</Authors>
     <Description>Self-optimizing Postgres proxy — start the proxy, get a connection URL, speed up your queries automatically.</Description>
