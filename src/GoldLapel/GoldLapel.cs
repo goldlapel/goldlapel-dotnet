@@ -18,21 +18,51 @@ namespace GoldLapel
     /// Construction-time options for <see cref="GoldLapel.StartAsync(string, Action{GoldLapelOptions})"/>.
     /// Populated via a configurator lambda:
     /// <code>
-    /// await GoldLapel.StartAsync(url, opts => { opts.Port = 7932; opts.LogLevel = "info"; });
+    /// await GoldLapel.StartAsync(url, opts => { opts.ProxyPort = 7932; opts.LogLevel = "info"; });
     /// </code>
     /// </summary>
     public class GoldLapelOptions
     {
         /// <summary>Proxy listen port (default: 7932).</summary>
-        public int Port { get; set; } = GoldLapel.DefaultPort;
+        public int ProxyPort { get; set; } = GoldLapel.DefaultProxyPort;
+
+        /// <summary>
+        /// Dashboard listen port. When null (default), the port is derived as
+        /// <see cref="ProxyPort"/> + 1. Set to 0 to disable the dashboard entirely.
+        /// </summary>
+        public int? DashboardPort { get; set; }
+
+        /// <summary>
+        /// Cache-invalidation listen port. When null (default), the port is derived
+        /// as <see cref="ProxyPort"/> + 2.
+        /// </summary>
+        public int? InvalidationPort { get; set; }
 
         /// <summary>
         /// Log level for the proxy. Accepted values: <c>"trace"</c>, <c>"debug"</c>,
         /// <c>"info"</c>, <c>"warn"</c>, <c>"error"</c>. Only trace/debug/info produce
-        /// visible output; warn/error are the binary's default level.
-        /// Shortcut for <c>Config["logLevel"]</c>.
+        /// visible output; warn/error are the binary's default level. Translated to
+        /// <c>-v</c>/<c>-vv</c>/<c>-vvv</c> when emitting argv.
         /// </summary>
         public string LogLevel { get; set; }
+
+        /// <summary>Operating mode (e.g. <c>"waiter"</c>, <c>"bellhop"</c>). Passed as <c>--mode</c>.</summary>
+        public string Mode { get; set; }
+
+        /// <summary>License file path. Passed as <c>--license</c>.</summary>
+        public string License { get; set; }
+
+        /// <summary>
+        /// Client identifier (emitted via <c>GOLDLAPEL_CLIENT</c> env var so the proxy can
+        /// tag telemetry with the originating wrapper). Defaults to <c>"dotnet"</c> when unset.
+        /// </summary>
+        public string Client { get; set; }
+
+        /// <summary>
+        /// Config file path. Passed as <c>--config</c> so the Rust binary parses the TOML.
+        /// Distinct from <see cref="Config"/> (structured map of tuning keys).
+        /// </summary>
+        public string ConfigFile { get; set; }
 
         /// <summary>Structured config map passed as CLI flags (e.g. {"poolSize", 50}).</summary>
         public Dictionary<string, object> Config { get; set; }
@@ -56,29 +86,31 @@ namespace GoldLapel
     /// </summary>
     public class GoldLapel : IAsyncDisposable, IDisposable
     {
-        internal const int DefaultPort = 7932;
+        internal const int DefaultProxyPort = 7932;
         internal const int DefaultDashboardPort = 7933;
         internal const long StartupTimeoutMs = 10000;
         internal const long StartupPollIntervalMs = 50;
         private const int GracefulTimeoutMs = 5000;
 
+        // Keys that are valid inside the structured `Config` map. Top-level
+        // concepts (proxyPort, dashboardPort, invalidationPort, logLevel, mode,
+        // license, client, configFile) live on GoldLapelOptions directly and
+        // are NOT accepted here — passing them through Config raises.
         private static readonly HashSet<string> ValidConfigKeys = new HashSet<string>(new[]
         {
-            "mode", "minPatternCount", "refreshIntervalSecs", "patternTtlSecs",
+            "minPatternCount", "refreshIntervalSecs", "patternTtlSecs",
             "maxTablesPerView", "maxColumnsPerView", "deepPaginationThreshold",
             "reportIntervalSecs", "resultCacheSize", "batchCacheSize",
             "batchCacheTtlSecs", "poolSize", "poolTimeoutSecs",
             "poolMode", "mgmtIdleTimeout", "fallback", "readAfterWriteSecs",
             "n1Threshold", "n1WindowMs", "n1CrossThreshold",
-            "tlsCert", "tlsKey", "tlsClientCa", "config", "dashboardPort",
-            "logLevel",
+            "tlsCert", "tlsKey", "tlsClientCa",
             "disableMatviews", "disableConsolidation", "disableBtreeIndexes",
             "disableTrigramIndexes", "disableExpressionIndexes",
             "disablePartialIndexes", "disableRewrite", "disablePreparedCache",
             "disableResultCache", "disablePool",
             "disableN1", "disableN1CrossConnection", "disableShadowMode",
-            "enableCoalescing", "replica", "excludeTables",
-            "invalidationPort"
+            "enableCoalescing", "replica", "excludeTables"
         });
 
         private static readonly HashSet<string> BooleanKeys = new HashSet<string>(new[]
@@ -104,8 +136,21 @@ namespace GoldLapel
         private readonly AsyncLocal<DbConnection> _scopedConnection = new AsyncLocal<DbConnection>();
 
         private readonly string _upstream;
-        private readonly int _port;
+        private readonly int _proxyPort;
         private readonly int _dashboardPort;
+        private readonly int _invalidationPort;
+        // True only when the user passed a non-null DashboardPort/InvalidationPort.
+        // Used at spawn time to decide whether to emit the flag explicitly (vs
+        // letting the Rust binary apply its own default). Keeping this separate
+        // from the resolved port lets `DashboardPort` expose the effective
+        // value unambiguously.
+        private readonly bool _dashboardPortExplicit;
+        private readonly bool _invalidationPortExplicit;
+        private readonly string _logLevel;
+        private readonly string _mode;
+        private readonly string _license;
+        private readonly string _client;
+        private readonly string _configFile;
         private readonly string[] _extraArgs;
         private readonly Dictionary<string, object> _config;
         private readonly bool _silent;
@@ -131,18 +176,30 @@ namespace GoldLapel
         {
             if (upstream == null) throw new ArgumentNullException(nameof(upstream));
             _upstream = upstream;
-            _port = options.Port;
+            _proxyPort = options.ProxyPort;
+            _logLevel = options.LogLevel;
+            _mode = options.Mode;
+            _license = options.License;
+            _client = options.Client;
+            _configFile = options.ConfigFile;
             _extraArgs = options.ExtraArgs ?? Array.Empty<string>();
-            _config = MergeConfig(options);
+            _config = options.Config != null
+                ? new Dictionary<string, object>(options.Config)
+                : null;
+            // Validate structured-config keys eagerly so the error surfaces at
+            // construction (same behavior as ConfigToArgs previously). Leaving
+            // validation to spawn time would let unit tests that never spawn
+            // miss bad keys.
+            ValidateConfigKeys(_config);
             _silent = options.Silent;
             // Dashboard defaults to proxy port + 1 (matches what the Rust binary
-            // binds when no --dashboard-port is passed). Only when the user
-            // supplies an explicit dashboardPort via Config does that value
-            // override the derivation. This ensures Port=17932 correctly
-            // reports the dashboard at :17933 rather than the hardcoded 7933.
-            _dashboardPort = _config != null && _config.ContainsKey("dashboardPort")
-                ? Convert.ToInt32(_config["dashboardPort"])
-                : _port + 1;
+            // binds when no --dashboard-port is passed). A user-supplied value
+            // on the top-level DashboardPort option overrides the derivation.
+            // DashboardPort=0 means "disable dashboard".
+            _dashboardPortExplicit = options.DashboardPort.HasValue;
+            _dashboardPort = options.DashboardPort ?? _proxyPort + 1;
+            _invalidationPortExplicit = options.InvalidationPort.HasValue;
+            _invalidationPort = options.InvalidationPort ?? _proxyPort + 2;
         }
 
         // ── Factory ─────────────────────────────────────────────────
@@ -156,7 +213,7 @@ namespace GoldLapel
         /// <code>
         /// await using var gl = await GoldLapel.StartAsync(
         ///     "postgresql://user:pass@db/mydb",
-        ///     opts => { opts.Port = 7932; opts.LogLevel = "info"; });
+        ///     opts => { opts.ProxyPort = 7932; opts.LogLevel = "info"; });
         /// var hits = await gl.SearchAsync("articles", "body", "postgres");
         /// </code>
         /// </example>
@@ -185,20 +242,14 @@ namespace GoldLapel
             return gl;
         }
 
-        private static Dictionary<string, object> MergeConfig(GoldLapelOptions options)
+        private static void ValidateConfigKeys(Dictionary<string, object> config)
         {
-            // Merge Config dictionary + LogLevel shortcut into one map.
-            if (options.Config == null && string.IsNullOrEmpty(options.LogLevel))
-                return null;
-
-            var merged = options.Config != null
-                ? new Dictionary<string, object>(options.Config)
-                : new Dictionary<string, object>();
-
-            if (!string.IsNullOrEmpty(options.LogLevel))
-                merged["logLevel"] = options.LogLevel;
-
-            return merged;
+            if (config == null) return;
+            foreach (var key in config.Keys)
+            {
+                if (!ValidConfigKeys.Contains(key))
+                    throw new ArgumentException("Unknown config key: " + key);
+            }
         }
 
         // ── Properties ──────────────────────────────────────────────
@@ -214,7 +265,7 @@ namespace GoldLapel
         public string ProxyUrl => _proxyUrl;
 
         /// <summary>Proxy port.</summary>
-        public int Port => _port;
+        public int ProxyPort => _proxyPort;
 
         /// <summary>True while the proxy subprocess is alive.</summary>
         public bool IsRunning => _process != null && !_process.HasExited;
@@ -227,8 +278,8 @@ namespace GoldLapel
         /// <remarks>
         /// This matches the behavior of the Python, Go, Java, and PHP wrappers:
         /// no live URL is reported until the proxy process is up. If you only
-        /// need the port number at construction time, read it from your
-        /// <c>Config["dashboardPort"]</c> or derive it as <c>Port + 1</c>.
+        /// need the port number at construction time, use <see cref="DashboardPort"/>
+        /// or derive it as <c>ProxyPort + 1</c>.
         /// </remarks>
         public string DashboardUrl =>
             _dashboardPort > 0 && _process != null && !_process.HasExited
@@ -237,10 +288,16 @@ namespace GoldLapel
 
         /// <summary>
         /// Dashboard port (always proxy port + 1 unless overridden via
-        /// Config["dashboardPort"]). Used by the DDL API client to POST to
-        /// <c>/api/ddl/stream/create</c> and friends.
+        /// the top-level <c>DashboardPort</c> option). Used by the DDL API
+        /// client to POST to <c>/api/ddl/stream/create</c> and friends.
         /// </summary>
         public int DashboardPort => _dashboardPort;
+
+        /// <summary>
+        /// Cache-invalidation port (always proxy port + 2 unless overridden
+        /// via the top-level <c>InvalidationPort</c> option).
+        /// </summary>
+        public int InvalidationPort => _invalidationPort;
 
         /// <summary>
         /// Dashboard token this instance provisioned for the proxy subprocess.
@@ -361,7 +418,47 @@ namespace GoldLapel
         private async Task SpawnAsync()
         {
             var binary = FindBinary();
-            var args = new List<string> { "--upstream", _upstream, "--proxy-port", _port.ToString() };
+            var args = new List<string> { "--upstream", _upstream, "--proxy-port", _proxyPort.ToString() };
+            // Top-level options emit their own CLI flags before the structured
+            // config map — keeps the argv order predictable for argv-diffing
+            // tests. An explicit (non-zero) dashboard/invalidation port
+            // overrides the binary's derived default.
+            if (_dashboardPortExplicit)
+            {
+                args.Add("--dashboard-port");
+                args.Add(_dashboardPort.ToString());
+            }
+            if (_invalidationPortExplicit)
+            {
+                args.Add("--invalidation-port");
+                args.Add(_invalidationPort.ToString());
+            }
+            if (!string.IsNullOrEmpty(_logLevel))
+            {
+                var verboseFlag = LogLevelToVerboseFlag(_logLevel);
+                if (verboseFlag != null)
+                    args.Add(verboseFlag);
+            }
+            if (!string.IsNullOrEmpty(_mode))
+            {
+                args.Add("--mode");
+                args.Add(_mode);
+            }
+            if (!string.IsNullOrEmpty(_license))
+            {
+                args.Add("--license");
+                args.Add(_license);
+            }
+            if (!string.IsNullOrEmpty(_client))
+            {
+                args.Add("--client");
+                args.Add(_client);
+            }
+            if (!string.IsNullOrEmpty(_configFile))
+            {
+                args.Add("--config");
+                args.Add(_configFile);
+            }
             args.AddRange(ConfigToArgs(_config));
             args.AddRange(_extraArgs);
 
@@ -375,8 +472,13 @@ namespace GoldLapel
                 RedirectStandardError = true,
                 CreateNoWindow = true
             };
-            if (!psi.EnvironmentVariables.ContainsKey("GOLDLAPEL_CLIENT"))
+            // GOLDLAPEL_CLIENT env var is only set when the user hasn't opted
+            // out via opts.Client (explicit --client flag takes precedence).
+            if (string.IsNullOrEmpty(_client)
+                && !psi.EnvironmentVariables.ContainsKey("GOLDLAPEL_CLIENT"))
+            {
                 psi.EnvironmentVariables["GOLDLAPEL_CLIENT"] = "dotnet";
+            }
             // Provision a session-scoped dashboard token for /api/ddl/* calls.
             // Pre-set env wins; otherwise generate a fresh one per session.
             string envToken = psi.EnvironmentVariables.ContainsKey("GOLDLAPEL_DASHBOARD_TOKEN")
@@ -442,7 +544,7 @@ namespace GoldLapel
             // up to 500ms of inner retries inside a 500ms per-attempt budget,
             // so total elapsed could exceed StartupTimeoutMs).
             var ready = await PollForPortAsync(
-                "127.0.0.1", _port, StartupTimeoutMs,
+                "127.0.0.1", _proxyPort, StartupTimeoutMs,
                 () => _process.HasExited).ConfigureAwait(false);
 
             if (!ready)
@@ -453,11 +555,11 @@ namespace GoldLapel
                 _process = null;
                 try { stderrThread.Join(2000); } catch { }
                 throw new InvalidOperationException(
-                    "Gold Lapel failed to start on port " + _port +
+                    "Gold Lapel failed to start on port " + _proxyPort +
                     " within " + (StartupTimeoutMs / 1000) + "s.\nstderr: " + stderrBuf);
             }
 
-            _proxyUrl = MakeProxyUrl(_upstream, _port);
+            _proxyUrl = MakeProxyUrl(_upstream, _proxyPort);
 
             // Eagerly open the internal Npgsql connection. Npgsql does not accept
             // URL-style connection strings, so convert to key-value form.
@@ -470,9 +572,9 @@ namespace GoldLapel
             if (!_silent)
             {
                 if (_dashboardPort > 0)
-                    Console.Error.WriteLine($"goldlapel \u2192 :{_port} (proxy) | http://127.0.0.1:{_dashboardPort} (dashboard)");
+                    Console.Error.WriteLine($"goldlapel \u2192 :{_proxyPort} (proxy) | http://127.0.0.1:{_dashboardPort} (dashboard)");
                 else
-                    Console.Error.WriteLine($"goldlapel \u2192 :{_port} (proxy)");
+                    Console.Error.WriteLine($"goldlapel \u2192 :{_proxyPort} (proxy)");
             }
         }
 
@@ -522,20 +624,6 @@ namespace GoldLapel
 
                 if (!ValidConfigKeys.Contains(key))
                     throw new ArgumentException("Unknown config key: " + key);
-
-                // logLevel is a wrapper-side concept. The proxy binary uses
-                // count-based verbosity (-v/-vv/-vvv), not --log-level.
-                if (key == "logLevel")
-                {
-                    var levelStr = value as string;
-                    if (levelStr == null)
-                        throw new ArgumentException(
-                            "Config key 'logLevel' must be a string, got " + value.GetType().Name);
-                    var verboseFlag = LogLevelToVerboseFlag(levelStr);
-                    if (verboseFlag != null)
-                        result.Add(verboseFlag);
-                    continue;
-                }
 
                 var flag = "--" + CamelToKebab(key);
 

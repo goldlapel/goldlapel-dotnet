@@ -303,15 +303,15 @@ namespace GoldLapel.Tests
         public void DefaultPort()
         {
             var gl = GL.CreateForTest("postgresql://localhost:5432/mydb");
-            Assert.Equal(7932, gl.Port);
+            Assert.Equal(7932, gl.ProxyPort);
         }
 
         [Fact]
         public void CustomPort()
         {
             var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
-                new GoldLapelOptions { Port = 9000 });
-            Assert.Equal(9000, gl.Port);
+                new GoldLapelOptions { ProxyPort = 9000 });
+            Assert.Equal(9000, gl.ProxyPort);
         }
 
         [Fact]
@@ -333,23 +333,19 @@ namespace GoldLapel.Tests
         {
             // The proxy binary accepts -v/-vv/-vvv (count-based), not --log-level.
             // LogLevel "debug" → -vv.
-            var config = new Dictionary<string, object> { { "logLevel", "debug" } };
-            var args = GL.ConfigToArgs(config);
-            Assert.Equal(new List<string> { "-vv" }, args);
+            Assert.Equal("-vv", GL.LogLevelToVerboseFlag("debug"));
         }
 
         [Fact]
         public void LogLevelTraceMapsToTripleVerbose()
         {
-            var args = GL.ConfigToArgs(new Dictionary<string, object> { { "logLevel", "trace" } });
-            Assert.Equal(new List<string> { "-vvv" }, args);
+            Assert.Equal("-vvv", GL.LogLevelToVerboseFlag("trace"));
         }
 
         [Fact]
         public void LogLevelInfoMapsToSingleVerbose()
         {
-            var args = GL.ConfigToArgs(new Dictionary<string, object> { { "logLevel", "info" } });
-            Assert.Equal(new List<string> { "-v" }, args);
+            Assert.Equal("-v", GL.LogLevelToVerboseFlag("info"));
         }
 
         [Theory]
@@ -359,22 +355,19 @@ namespace GoldLapel.Tests
         public void LogLevelWarnOrErrorEmitsNoFlag(string level)
         {
             // warn/error are the default level — no extra flag needed.
-            var args = GL.ConfigToArgs(new Dictionary<string, object> { { "logLevel", level } });
-            Assert.Empty(args);
+            Assert.Null(GL.LogLevelToVerboseFlag(level));
         }
 
         [Fact]
         public void LogLevelIsCaseInsensitive()
         {
-            var args = GL.ConfigToArgs(new Dictionary<string, object> { { "logLevel", "DEBUG" } });
-            Assert.Equal(new List<string> { "-vv" }, args);
+            Assert.Equal("-vv", GL.LogLevelToVerboseFlag("DEBUG"));
         }
 
         [Fact]
         public void LogLevelInvalidRaises()
         {
-            var ex = Assert.Throws<ArgumentException>(() =>
-                GL.ConfigToArgs(new Dictionary<string, object> { { "logLevel", "loud" } }));
+            var ex = Assert.Throws<ArgumentException>(() => GL.LogLevelToVerboseFlag("loud"));
             Assert.Contains("logLevel must be one of", ex.Message);
         }
 
@@ -384,9 +377,19 @@ namespace GoldLapel.Tests
             // Regression guard: the proxy binary does not accept --log-level.
             foreach (var lvl in new[] { "trace", "debug", "info", "warn", "error" })
             {
-                var args = GL.ConfigToArgs(new Dictionary<string, object> { { "logLevel", lvl } });
-                Assert.DoesNotContain("--log-level", args);
+                var flag = GL.LogLevelToVerboseFlag(lvl);
+                Assert.True(flag == null || !flag.StartsWith("--log-level"));
             }
+        }
+
+        [Fact]
+        public void LogLevelInConfigMapIsRejected()
+        {
+            // Regression guard: logLevel was promoted out of the Config map
+            // to the top-level LogLevel option. Passing it through Config
+            // must raise (no silent fallback).
+            var config = new Dictionary<string, object> { { "logLevel", "info" } };
+            Assert.Throws<ArgumentException>(() => GL.ConfigToArgs(config));
         }
     }
 
@@ -404,21 +407,7 @@ namespace GoldLapel.Tests
         public void CustomDashboardPort()
         {
             var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
-                new GoldLapelOptions
-                {
-                    Config = new Dictionary<string, object> { { "dashboardPort", 9090 } }
-                });
-            Assert.Null(gl.DashboardUrl);
-        }
-
-        [Fact]
-        public void DashboardDisabledWithZero()
-        {
-            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
-                new GoldLapelOptions
-                {
-                    Config = new Dictionary<string, object> { { "dashboardPort", 0 } }
-                });
+                new GoldLapelOptions { DashboardPort = 9090 });
             Assert.Null(gl.DashboardUrl);
         }
 
@@ -443,38 +432,31 @@ namespace GoldLapel.Tests
             var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
                 new GoldLapelOptions
                 {
-                    Port = 17932,
-                    Config = new Dictionary<string, object> { { "dashboardPort", 9999 } }
+                    ProxyPort = 17932,
+                    DashboardPort = 9999
                 });
             Assert.False(gl.IsRunning);
             Assert.Null(gl.DashboardUrl);
         }
 
         [Fact]
-        public void DashboardPortExtractedFromConfig()
+        public void DashboardPortFromTopLevelOption()
         {
             var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
-                new GoldLapelOptions
-                {
-                    Config = new Dictionary<string, object> { { "dashboardPort", 8888 } }
-                });
+                new GoldLapelOptions { DashboardPort = 8888 });
             Assert.Null(gl.DashboardUrl);
             Assert.False(gl.IsRunning);
+            Assert.Equal(8888, gl.DashboardPort);
         }
 
         [Fact]
         public void DashboardPortDerivesFromCustomProxyPort()
         {
-            // When only Port is set, dashboard defaults to port + 1 (not the
-            // hardcoded 7933). The internal _dashboardPort isn't public, but
-            // DashboardUrl exposes it when the process is running; since we
-            // can't spawn a real process here, we reach in via reflection.
+            // When only ProxyPort is set, dashboard defaults to proxyPort + 1
+            // (not the hardcoded 7933).
             var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
-                new GoldLapelOptions { Port = 17932 });
-            var field = typeof(GL).GetField("_dashboardPort",
-                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
-            Assert.NotNull(field);
-            Assert.Equal(17933, (int)field.GetValue(gl));
+                new GoldLapelOptions { ProxyPort = 17932 });
+            Assert.Equal(17933, gl.DashboardPort);
         }
 
         [Fact]
@@ -483,13 +465,10 @@ namespace GoldLapel.Tests
             var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
                 new GoldLapelOptions
                 {
-                    Port = 17932,
-                    Config = new Dictionary<string, object> { { "dashboardPort", 9999 } }
+                    ProxyPort = 17932,
+                    DashboardPort = 9999
                 });
-            var field = typeof(GL).GetField("_dashboardPort",
-                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
-            Assert.NotNull(field);
-            Assert.Equal(9999, (int)field.GetValue(gl));
+            Assert.Equal(9999, gl.DashboardPort);
         }
     }
 
@@ -508,19 +487,30 @@ namespace GoldLapel.Tests
         [Fact]
         public void ContainsKnownKeys()
         {
+            // Tuning knobs still live in the structured Config map.
+            // Top-level options (mode, logLevel, dashboardPort, etc.) do not.
             var keys = GL.ConfigKeys();
-            Assert.Contains("mode", keys);
             Assert.Contains("poolSize", keys);
             Assert.Contains("disableMatviews", keys);
             Assert.Contains("replica", keys);
         }
 
         [Fact]
-        public void ContainsLogLevel()
+        public void DoesNotContainPromotedTopLevelKeys()
         {
-            // v0.2.0: logLevel is a first-class config key (exposed via LogLevel option).
+            // Canonical surface: logLevel, dashboardPort, invalidationPort,
+            // mode, client, config, license are top-level options on
+            // GoldLapelOptions, not structured-config keys. ConfigKeys()
+            // reports only the tuning knobs that remain inside the `Config`
+            // map.
             var keys = GL.ConfigKeys();
-            Assert.Contains("logLevel", keys);
+            Assert.DoesNotContain("logLevel", keys);
+            Assert.DoesNotContain("dashboardPort", keys);
+            Assert.DoesNotContain("invalidationPort", keys);
+            Assert.DoesNotContain("mode", keys);
+            Assert.DoesNotContain("client", keys);
+            Assert.DoesNotContain("config", keys);
+            Assert.DoesNotContain("license", keys);
         }
 
         [Fact]
@@ -637,9 +627,9 @@ namespace GoldLapel.Tests
         [Fact]
         public void ConfigToArgs_StringValue()
         {
-            var config = new Dictionary<string, object> { { "mode", "waiter" } };
+            var config = new Dictionary<string, object> { { "poolMode", "transaction" } };
             var args = GL.ConfigToArgs(config);
-            Assert.Equal(new List<string> { "--mode", "waiter" }, args);
+            Assert.Equal(new List<string> { "--pool-mode", "transaction" }, args);
         }
 
         [Fact]
@@ -704,13 +694,13 @@ namespace GoldLapel.Tests
         {
             var config = new Dictionary<string, object>
             {
-                { "mode", "waiter" },
+                { "poolMode", "transaction" },
                 { "poolSize", 10 },
                 { "disableRewrite", true }
             };
             var args = GL.ConfigToArgs(config);
-            Assert.Contains("--mode", args);
-            Assert.Contains("waiter", args);
+            Assert.Contains("--pool-mode", args);
+            Assert.Contains("transaction", args);
             Assert.Contains("--pool-size", args);
             Assert.Contains("10", args);
             Assert.Contains("--disable-rewrite", args);
@@ -745,14 +735,15 @@ namespace GoldLapel.Tests
         {
             var options = new GoldLapelOptions
             {
+                Mode = "waiter",
                 Config = new Dictionary<string, object>
                 {
-                    { "mode", "waiter" },
                     { "disablePool", true }
                 }
             };
             var gl = GL.CreateForTest("postgresql://localhost:5432/mydb", options);
-            Assert.Equal(7932, gl.Port);
+            Assert.Equal(7932, gl.ProxyPort);
+            Assert.Equal("waiter", options.Mode);
         }
     }
 }

@@ -69,7 +69,7 @@ namespace GoldLapel.Tests
             var name = "gl_dotnet_int_" + DateTime.UtcNow.Ticks;
             await using var gl = await GL.StartAsync(Upstream, opts =>
             {
-                opts.Port = NextPort();
+                opts.ProxyPort = NextPort();
                 opts.Silent = true;
             });
             await gl.StreamAddAsync(name, "{\"type\":\"click\"}");
@@ -99,7 +99,7 @@ namespace GoldLapel.Tests
             var name = "gl_dotnet_int_meta_" + DateTime.UtcNow.Ticks;
             await using var gl = await GL.StartAsync(Upstream, opts =>
             {
-                opts.Port = NextPort();
+                opts.ProxyPort = NextPort();
                 opts.Silent = true;
             });
             await gl.StreamAddAsync(name, "{\"type\":\"click\"}");
@@ -124,7 +124,7 @@ namespace GoldLapel.Tests
             var name = "gl_dotnet_int_rt_" + DateTime.UtcNow.Ticks;
             await using var gl = await GL.StartAsync(Upstream, opts =>
             {
-                opts.Port = NextPort();
+                opts.ProxyPort = NextPort();
                 opts.Silent = true;
             });
             await gl.StreamCreateGroupAsync(name, "workers");

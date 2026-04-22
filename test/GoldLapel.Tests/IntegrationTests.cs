@@ -56,7 +56,7 @@ namespace GoldLapel.Tests
             if (!CanRunIntegration()) return;
 
             var port = NextPort();
-            await using var gl = await GL.StartAsync(Upstream, opts => { opts.Port = port; });
+            await using var gl = await GL.StartAsync(Upstream, opts => { opts.ProxyPort = port; });
 
             Assert.True(gl.IsRunning);
             Assert.NotNull(gl.Url);
@@ -74,7 +74,7 @@ namespace GoldLapel.Tests
 
             var port = NextPort();
             GL gl;
-            await using (gl = await GL.StartAsync(Upstream, opts => { opts.Port = port; }))
+            await using (gl = await GL.StartAsync(Upstream, opts => { opts.ProxyPort = port; }))
             {
                 Assert.True(gl.IsRunning);
             }
@@ -89,7 +89,7 @@ namespace GoldLapel.Tests
             if (!CanRunIntegration()) return;
 
             var port = NextPort();
-            await using var gl = await GL.StartAsync(Upstream, opts => { opts.Port = port; });
+            await using var gl = await GL.StartAsync(Upstream, opts => { opts.ProxyPort = port; });
 
             // Raw SQL round-trip via gl.Url -> new NpgsqlConnection(gl.Url) pattern.
             await using var conn = new NpgsqlConnection(gl.Url);
@@ -120,7 +120,7 @@ namespace GoldLapel.Tests
             if (!CanRunIntegration()) return;
 
             var port = NextPort();
-            await using var gl = await GL.StartAsync(Upstream, opts => { opts.Port = port; });
+            await using var gl = await GL.StartAsync(Upstream, opts => { opts.ProxyPort = port; });
 
             var collection = "gl_int_using_" + Guid.NewGuid().ToString("N").Substring(0, 8);
 
@@ -196,7 +196,7 @@ namespace GoldLapel.Tests
                 "Requires a CloseComplete-fixed proxy binary. Set GOLDLAPEL_CLOSECOMPLETE_FIX=1 to run.");
 
             var port = NextPort();
-            await using var gl = await GL.StartAsync(Upstream, opts => { opts.Port = port; });
+            await using var gl = await GL.StartAsync(Upstream, opts => { opts.ProxyPort = port; });
 
             await using var conn = new NpgsqlConnection(gl.Url);
             await conn.OpenAsync();
@@ -236,7 +236,7 @@ namespace GoldLapel.Tests
                 "Requires a CloseComplete-fixed proxy binary. Set GOLDLAPEL_CLOSECOMPLETE_FIX=1 to run.");
 
             var port = NextPort();
-            await using var gl = await GL.StartAsync(Upstream, opts => { opts.Port = port; });
+            await using var gl = await GL.StartAsync(Upstream, opts => { opts.ProxyPort = port; });
 
             var table = "gl_cc_" + Guid.NewGuid().ToString("N").Substring(0, 8);
 
@@ -291,7 +291,7 @@ namespace GoldLapel.Tests
             if (!CanRunIntegration()) return;
 
             var port = NextPort();
-            await using var gl = await GL.StartAsync(Upstream, opts => { opts.Port = port; });
+            await using var gl = await GL.StartAsync(Upstream, opts => { opts.ProxyPort = port; });
 
             var collection = "gl_int_" + Guid.NewGuid().ToString("N").Substring(0, 8);
             await using var userConn = new NpgsqlConnection(gl.Url);
@@ -327,7 +327,7 @@ namespace GoldLapel.Tests
             try
             {
                 var port = NextPort();
-                await using (await GL.StartAsync(Upstream, opts => { opts.Port = port; }))
+                await using (await GL.StartAsync(Upstream, opts => { opts.ProxyPort = port; }))
                 {
                 }
             }
@@ -364,7 +364,7 @@ namespace GoldLapel.Tests
                 var port = NextPort();
                 await using (await GL.StartAsync(Upstream, opts =>
                 {
-                    opts.Port = port;
+                    opts.ProxyPort = port;
                     opts.Silent = true;
                 }))
                 {

@@ -188,7 +188,7 @@ finally:
             {
                 await using var gl = await GL.StartAsync(
                     upstream,
-                    opts => { opts.Port = port; opts.Silent = true; });
+                    opts => { opts.ProxyPort = port; opts.Silent = true; });
             });
 
             Assert.NotNull(exception);
