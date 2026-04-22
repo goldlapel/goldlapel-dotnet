@@ -569,6 +569,65 @@ namespace GoldLapel.Tests
             gl.Dispose();
             gl.Dispose(); // second call should not throw
         }
+
+        // DisposeAsync is the .NET stop-idempotency equivalent: in async code,
+        // `await using` calls DisposeAsync, not Dispose. Double-DisposeAsync is
+        // reachable via atexit-style cleanup, AppDomain.ProcessExit handlers,
+        // cancellation-token teardown, and test class teardown loops. A buggy
+        // second-DisposeAsync (re-closing a null _conn, re-stopping a null
+        // _process) would mask the root error or crash the test host.
+        [Fact]
+        public async Task StopAsync_IsIdempotent()
+        {
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb");
+            await gl.DisposeAsync();
+            await gl.DisposeAsync(); // second call must not throw
+
+            // Internal state is fully torn down after first DisposeAsync; the
+            // second call observes _disposed=true and returns early.
+            var disposedField = typeof(GL).GetField("_disposed",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            Assert.NotNull(disposedField);
+            Assert.True((bool)disposedField.GetValue(gl));
+
+            var processField = typeof(GL).GetField("_process",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            Assert.NotNull(processField);
+            Assert.Null(processField.GetValue(gl));
+
+            var connField = typeof(GL).GetField("_conn",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            Assert.NotNull(connField);
+            Assert.Null(connField.GetValue(gl));
+
+            var proxyUrlField = typeof(GL).GetField("_proxyUrl",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            Assert.NotNull(proxyUrlField);
+            Assert.Null(proxyUrlField.GetValue(gl));
+
+            Assert.False(gl.IsRunning);
+            Assert.Null(gl.ProxyUrl);
+            Assert.Null(gl.Url);
+        }
+
+        // Mixed sync/async teardown is reachable when user code awaits
+        // DisposeAsync then a finally-block also calls Dispose (or vice-versa).
+        // The _disposed flag must cover both code paths.
+        [Fact]
+        public async Task DisposeAsync_ThenDispose_IsIdempotent()
+        {
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb");
+            await gl.DisposeAsync();
+            gl.Dispose(); // sync follow-up must not throw
+        }
+
+        [Fact]
+        public async Task Dispose_ThenDisposeAsync_IsIdempotent()
+        {
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb");
+            gl.Dispose();
+            await gl.DisposeAsync(); // async follow-up must not throw
+        }
     }
 
     // ── ConfigToArgs ─────────────────────────────────────────
