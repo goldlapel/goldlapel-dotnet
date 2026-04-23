@@ -77,6 +77,21 @@ namespace GoldLapel
         /// shells redirecting stdout, etc.).
         /// </summary>
         public bool Silent { get; set; }
+
+        /// <summary>
+        /// When <c>true</c>, opt into the mesh at startup. HQ enforces the license;
+        /// if the current plan doesn't cover mesh the proxy continues running
+        /// normally without clustering (concierge, not bouncer). Equivalent CLI
+        /// flag: <c>--mesh</c>. Env: <c>GOLDLAPEL_MESH</c>. TOML: <c>[mesh] enabled</c>.
+        /// </summary>
+        public bool Mesh { get; set; }
+
+        /// <summary>
+        /// Optional mesh tag — instances sharing a tag cluster together. When
+        /// unset, mesh-enabled instances join the account's default mesh.
+        /// Equivalent CLI flag: <c>--mesh-tag</c>. Env: <c>GOLDLAPEL_MESH_TAG</c>.
+        /// </summary>
+        public string MeshTag { get; set; }
     }
 
     /// <summary>
@@ -154,6 +169,8 @@ namespace GoldLapel
         private readonly string[] _extraArgs;
         private readonly Dictionary<string, object> _config;
         private readonly bool _silent;
+        private readonly bool _mesh;
+        private readonly string _meshTag;
         private Process _process;
         private string _proxyUrl;
         private bool _disposed;
@@ -192,6 +209,9 @@ namespace GoldLapel
             // miss bad keys.
             ValidateConfigKeys(_config);
             _silent = options.Silent;
+            // Mesh membership — startup intent (HQ enforces license).
+            _mesh = options.Mesh;
+            _meshTag = string.IsNullOrEmpty(options.MeshTag) ? null : options.MeshTag;
             // Dashboard defaults to proxy port + 1 (matches what the Rust binary
             // binds when no --dashboard-port is passed). A user-supplied value
             // on the top-level DashboardPort option overrides the derivation.
@@ -201,6 +221,10 @@ namespace GoldLapel
             _invalidationPortExplicit = options.InvalidationPort.HasValue;
             _invalidationPort = options.InvalidationPort ?? _proxyPort + 2;
         }
+
+        // Test-only accessors for mesh wiring.
+        internal bool IsMesh => _mesh;
+        internal string MeshTag => _meshTag;
 
         // ── Factory ─────────────────────────────────────────────────
 
@@ -458,6 +482,15 @@ namespace GoldLapel
             {
                 args.Add("--config");
                 args.Add(_configFile);
+            }
+            if (_mesh)
+            {
+                args.Add("--mesh");
+            }
+            if (!string.IsNullOrEmpty(_meshTag))
+            {
+                args.Add("--mesh-tag");
+                args.Add(_meshTag);
             }
             args.AddRange(ConfigToArgs(_config));
             args.AddRange(_extraArgs);

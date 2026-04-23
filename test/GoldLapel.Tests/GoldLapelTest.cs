@@ -391,6 +391,44 @@ namespace GoldLapel.Tests
             var config = new Dictionary<string, object> { { "logLevel", "info" } };
             Assert.Throws<ArgumentException>(() => GL.ConfigToArgs(config));
         }
+
+        // ─── Mesh startup options ─────────────────────────────────────
+
+        [Fact]
+        public void MeshDefaultsToFalse()
+        {
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb");
+            Assert.False(gl.IsMesh);
+            Assert.Null(gl.MeshTag);
+        }
+
+        [Fact]
+        public void MeshOptionStored()
+        {
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
+                new GoldLapelOptions { Mesh = true, MeshTag = "prod-east" });
+            Assert.True(gl.IsMesh);
+            Assert.Equal("prod-east", gl.MeshTag);
+        }
+
+        [Fact]
+        public void MeshTagEmptyStringNormalizedToNull()
+        {
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
+                new GoldLapelOptions { Mesh = true, MeshTag = "" });
+            Assert.Null(gl.MeshTag);
+        }
+
+        [Fact]
+        public void MeshInConfigMapIsRejected()
+        {
+            // Regression guard: Mesh / MeshTag are top-level canonical-surface
+            // options, never valid inside the structured config map.
+            var meshCfg = new Dictionary<string, object> { { "mesh", true } };
+            Assert.Throws<ArgumentException>(() => GL.ConfigToArgs(meshCfg));
+            var tagCfg = new Dictionary<string, object> { { "meshTag", "prod" } };
+            Assert.Throws<ArgumentException>(() => GL.ConfigToArgs(tagCfg));
+        }
     }
 
     // ── DashboardUrl ───────────────────────────────────────
