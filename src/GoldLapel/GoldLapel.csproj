@@ -5,13 +5,13 @@
     <LangVersion>8.0</LangVersion>
     <Version>0.0.0</Version>
     <PackageId>GoldLapel</PackageId>
-    <Authors>Gold Lapel</Authors>
+    <Authors>The Waiter of Gold Lapel</Authors>
     <Description>Self-optimizing Postgres proxy — start the proxy, get a connection URL, speed up your queries automatically.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageProjectUrl>https://goldlapel.com</PackageProjectUrl>
     <RepositoryUrl>https://github.com/goldlapel/goldlapel-dotnet</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
-    <PackageTags>postgres;postgresql;proxy;optimization;database</PackageTags>
+    <PackageTags>postgres;postgresql;proxy;optimization;database;cache;redis-compat;mongo-compat;query-optimization</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <RootNamespace>GoldLapel</RootNamespace>
     <AssemblyName>GoldLapel</AssemblyName>
