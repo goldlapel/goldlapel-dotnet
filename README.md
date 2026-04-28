@@ -53,6 +53,24 @@ Linux x64, Linux ARM64, macOS ARM64 (Apple Silicon), Windows x64. Targets `netst
 
 Full API reference, configuration, async patterns, upgrading from v0.1, and production deployment: https://goldlapel.com/docs/dotnet
 
+## Uninstalling
+
+Before removing the package, drop Gold Lapel's helper schema and cached matviews from your Postgres:
+
+```bash
+goldlapel clean
+```
+
+Then remove the package and any local state:
+
+```bash
+dotnet remove package GoldLapel
+rm -rf ~/.goldlapel
+rm -f goldlapel.toml     # only if you wrote one
+```
+
+Cancelling your subscription does not delete your data — only Gold Lapel's helper schema and cached matviews go away.
+
 ## License
 
 MIT. See `LICENSE`.
