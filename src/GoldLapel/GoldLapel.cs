@@ -46,7 +46,7 @@ namespace GoldLapel
         /// </summary>
         public string LogLevel { get; set; }
 
-        /// <summary>Operating mode (e.g. <c>"waiter"</c>, <c>"bellhop"</c>). Passed as <c>--mode</c>.</summary>
+        /// <summary>Operating mode (e.g. <c>"waiter"</c>, <c>"consideration"</c>). Passed as <c>--mode</c>.</summary>
         public string Mode { get; set; }
 
         /// <summary>License file path. Passed as <c>--license</c>.</summary>
