@@ -220,7 +220,29 @@ namespace GoldLapel
             _dashboardPort = options.DashboardPort ?? _proxyPort + 1;
             _invalidationPortExplicit = options.InvalidationPort.HasValue;
             _invalidationPort = options.InvalidationPort ?? _proxyPort + 2;
+
+            // Nested namespaces — see Documents.cs and Streams.cs. These are
+            // the canonical schema-to-core sub-API instances. Each holds a
+            // back-reference to this client for shared state (license,
+            // dashboard token, http session, conn, DDL pattern cache). Other
+            // namespaces (cache, search, queues, counters, hashes, zsets, geo,
+            // …) stay flat for now; they migrate to nested form one-at-a-time
+            // as their own schema-to-core phase fires.
+            Documents = new DocumentsApi(this);
+            Streams = new StreamsApi(this);
         }
+
+        /// <summary>
+        /// Document-store namespace — <c>gl.Documents.&lt;Verb&gt;Async(...)</c>.
+        /// See <see cref="DocumentsApi"/>.
+        /// </summary>
+        public DocumentsApi Documents { get; }
+
+        /// <summary>
+        /// Stream namespace — <c>gl.Streams.&lt;Verb&gt;Async(...)</c>.
+        /// See <see cref="StreamsApi"/>.
+        /// </summary>
+        public StreamsApi Streams { get; }
 
         // Test-only accessors for mesh wiring.
         internal bool IsMesh => _mesh;
@@ -348,7 +370,7 @@ namespace GoldLapel
         /// <example>
         /// <code>
         /// await gl.UsingAsync(conn, async gl => {
-        ///     await gl.DocInsertAsync("events", new { type = "order.created" });
+        ///     await gl.Documents.InsertAsync("events", "{\"type\":\"order.created\"}");
         /// });
         /// </code>
         /// </example>
@@ -1039,6 +1061,12 @@ namespace GoldLapel
             return _conn;
         }
 
+        // Internal accessor used by the nested namespace classes
+        // (DocumentsApi, StreamsApi). Keeps `ResolveActive` private so
+        // direct subclassing/external mocking of the resolution policy
+        // stays off-limits.
+        internal DbConnection ResolveActiveDb(DbConnection perCall) => ResolveActive(perCall);
+
         // ── Wrapper methods ─────────────────────────────────────────
         // All methods:
         //   - Have an Async suffix (.NET convention)
@@ -1050,109 +1078,7 @@ namespace GoldLapel
         // a single connection in one request flow). The Task return is a natural
         // .NET shape; per-method actual async-IO is a future enhancement.
 
-        // Document store
-        public Task<Dictionary<string, object>> DocInsertAsync(string collection, string documentJson, NpgsqlConnection connection = null)
-            => Task.FromResult(Utils.DocInsert(ResolveActive(connection), collection, documentJson));
-
-        public Task<List<Dictionary<string, object>>> DocInsertManyAsync(string collection, List<string> documents, NpgsqlConnection connection = null)
-            => Task.FromResult(Utils.DocInsertMany(ResolveActive(connection), collection, documents));
-
-        public Task<List<Dictionary<string, object>>> DocFindAsync(string collection,
-            string filterJson = null, Dictionary<string, int> sort = null, int? limit = null, int? skip = null,
-            NpgsqlConnection connection = null)
-            => Task.FromResult(Utils.DocFind(ResolveActive(connection), collection, filterJson, sort, limit, skip));
-
-        public IEnumerable<Dictionary<string, object>> DocFindCursor(string collection,
-            string filterJson = null, string sortJson = null, int? limit = null, int? skip = null,
-            int batchSize = 100, NpgsqlConnection connection = null)
-            => Utils.DocFindCursor(ResolveActive(connection), collection, filterJson, sortJson, limit, skip, batchSize);
-
-        public Task<Dictionary<string, object>> DocFindOneAsync(string collection,
-            string filterJson = null, NpgsqlConnection connection = null)
-            => Task.FromResult(Utils.DocFindOne(ResolveActive(connection), collection, filterJson));
-
-        public Task<int> DocUpdateAsync(string collection, string filterJson, string updateJson,
-            NpgsqlConnection connection = null)
-            => Task.FromResult(Utils.DocUpdate(ResolveActive(connection), collection, filterJson, updateJson));
-
-        public Task<int> DocUpdateOneAsync(string collection, string filterJson, string updateJson,
-            NpgsqlConnection connection = null)
-            => Task.FromResult(Utils.DocUpdateOne(ResolveActive(connection), collection, filterJson, updateJson));
-
-        public Task<int> DocDeleteAsync(string collection, string filterJson, NpgsqlConnection connection = null)
-            => Task.FromResult(Utils.DocDelete(ResolveActive(connection), collection, filterJson));
-
-        public Task<int> DocDeleteOneAsync(string collection, string filterJson, NpgsqlConnection connection = null)
-            => Task.FromResult(Utils.DocDeleteOne(ResolveActive(connection), collection, filterJson));
-
-        public Task<long> DocCountAsync(string collection, string filterJson = null, NpgsqlConnection connection = null)
-            => Task.FromResult(Utils.DocCount(ResolveActive(connection), collection, filterJson));
-
-        public Task<Dictionary<string, object>> DocFindOneAndUpdateAsync(string collection, string filterJson,
-            string updateJson, NpgsqlConnection connection = null)
-            => Task.FromResult(Utils.DocFindOneAndUpdate(ResolveActive(connection), collection, filterJson, updateJson));
-
-        public Task<Dictionary<string, object>> DocFindOneAndDeleteAsync(string collection, string filterJson,
-            NpgsqlConnection connection = null)
-            => Task.FromResult(Utils.DocFindOneAndDelete(ResolveActive(connection), collection, filterJson));
-
-        public Task<List<string>> DocDistinctAsync(string collection, string field, string filterJson = null,
-            NpgsqlConnection connection = null)
-            => Task.FromResult(Utils.DocDistinct(ResolveActive(connection), collection, field, filterJson));
-
-        public Task DocCreateIndexAsync(string collection, List<string> keys = null, NpgsqlConnection connection = null)
-        {
-            Utils.DocCreateIndex(ResolveActive(connection), collection, keys);
-            return Task.CompletedTask;
-        }
-
-        public Task<List<Dictionary<string, object>>> DocAggregateAsync(string collection, string pipelineJson,
-            NpgsqlConnection connection = null)
-            => Task.FromResult(Utils.DocAggregate(ResolveActive(connection), collection, pipelineJson));
-
-        public Task DocWatchAsync(string collection, Action<string, string> callback, bool blocking = true,
-            NpgsqlConnection connection = null)
-        {
-            Utils.DocWatch(ResolveActive(connection), collection, callback, blocking);
-            return Task.CompletedTask;
-        }
-
-        public Task DocUnwatchAsync(string collection, NpgsqlConnection connection = null)
-        {
-            Utils.DocUnwatch(ResolveActive(connection), collection);
-            return Task.CompletedTask;
-        }
-
-        public Task DocCreateTtlIndexAsync(string collection, int expireAfterSeconds, string field = "created_at",
-            NpgsqlConnection connection = null)
-        {
-            Utils.DocCreateTtlIndex(ResolveActive(connection), collection, expireAfterSeconds, field);
-            return Task.CompletedTask;
-        }
-
-        public Task DocRemoveTtlIndexAsync(string collection, NpgsqlConnection connection = null)
-        {
-            Utils.DocRemoveTtlIndex(ResolveActive(connection), collection);
-            return Task.CompletedTask;
-        }
-
-        public Task DocCreateCollectionAsync(string collection, bool unlogged = false, NpgsqlConnection connection = null)
-        {
-            Utils.DocCreateCollection(ResolveActive(connection), collection, unlogged);
-            return Task.CompletedTask;
-        }
-
-        public Task DocCreateCappedAsync(string collection, int maxDocuments, NpgsqlConnection connection = null)
-        {
-            Utils.DocCreateCapped(ResolveActive(connection), collection, maxDocuments);
-            return Task.CompletedTask;
-        }
-
-        public Task DocRemoveCapAsync(string collection, NpgsqlConnection connection = null)
-        {
-            Utils.DocRemoveCap(ResolveActive(connection), collection);
-            return Task.CompletedTask;
-        }
+        // Document store: gl.Documents.<Verb>Async(...). See Documents.cs.
 
         // Search
         public Task<List<Dictionary<string, object>>> SearchAsync(string table,
@@ -1297,48 +1223,7 @@ namespace GoldLapel
         public Task<string> ScriptAsync(string luaCode, string[] args = null, NpgsqlConnection connection = null)
             => Task.FromResult(Utils.Script(ResolveActive(connection), luaCode, args ?? Array.Empty<string>()));
 
-        // Streams — proxy-owned DDL. First call per (family, name) fetches
-        // canonical query patterns from /api/ddl/stream/create; subsequent
-        // calls reuse the ConcurrentDictionary cache on this instance.
-
-        private async Task<DdlEntry> StreamPatternsAsync(string stream)
-        {
-            var token = _dashboardToken ?? Ddl.TokenFromEnvOrFile();
-            return await Ddl.FetchPatternsAsync(_ddlCache, "stream", stream, _dashboardPort, token).ConfigureAwait(false);
-        }
-
-        public async Task<long> StreamAddAsync(string stream, string payload, NpgsqlConnection connection = null)
-        {
-            var patterns = await StreamPatternsAsync(stream).ConfigureAwait(false);
-            return Utils.StreamAdd(ResolveActive(connection), stream, payload, patterns);
-        }
-
-        public async Task StreamCreateGroupAsync(string stream, string group, NpgsqlConnection connection = null)
-        {
-            var patterns = await StreamPatternsAsync(stream).ConfigureAwait(false);
-            Utils.StreamCreateGroup(ResolveActive(connection), stream, group, patterns);
-        }
-
-        public async Task<List<Dictionary<string, object>>> StreamReadAsync(string stream,
-            string group, string consumer, int count = 1, NpgsqlConnection connection = null)
-        {
-            var patterns = await StreamPatternsAsync(stream).ConfigureAwait(false);
-            return Utils.StreamRead(ResolveActive(connection), stream, group, consumer, count, patterns);
-        }
-
-        public async Task<bool> StreamAckAsync(string stream, string group, long messageId,
-            NpgsqlConnection connection = null)
-        {
-            var patterns = await StreamPatternsAsync(stream).ConfigureAwait(false);
-            return Utils.StreamAck(ResolveActive(connection), stream, group, messageId, patterns);
-        }
-
-        public async Task<List<Dictionary<string, object>>> StreamClaimAsync(string stream,
-            string group, string consumer, long minIdleMs = 60000, NpgsqlConnection connection = null)
-        {
-            var patterns = await StreamPatternsAsync(stream).ConfigureAwait(false);
-            return Utils.StreamClaim(ResolveActive(connection), stream, group, consumer, minIdleMs, patterns);
-        }
+        // Streams: gl.Streams.<Verb>Async(...). See Streams.cs.
 
         // Percolate
         public Task PercolateAddAsync(string name, string queryId, string query,

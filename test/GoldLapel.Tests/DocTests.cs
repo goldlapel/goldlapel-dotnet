@@ -10,26 +10,24 @@ namespace GoldLapel.Tests
     public class DocInsertTest
     {
         [Fact]
-        public void CreatesTableThenInserts()
+        public void DoesNotCreateTable_ProxyOwnsDdl()
         {
+            // Wrappers no longer issue CREATE TABLE — the proxy's DDL API
+            // materialized the canonical table when we fetched patterns.
             var conn = new SpyConnection();
-            Utils.DocInsert(conn, "users", "{\"name\":\"alice\"}");
+            Utils.DocInsert(conn,"users", "{\"name\":\"alice\"}", DocTestHelpers.FakePatterns("users"));
 
-            Assert.Equal(2, conn.Commands.Count);
-            Assert.Contains("CREATE TABLE IF NOT EXISTS users", conn.Commands[0].CommandText);
-            Assert.Contains("_id UUID PRIMARY KEY DEFAULT gen_random_uuid()", conn.Commands[0].CommandText);
-            Assert.Contains("data JSONB NOT NULL", conn.Commands[0].CommandText);
-            Assert.Contains("created_at TIMESTAMPTZ", conn.Commands[0].CommandText);
-            Assert.Contains("updated_at TIMESTAMPTZ", conn.Commands[0].CommandText);
+            Assert.Single(conn.Commands);
+            Assert.DoesNotContain("CREATE TABLE", conn.Commands[0].CommandText);
         }
 
         [Fact]
         public void InsertSqlAndParams()
         {
             var conn = new SpyConnection();
-            Utils.DocInsert(conn, "users", "{\"name\":\"alice\"}");
+            Utils.DocInsert(conn,"users", "{\"name\":\"alice\"}", DocTestHelpers.FakePatterns("users"));
 
-            var cmd = conn.Commands[1];
+            var cmd = conn.Commands[0];
             Assert.Contains("INSERT INTO users", cmd.CommandText);
             Assert.Contains("VALUES (@doc::jsonb)", cmd.CommandText);
             Assert.Contains("RETURNING _id, data, created_at, updated_at", cmd.CommandText);
@@ -41,7 +39,7 @@ namespace GoldLapel.Tests
         {
             var conn = new SpyConnection();
             Assert.Throws<ArgumentException>(() =>
-                Utils.DocInsert(conn, "bad table!", "{\"x\":1}"));
+                Utils.DocInsert(conn,"bad table!", "{\"x\":1}", DocTestHelpers.FakePatterns("bad table!")));
         }
     }
 
@@ -54,10 +52,12 @@ namespace GoldLapel.Tests
         {
             var conn = new SpyConnection();
             var docs = new List<string> { "{\"a\":1}", "{\"b\":2}", "{\"c\":3}" };
-            Utils.DocInsertMany(conn, "items", docs);
+            Utils.DocInsertMany(conn,"items", docs, DocTestHelpers.FakePatterns("items"));
 
-            // 1 create table + 3 inserts
-            Assert.Equal(4, conn.Commands.Count);
+            // No in-wrapper CREATE TABLE — proxy owns DDL. 3 inserts.
+            Assert.Equal(3, conn.Commands.Count);
+            foreach (var c in conn.Commands)
+                Assert.DoesNotContain("CREATE TABLE", c.CommandText);
         }
 
         [Fact]
@@ -65,21 +65,22 @@ namespace GoldLapel.Tests
         {
             var conn = new SpyConnection();
             var docs = new List<string> { "{\"x\":1}", "{\"y\":2}" };
-            Utils.DocInsertMany(conn, "items", docs);
+            Utils.DocInsertMany(conn,"items", docs, DocTestHelpers.FakePatterns("items"));
 
-            // Commands[0] = CREATE TABLE, Commands[1] = first insert, Commands[2] = second insert
-            Assert.Equal("{\"x\":1}", conn.Commands[1].ParamValue("@doc"));
-            Assert.Equal("{\"y\":2}", conn.Commands[2].ParamValue("@doc"));
+            // Commands[0] = first insert, Commands[1] = second insert
+            // (proxy owns DDL — no leading CREATE TABLE).
+            Assert.Equal("{\"x\":1}", conn.Commands[0].ParamValue("@doc"));
+            Assert.Equal("{\"y\":2}", conn.Commands[1].ParamValue("@doc"));
         }
 
         [Fact]
-        public void EmptyListOnlyCreatesTable()
+        public void EmptyListIssuesNoCommands()
         {
             var conn = new SpyConnection();
-            Utils.DocInsertMany(conn, "items", new List<string>());
+            Utils.DocInsertMany(conn,"items", new List<string>(), DocTestHelpers.FakePatterns("items"));
 
-            Assert.Single(conn.Commands);
-            Assert.Contains("CREATE TABLE IF NOT EXISTS items", conn.Commands[0].CommandText);
+            // Proxy owns DDL — no CREATE TABLE — and no rows means no INSERTs.
+            Assert.Empty(conn.Commands);
         }
 
         [Fact]
@@ -87,7 +88,7 @@ namespace GoldLapel.Tests
         {
             var conn = new SpyConnection();
             Assert.Throws<ArgumentException>(() =>
-                Utils.DocInsertMany(conn, "1bad", new List<string> { "{}" }));
+                Utils.DocInsertMany(conn,"1bad", new List<string> { "{}" }, DocTestHelpers.FakePatterns("1bad")));
         }
     }
 
@@ -99,7 +100,7 @@ namespace GoldLapel.Tests
         public void BasicFindSql()
         {
             var conn = new SpyConnection();
-            Utils.DocFind(conn, "users");
+            Utils.DocFind(conn,"users", DocTestHelpers.FakePatterns("users"));
 
             var sql = conn.LastCommandText;
             Assert.Contains("SELECT _id, data, created_at, updated_at FROM users", sql);
@@ -113,7 +114,7 @@ namespace GoldLapel.Tests
         public void WithFilter()
         {
             var conn = new SpyConnection();
-            Utils.DocFind(conn, "users", filterJson: "{\"active\":true}");
+            Utils.DocFind(conn,"users", DocTestHelpers.FakePatterns("users"), filterJson: "{\"active\":true}");
 
             var sql = conn.LastCommandText;
             Assert.Contains("WHERE data @> @p0::jsonb", sql);
@@ -124,7 +125,7 @@ namespace GoldLapel.Tests
         public void WithSort()
         {
             var conn = new SpyConnection();
-            Utils.DocFind(conn, "users", sort: new Dictionary<string, int> { { "name", 1 } });
+            Utils.DocFind(conn,"users", DocTestHelpers.FakePatterns("users"), sort: new Dictionary<string, int> { { "name", 1 } });
 
             var sql = conn.LastCommandText;
             Assert.Contains("ORDER BY data->>'name' ASC", sql);
@@ -134,7 +135,7 @@ namespace GoldLapel.Tests
         public void WithSortDescending()
         {
             var conn = new SpyConnection();
-            Utils.DocFind(conn, "users", sort: new Dictionary<string, int> { { "age", -1 } });
+            Utils.DocFind(conn,"users", DocTestHelpers.FakePatterns("users"), sort: new Dictionary<string, int> { { "age", -1 } });
 
             var sql = conn.LastCommandText;
             Assert.Contains("ORDER BY data->>'age' DESC", sql);
@@ -144,7 +145,7 @@ namespace GoldLapel.Tests
         public void WithLimit()
         {
             var conn = new SpyConnection();
-            Utils.DocFind(conn, "users", limit: 10);
+            Utils.DocFind(conn,"users", DocTestHelpers.FakePatterns("users"), limit: 10);
 
             var sql = conn.LastCommandText;
             Assert.Contains("LIMIT @limit", sql);
@@ -155,7 +156,7 @@ namespace GoldLapel.Tests
         public void WithSkip()
         {
             var conn = new SpyConnection();
-            Utils.DocFind(conn, "users", skip: 5);
+            Utils.DocFind(conn,"users", DocTestHelpers.FakePatterns("users"), skip: 5);
 
             var sql = conn.LastCommandText;
             Assert.Contains("OFFSET @skip", sql);
@@ -166,7 +167,7 @@ namespace GoldLapel.Tests
         public void AllOptionsCombined()
         {
             var conn = new SpyConnection();
-            Utils.DocFind(conn, "posts",
+            Utils.DocFind(conn,"posts", DocTestHelpers.FakePatterns("posts"),
                 filterJson: "{\"status\":\"published\"}",
                 sort: new Dictionary<string, int> { { "date", -1 } },
                 limit: 20,
@@ -189,7 +190,7 @@ namespace GoldLapel.Tests
         {
             var conn = new SpyConnection();
             Assert.Throws<ArgumentException>(() =>
-                Utils.DocFind(conn, "drop table--"));
+                Utils.DocFind(conn,"drop table--", DocTestHelpers.FakePatterns("drop table--")));
         }
 
         [Fact]
@@ -197,7 +198,7 @@ namespace GoldLapel.Tests
         {
             var conn = new SpyConnection();
             Assert.Throws<ArgumentException>(() =>
-                Utils.DocFind(conn, "users",
+                Utils.DocFind(conn,"users", DocTestHelpers.FakePatterns("users"),
                     sort: new Dictionary<string, int> { { "bad key!", 1 } }));
         }
     }
@@ -210,7 +211,7 @@ namespace GoldLapel.Tests
         public void BasicSql()
         {
             var conn = new SpyConnection();
-            Utils.DocFindOne(conn, "users");
+            Utils.DocFindOne(conn,"users", DocTestHelpers.FakePatterns("users"));
 
             var sql = conn.LastCommandText;
             Assert.Contains("SELECT _id, data, created_at, updated_at FROM users", sql);
@@ -222,7 +223,7 @@ namespace GoldLapel.Tests
         public void WithFilter()
         {
             var conn = new SpyConnection();
-            Utils.DocFindOne(conn, "users", filterJson: "{\"email\":\"a@b.com\"}");
+            Utils.DocFindOne(conn,"users", DocTestHelpers.FakePatterns("users"), filterJson: "{\"email\":\"a@b.com\"}");
 
             var sql = conn.LastCommandText;
             Assert.Contains("WHERE data @> @p0::jsonb", sql);
@@ -235,7 +236,7 @@ namespace GoldLapel.Tests
         {
             var conn = new SpyConnection();
             Assert.Throws<ArgumentException>(() =>
-                Utils.DocFindOne(conn, "bad;name"));
+                Utils.DocFindOne(conn,"bad;name", DocTestHelpers.FakePatterns("bad;name")));
         }
     }
 
@@ -247,7 +248,7 @@ namespace GoldLapel.Tests
         public void SqlGeneration()
         {
             var conn = new SpyConnection();
-            Utils.DocUpdate(conn, "users", "{\"active\":true}", "{\"role\":\"admin\"}");
+            Utils.DocUpdate(conn,"users", "{\"active\":true}", "{\"role\":\"admin\"}", DocTestHelpers.FakePatterns("users"));
 
             var sql = conn.LastCommandText;
             Assert.Contains("UPDATE users", sql);
@@ -260,7 +261,7 @@ namespace GoldLapel.Tests
         public void Parameters()
         {
             var conn = new SpyConnection();
-            Utils.DocUpdate(conn, "users", "{\"active\":true}", "{\"role\":\"admin\"}");
+            Utils.DocUpdate(conn,"users", "{\"active\":true}", "{\"role\":\"admin\"}", DocTestHelpers.FakePatterns("users"));
 
             Assert.Equal("{\"role\":\"admin\"}", conn.LastCommand.ParamValue("@p0"));
             Assert.Equal("{\"active\":true}", conn.LastCommand.ParamValue("@p1"));
@@ -271,7 +272,7 @@ namespace GoldLapel.Tests
         {
             var conn = new SpyConnection();
             Assert.Throws<ArgumentException>(() =>
-                Utils.DocUpdate(conn, "bad name", "{}", "{}"));
+                Utils.DocUpdate(conn,"bad name", "{}", "{}", DocTestHelpers.FakePatterns("bad name")));
         }
     }
 
@@ -283,7 +284,7 @@ namespace GoldLapel.Tests
         public void SqlGeneration()
         {
             var conn = new SpyConnection();
-            Utils.DocUpdateOne(conn, "users", "{\"name\":\"alice\"}", "{\"age\":30}");
+            Utils.DocUpdateOne(conn,"users", "{\"name\":\"alice\"}", "{\"age\":30}", DocTestHelpers.FakePatterns("users"));
 
             var sql = conn.LastCommandText;
             Assert.Contains("UPDATE users", sql);
@@ -296,7 +297,7 @@ namespace GoldLapel.Tests
         public void Parameters()
         {
             var conn = new SpyConnection();
-            Utils.DocUpdateOne(conn, "users", "{\"name\":\"alice\"}", "{\"age\":30}");
+            Utils.DocUpdateOne(conn,"users", "{\"name\":\"alice\"}", "{\"age\":30}", DocTestHelpers.FakePatterns("users"));
 
             Assert.Equal("{\"age\":30}", conn.LastCommand.ParamValue("@p1"));
             Assert.Equal("{\"name\":\"alice\"}", conn.LastCommand.ParamValue("@p0"));
@@ -307,7 +308,7 @@ namespace GoldLapel.Tests
         {
             var conn = new SpyConnection();
             Assert.Throws<ArgumentException>(() =>
-                Utils.DocUpdateOne(conn, "123bad", "{}", "{}"));
+                Utils.DocUpdateOne(conn,"123bad", "{}", "{}", DocTestHelpers.FakePatterns("123bad")));
         }
     }
 
@@ -319,7 +320,7 @@ namespace GoldLapel.Tests
         public void SqlGeneration()
         {
             var conn = new SpyConnection();
-            Utils.DocDelete(conn, "users", "{\"active\":false}");
+            Utils.DocDelete(conn,"users", "{\"active\":false}", DocTestHelpers.FakePatterns("users"));
 
             var sql = conn.LastCommandText;
             Assert.Contains("DELETE FROM users", sql);
@@ -330,7 +331,7 @@ namespace GoldLapel.Tests
         public void Parameters()
         {
             var conn = new SpyConnection();
-            Utils.DocDelete(conn, "users", "{\"active\":false}");
+            Utils.DocDelete(conn,"users", "{\"active\":false}", DocTestHelpers.FakePatterns("users"));
 
             Assert.Equal("{\"active\":false}", conn.LastCommand.ParamValue("@p0"));
         }
@@ -340,7 +341,7 @@ namespace GoldLapel.Tests
         {
             var conn = new SpyConnection();
             Assert.Throws<ArgumentException>(() =>
-                Utils.DocDelete(conn, "bad table", "{}"));
+                Utils.DocDelete(conn,"bad table", "{}", DocTestHelpers.FakePatterns("bad table")));
         }
     }
 
@@ -352,7 +353,7 @@ namespace GoldLapel.Tests
         public void SqlGeneration()
         {
             var conn = new SpyConnection();
-            Utils.DocDeleteOne(conn, "users", "{\"name\":\"alice\"}");
+            Utils.DocDeleteOne(conn,"users", "{\"name\":\"alice\"}", DocTestHelpers.FakePatterns("users"));
 
             var sql = conn.LastCommandText;
             Assert.Contains("DELETE FROM users", sql);
@@ -364,7 +365,7 @@ namespace GoldLapel.Tests
         public void Parameters()
         {
             var conn = new SpyConnection();
-            Utils.DocDeleteOne(conn, "users", "{\"name\":\"alice\"}");
+            Utils.DocDeleteOne(conn,"users", "{\"name\":\"alice\"}", DocTestHelpers.FakePatterns("users"));
 
             Assert.Equal("{\"name\":\"alice\"}", conn.LastCommand.ParamValue("@p0"));
         }
@@ -374,7 +375,7 @@ namespace GoldLapel.Tests
         {
             var conn = new SpyConnection();
             Assert.Throws<ArgumentException>(() =>
-                Utils.DocDeleteOne(conn, "x;y", "{}"));
+                Utils.DocDeleteOne(conn,"x;y", "{}", DocTestHelpers.FakePatterns("x;y")));
         }
     }
 
@@ -389,7 +390,7 @@ namespace GoldLapel.Tests
             // DocCount calls ExecuteScalar, SpyCommand returns null by default.
             // We need to set up the spy to return a value.
             conn.NextScalarResult = 42L;
-            Utils.DocCount(conn, "users");
+            Utils.DocCount(conn,"users", DocTestHelpers.FakePatterns("users"));
 
             var sql = conn.LastCommandText;
             Assert.Contains("SELECT COUNT(*) FROM users", sql);
@@ -401,7 +402,7 @@ namespace GoldLapel.Tests
         {
             var conn = new SpyConnection();
             conn.NextScalarResult = 5L;
-            Utils.DocCount(conn, "users", filterJson: "{\"active\":true}");
+            Utils.DocCount(conn,"users", DocTestHelpers.FakePatterns("users"), filterJson: "{\"active\":true}");
 
             var sql = conn.LastCommandText;
             Assert.Contains("SELECT COUNT(*) FROM users", sql);
@@ -414,7 +415,7 @@ namespace GoldLapel.Tests
         {
             var conn = new SpyConnection();
             Assert.Throws<ArgumentException>(() =>
-                Utils.DocCount(conn, "bad!name"));
+                Utils.DocCount(conn,"bad!name", DocTestHelpers.FakePatterns("bad!name")));
         }
     }
 
@@ -426,12 +427,12 @@ namespace GoldLapel.Tests
         public void DefaultGinIndex()
         {
             var conn = new SpyConnection();
-            Utils.DocCreateIndex(conn, "users");
+            Utils.DocCreateIndex(conn,"users", DocTestHelpers.FakePatterns("users"));
 
-            // Commands[0] = CREATE TABLE, Commands[1] = CREATE INDEX
-            Assert.Equal(2, conn.Commands.Count);
-            var indexCmd = conn.Commands[1];
-            Assert.Contains("CREATE INDEX IF NOT EXISTS users_data_gin", indexCmd.CommandText);
+            // Proxy owns DDL — only the CREATE INDEX runs through the wrapper.
+            Assert.Single(conn.Commands);
+            var indexCmd = conn.Commands[0];
+            Assert.Contains("CREATE INDEX IF NOT EXISTS idx_users_data_gin", indexCmd.CommandText);
             Assert.Contains("USING GIN (data)", indexCmd.CommandText);
         }
 
@@ -439,9 +440,9 @@ namespace GoldLapel.Tests
         public void NullKeysCreatesGinIndex()
         {
             var conn = new SpyConnection();
-            Utils.DocCreateIndex(conn, "users", null);
+            Utils.DocCreateIndex(conn,"users", DocTestHelpers.FakePatterns("users"), null);
 
-            var indexCmd = conn.Commands[1];
+            var indexCmd = conn.Commands[0];
             Assert.Contains("USING GIN (data)", indexCmd.CommandText);
         }
 
@@ -449,9 +450,9 @@ namespace GoldLapel.Tests
         public void EmptyKeysCreatesGinIndex()
         {
             var conn = new SpyConnection();
-            Utils.DocCreateIndex(conn, "users", new List<string>());
+            Utils.DocCreateIndex(conn,"users", DocTestHelpers.FakePatterns("users"), new List<string>());
 
-            var indexCmd = conn.Commands[1];
+            var indexCmd = conn.Commands[0];
             Assert.Contains("USING GIN (data)", indexCmd.CommandText);
         }
 
@@ -459,10 +460,10 @@ namespace GoldLapel.Tests
         public void SingleKeyBtreeIndex()
         {
             var conn = new SpyConnection();
-            Utils.DocCreateIndex(conn, "users", new List<string> { "email" });
+            Utils.DocCreateIndex(conn,"users", DocTestHelpers.FakePatterns("users"), new List<string> { "email" });
 
-            var indexCmd = conn.Commands[1];
-            Assert.Contains("CREATE INDEX IF NOT EXISTS users_email_idx", indexCmd.CommandText);
+            var indexCmd = conn.Commands[0];
+            Assert.Contains("CREATE INDEX IF NOT EXISTS idx_users_email", indexCmd.CommandText);
             Assert.Contains("(data->>'email')", indexCmd.CommandText);
             Assert.DoesNotContain("GIN", indexCmd.CommandText);
         }
@@ -471,20 +472,22 @@ namespace GoldLapel.Tests
         public void MultiKeyBtreeIndex()
         {
             var conn = new SpyConnection();
-            Utils.DocCreateIndex(conn, "orders", new List<string> { "status", "date" });
+            Utils.DocCreateIndex(conn,"orders", DocTestHelpers.FakePatterns("orders"), new List<string> { "status", "date" });
 
-            var indexCmd = conn.Commands[1];
-            Assert.Contains("CREATE INDEX IF NOT EXISTS orders_status_date_idx", indexCmd.CommandText);
+            var indexCmd = conn.Commands[0];
+            Assert.Contains("CREATE INDEX IF NOT EXISTS idx_orders_status_date", indexCmd.CommandText);
             Assert.Contains("(data->>'status'), (data->>'date')", indexCmd.CommandText);
         }
 
         [Fact]
-        public void CreatesTableFirst()
+        public void DoesNotCreateTable()
         {
+            // Proxy owns DDL — no CREATE TABLE ever runs through the wrapper.
             var conn = new SpyConnection();
-            Utils.DocCreateIndex(conn, "users");
+            Utils.DocCreateIndex(conn,"users", DocTestHelpers.FakePatterns("users"));
 
-            Assert.Contains("CREATE TABLE IF NOT EXISTS users", conn.Commands[0].CommandText);
+            foreach (var c in conn.Commands)
+                Assert.DoesNotContain("CREATE TABLE", c.CommandText);
         }
 
         [Fact]
@@ -492,7 +495,7 @@ namespace GoldLapel.Tests
         {
             var conn = new SpyConnection();
             Assert.Throws<ArgumentException>(() =>
-                Utils.DocCreateIndex(conn, "bad name"));
+                Utils.DocCreateIndex(conn,"bad name", DocTestHelpers.FakePatterns("bad name")));
         }
 
         [Fact]
@@ -500,7 +503,7 @@ namespace GoldLapel.Tests
         {
             var conn = new SpyConnection();
             Assert.Throws<ArgumentException>(() =>
-                Utils.DocCreateIndex(conn, "users", new List<string> { "bad key!" }));
+                Utils.DocCreateIndex(conn,"users", DocTestHelpers.FakePatterns("users"), new List<string> { "bad key!" }));
         }
     }
 
@@ -512,12 +515,12 @@ namespace GoldLapel.Tests
         public void FullPipeline()
         {
             var conn = new SpyConnection();
-            Utils.DocAggregate(conn, "orders",
+            Utils.DocAggregate(conn,"orders",
                 "[{\"$match\": {\"status\":\"shipped\"}}, " +
                 "{\"$group\": {\"_id\": \"$region\", \"total\": {\"$sum\": \"$amount\"}}}, " +
                 "{\"$sort\": {\"total\": -1}}, " +
                 "{\"$limit\": 10}, " +
-                "{\"$skip\": 5}]");
+                "{\"$skip\": 5}]", DocTestHelpers.FakePatterns("orders"));
 
             var sql = conn.LastCommandText;
             Assert.Contains("SELECT data->>'region' AS _id, SUM((data->>'amount')::numeric) AS total", sql);
@@ -536,14 +539,14 @@ namespace GoldLapel.Tests
         public void Accumulators()
         {
             var conn = new SpyConnection();
-            Utils.DocAggregate(conn, "orders",
+            Utils.DocAggregate(conn,"orders",
                 "[{\"$group\": {" +
                 "\"_id\": \"$category\", " +
                 "\"cnt\": {\"$sum\": 1}, " +
                 "\"total\": {\"$sum\": \"$price\"}, " +
                 "\"mean\": {\"$avg\": \"$price\"}, " +
                 "\"lo\": {\"$min\": \"$price\"}, " +
-                "\"hi\": {\"$max\": \"$price\"}}}]");
+                "\"hi\": {\"$max\": \"$price\"}}}]", DocTestHelpers.FakePatterns("orders"));
 
             var sql = conn.LastCommandText;
             Assert.Contains("COUNT(*) AS cnt", sql);
@@ -558,8 +561,8 @@ namespace GoldLapel.Tests
         public void NullGroupId()
         {
             var conn = new SpyConnection();
-            Utils.DocAggregate(conn, "orders",
-                "[{\"$group\": {\"_id\": null, \"total\": {\"$sum\": \"$amount\"}}}]");
+            Utils.DocAggregate(conn,"orders",
+                "[{\"$group\": {\"_id\": null, \"total\": {\"$sum\": \"$amount\"}}}]", DocTestHelpers.FakePatterns("orders"));
 
             var sql = conn.LastCommandText;
             Assert.Contains("SUM((data->>'amount')::numeric) AS total", sql);
@@ -571,8 +574,8 @@ namespace GoldLapel.Tests
         public void MatchOnly()
         {
             var conn = new SpyConnection();
-            Utils.DocAggregate(conn, "users",
-                "[{\"$match\": {\"active\":true}}]");
+            Utils.DocAggregate(conn,"users",
+                "[{\"$match\": {\"active\":true}}]", DocTestHelpers.FakePatterns("users"));
 
             var sql = conn.LastCommandText;
             Assert.Contains("SELECT _id, data, created_at, updated_at FROM users", sql);
@@ -585,8 +588,8 @@ namespace GoldLapel.Tests
         public void SortBeforeGroup()
         {
             var conn = new SpyConnection();
-            Utils.DocAggregate(conn, "users",
-                "[{\"$sort\": {\"name\": 1}}]");
+            Utils.DocAggregate(conn,"users",
+                "[{\"$sort\": {\"name\": 1}}]", DocTestHelpers.FakePatterns("users"));
 
             var sql = conn.LastCommandText;
             Assert.Contains("ORDER BY data->>'name' ASC", sql);
@@ -596,9 +599,9 @@ namespace GoldLapel.Tests
         public void SortAfterGroup()
         {
             var conn = new SpyConnection();
-            Utils.DocAggregate(conn, "users",
+            Utils.DocAggregate(conn,"users",
                 "[{\"$group\": {\"_id\": \"$role\", \"cnt\": {\"$sum\": 1}}}, " +
-                "{\"$sort\": {\"cnt\": -1}}]");
+                "{\"$sort\": {\"cnt\": -1}}]", DocTestHelpers.FakePatterns("users"));
 
             var sql = conn.LastCommandText;
             Assert.Contains("ORDER BY cnt DESC", sql);
@@ -609,7 +612,7 @@ namespace GoldLapel.Tests
         public void EmptyPipeline()
         {
             var conn = new SpyConnection();
-            Utils.DocAggregate(conn, "users", "[]");
+            Utils.DocAggregate(conn,"users", "[]", DocTestHelpers.FakePatterns("users"));
 
             var sql = conn.LastCommandText;
             Assert.Contains("SELECT _id, data, created_at, updated_at FROM users", sql);
@@ -621,8 +624,8 @@ namespace GoldLapel.Tests
         public void CountAccumulator()
         {
             var conn = new SpyConnection();
-            Utils.DocAggregate(conn, "events",
-                "[{\"$group\": {\"_id\": \"$type\", \"n\": {\"$count\": {}}}}]");
+            Utils.DocAggregate(conn,"events",
+                "[{\"$group\": {\"_id\": \"$type\", \"n\": {\"$count\": {}}}}]", DocTestHelpers.FakePatterns("events"));
 
             var sql = conn.LastCommandText;
             Assert.Contains("COUNT(*) AS n", sql);
@@ -633,7 +636,7 @@ namespace GoldLapel.Tests
         {
             var conn = new SpyConnection();
             Assert.Throws<ArgumentException>(() =>
-                Utils.DocAggregate(conn, "users", "[{\"$bucket\": {}}]"));
+                Utils.DocAggregate(conn,"users", "[{\"$bucket\": {}}]", DocTestHelpers.FakePatterns("users")));
         }
 
         [Fact]
@@ -641,7 +644,7 @@ namespace GoldLapel.Tests
         {
             var conn = new SpyConnection();
             Assert.Throws<ArgumentException>(() =>
-                Utils.DocAggregate(conn, "bad table", "[]"));
+                Utils.DocAggregate(conn,"bad table", "[]", DocTestHelpers.FakePatterns("bad table")));
         }
 
         [Fact]
@@ -649,7 +652,7 @@ namespace GoldLapel.Tests
         {
             var conn = new SpyConnection();
             Assert.Throws<ArgumentException>(() =>
-                Utils.DocAggregate(conn, "users", null));
+                Utils.DocAggregate(conn,"users", null, DocTestHelpers.FakePatterns("users")));
         }
 
         [Fact]
@@ -657,8 +660,8 @@ namespace GoldLapel.Tests
         {
             var conn = new SpyConnection();
             Assert.Throws<ArgumentException>(() =>
-                Utils.DocAggregate(conn, "users",
-                    "[{\"$group\": {\"_id\": \"$bad field!\", \"n\": {\"$sum\": 1}}}]"));
+                Utils.DocAggregate(conn,"users",
+                    "[{\"$group\": {\"_id\": \"$bad field!\", \"n\": {\"$sum\": 1}}}]", DocTestHelpers.FakePatterns("users")));
         }
 
         [Fact]
@@ -666,8 +669,8 @@ namespace GoldLapel.Tests
         {
             var conn = new SpyConnection();
             Assert.Throws<ArgumentException>(() =>
-                Utils.DocAggregate(conn, "users",
-                    "[{\"$group\": {\"_id\": null, \"n\": {\"$sum\": \"$bad field!\"}}}]"));
+                Utils.DocAggregate(conn,"users",
+                    "[{\"$group\": {\"_id\": null, \"n\": {\"$sum\": \"$bad field!\"}}}]", DocTestHelpers.FakePatterns("users")));
         }
 
         [Fact]
@@ -675,16 +678,16 @@ namespace GoldLapel.Tests
         {
             var conn = new SpyConnection();
             Assert.Throws<ArgumentException>(() =>
-                Utils.DocAggregate(conn, "users",
-                    "[{\"$group\": {\"_id\": null, \"n\": {\"$first\": \"$name\"}}}]"));
+                Utils.DocAggregate(conn,"users",
+                    "[{\"$group\": {\"_id\": null, \"n\": {\"$first\": \"$name\"}}}]", DocTestHelpers.FakePatterns("users")));
         }
 
         [Fact]
         public void CompositeGroupId()
         {
             var conn = new SpyConnection();
-            Utils.DocAggregate(conn, "orders",
-                "[{\"$group\": {\"_id\": {\"region\": \"$region\", \"year\": \"$year\"}, \"total\": {\"$sum\": \"$amount\"}}}]");
+            Utils.DocAggregate(conn,"orders",
+                "[{\"$group\": {\"_id\": {\"region\": \"$region\", \"year\": \"$year\"}, \"total\": {\"$sum\": \"$amount\"}}}]", DocTestHelpers.FakePatterns("orders"));
 
             var sql = conn.LastCommandText;
             Assert.Contains("json_build_object('region', data->>'region', 'year', data->>'year') AS _id", sql);
@@ -696,8 +699,8 @@ namespace GoldLapel.Tests
         public void CompositeGroupIdSingleKey()
         {
             var conn = new SpyConnection();
-            Utils.DocAggregate(conn, "events",
-                "[{\"$group\": {\"_id\": {\"type\": \"$type\"}, \"cnt\": {\"$sum\": 1}}}]");
+            Utils.DocAggregate(conn,"events",
+                "[{\"$group\": {\"_id\": {\"type\": \"$type\"}, \"cnt\": {\"$sum\": 1}}}]", DocTestHelpers.FakePatterns("events"));
 
             var sql = conn.LastCommandText;
             Assert.Contains("json_build_object('type', data->>'type') AS _id", sql);
@@ -710,8 +713,8 @@ namespace GoldLapel.Tests
         {
             var conn = new SpyConnection();
             Assert.Throws<ArgumentException>(() =>
-                Utils.DocAggregate(conn, "orders",
-                    "[{\"$group\": {\"_id\": {\"x\": \"$bad field!\"}, \"n\": {\"$sum\": 1}}}]"));
+                Utils.DocAggregate(conn,"orders",
+                    "[{\"$group\": {\"_id\": {\"x\": \"$bad field!\"}, \"n\": {\"$sum\": 1}}}]", DocTestHelpers.FakePatterns("orders")));
         }
 
         [Fact]
@@ -719,16 +722,16 @@ namespace GoldLapel.Tests
         {
             var conn = new SpyConnection();
             Assert.Throws<ArgumentException>(() =>
-                Utils.DocAggregate(conn, "orders",
-                    "[{\"$group\": {\"_id\": {\"bad key!\": \"$region\"}, \"n\": {\"$sum\": 1}}}]"));
+                Utils.DocAggregate(conn,"orders",
+                    "[{\"$group\": {\"_id\": {\"bad key!\": \"$region\"}, \"n\": {\"$sum\": 1}}}]", DocTestHelpers.FakePatterns("orders")));
         }
 
         [Fact]
         public void PushAccumulator()
         {
             var conn = new SpyConnection();
-            Utils.DocAggregate(conn, "orders",
-                "[{\"$group\": {\"_id\": \"$region\", \"items\": {\"$push\": \"$item\"}}}]");
+            Utils.DocAggregate(conn,"orders",
+                "[{\"$group\": {\"_id\": \"$region\", \"items\": {\"$push\": \"$item\"}}}]", DocTestHelpers.FakePatterns("orders"));
 
             var sql = conn.LastCommandText;
             Assert.Contains("array_agg(data->>'item') AS items", sql);
@@ -739,8 +742,8 @@ namespace GoldLapel.Tests
         public void AddToSetAccumulator()
         {
             var conn = new SpyConnection();
-            Utils.DocAggregate(conn, "orders",
-                "[{\"$group\": {\"_id\": \"$region\", \"tags\": {\"$addToSet\": \"$tag\"}}}]");
+            Utils.DocAggregate(conn,"orders",
+                "[{\"$group\": {\"_id\": \"$region\", \"tags\": {\"$addToSet\": \"$tag\"}}}]", DocTestHelpers.FakePatterns("orders"));
 
             var sql = conn.LastCommandText;
             Assert.Contains("array_agg(DISTINCT data->>'tag') AS tags", sql);
@@ -751,8 +754,8 @@ namespace GoldLapel.Tests
         public void PushWithNullGroupId()
         {
             var conn = new SpyConnection();
-            Utils.DocAggregate(conn, "events",
-                "[{\"$group\": {\"_id\": null, \"names\": {\"$push\": \"$name\"}}}]");
+            Utils.DocAggregate(conn,"events",
+                "[{\"$group\": {\"_id\": null, \"names\": {\"$push\": \"$name\"}}}]", DocTestHelpers.FakePatterns("events"));
 
             var sql = conn.LastCommandText;
             Assert.Contains("array_agg(data->>'name') AS names", sql);
@@ -765,8 +768,8 @@ namespace GoldLapel.Tests
         {
             var conn = new SpyConnection();
             Assert.Throws<ArgumentException>(() =>
-                Utils.DocAggregate(conn, "orders",
-                    "[{\"$group\": {\"_id\": null, \"x\": {\"$addToSet\": \"$bad field!\"}}}]"));
+                Utils.DocAggregate(conn,"orders",
+                    "[{\"$group\": {\"_id\": null, \"x\": {\"$addToSet\": \"$bad field!\"}}}]", DocTestHelpers.FakePatterns("orders")));
         }
     }
 
@@ -778,8 +781,8 @@ namespace GoldLapel.Tests
         public void ProjectInclude()
         {
             var conn = new SpyConnection();
-            Utils.DocAggregate(conn, "users",
-                "[{\"$project\": {\"name\": 1, \"status\": 1}}]");
+            Utils.DocAggregate(conn,"users",
+                "[{\"$project\": {\"name\": 1, \"status\": 1}}]", DocTestHelpers.FakePatterns("users"));
 
             var sql = conn.LastCommandText;
             Assert.Contains("data->>'name' AS name", sql);
@@ -790,8 +793,8 @@ namespace GoldLapel.Tests
         public void ProjectExcludeId()
         {
             var conn = new SpyConnection();
-            Utils.DocAggregate(conn, "users",
-                "[{\"$project\": {\"_id\": 0, \"name\": 1}}]");
+            Utils.DocAggregate(conn,"users",
+                "[{\"$project\": {\"_id\": 0, \"name\": 1}}]", DocTestHelpers.FakePatterns("users"));
 
             var sql = conn.LastCommandText;
             Assert.DoesNotContain("AS _id", sql);
@@ -802,8 +805,8 @@ namespace GoldLapel.Tests
         public void ProjectRename()
         {
             var conn = new SpyConnection();
-            Utils.DocAggregate(conn, "users",
-                "[{\"$project\": {\"fullName\": \"$name\"}}]");
+            Utils.DocAggregate(conn,"users",
+                "[{\"$project\": {\"fullName\": \"$name\"}}]", DocTestHelpers.FakePatterns("users"));
 
             var sql = conn.LastCommandText;
             Assert.Contains("data->>'name' AS fullName", sql);
@@ -813,9 +816,9 @@ namespace GoldLapel.Tests
         public void ProjectAfterGroup()
         {
             var conn = new SpyConnection();
-            Utils.DocAggregate(conn, "products",
+            Utils.DocAggregate(conn,"products",
                 "[{\"$group\": {\"_id\": \"$category\", \"count\": {\"$sum\": 1}}}, " +
-                "{\"$project\": {\"_id\": 1, \"count\": 1}}]");
+                "{\"$project\": {\"_id\": 1, \"count\": 1}}]", DocTestHelpers.FakePatterns("products"));
 
             var sql = conn.LastCommandText;
             // $project after $group should pass through aliases, not data->>
@@ -828,8 +831,8 @@ namespace GoldLapel.Tests
         public void ProjectDotNotation()
         {
             var conn = new SpyConnection();
-            Utils.DocAggregate(conn, "users",
-                "[{\"$project\": {\"city\": \"$addr.city\"}}]");
+            Utils.DocAggregate(conn,"users",
+                "[{\"$project\": {\"city\": \"$addr.city\"}}]", DocTestHelpers.FakePatterns("users"));
 
             var sql = conn.LastCommandText;
             Assert.Contains("data->'addr'->>'city' AS city", sql);
@@ -844,8 +847,8 @@ namespace GoldLapel.Tests
         public void UnwindBasic()
         {
             var conn = new SpyConnection();
-            Utils.DocAggregate(conn, "posts",
-                "[{\"$unwind\": \"$tags\"}]");
+            Utils.DocAggregate(conn,"posts",
+                "[{\"$unwind\": \"$tags\"}]", DocTestHelpers.FakePatterns("posts"));
 
             var sql = conn.LastCommandText;
             Assert.Contains("jsonb_array_elements_text(data->'tags') AS _unwound_tags", sql);
@@ -855,9 +858,9 @@ namespace GoldLapel.Tests
         public void UnwindThenGroup()
         {
             var conn = new SpyConnection();
-            Utils.DocAggregate(conn, "posts",
+            Utils.DocAggregate(conn,"posts",
                 "[{\"$unwind\": \"$tags\"}, " +
-                "{\"$group\": {\"_id\": \"$tags\", \"count\": {\"$sum\": 1}}}]");
+                "{\"$group\": {\"_id\": \"$tags\", \"count\": {\"$sum\": 1}}}]", DocTestHelpers.FakePatterns("posts"));
 
             var sql = conn.LastCommandText;
             Assert.Contains("_unwound_tags AS _id", sql);
@@ -869,8 +872,8 @@ namespace GoldLapel.Tests
         public void UnwindObjectForm()
         {
             var conn = new SpyConnection();
-            Utils.DocAggregate(conn, "posts",
-                "[{\"$unwind\": {\"path\": \"$tags\"}}]");
+            Utils.DocAggregate(conn,"posts",
+                "[{\"$unwind\": {\"path\": \"$tags\"}}]", DocTestHelpers.FakePatterns("posts"));
 
             var sql = conn.LastCommandText;
             Assert.Contains("jsonb_array_elements_text(data->'tags') AS _unwound_tags", sql);
@@ -881,8 +884,8 @@ namespace GoldLapel.Tests
         {
             var conn = new SpyConnection();
             Assert.Throws<ArgumentException>(() =>
-                Utils.DocAggregate(conn, "posts",
-                    "[{\"$unwind\": \"no_dollar\"}]"));
+                Utils.DocAggregate(conn,"posts",
+                    "[{\"$unwind\": \"no_dollar\"}]", DocTestHelpers.FakePatterns("posts")));
         }
     }
 
@@ -894,12 +897,12 @@ namespace GoldLapel.Tests
         public void LookupBasic()
         {
             var conn = new SpyConnection();
-            Utils.DocAggregate(conn, "users",
+            Utils.DocAggregate(conn,"users",
                 "[{\"$lookup\": {" +
                 "\"from\": \"orders\", " +
                 "\"localField\": \"uid\", " +
                 "\"foreignField\": \"uid\", " +
-                "\"as\": \"user_orders\"}}]");
+                "\"as\": \"user_orders\"}}]", DocTestHelpers.FakePatterns("users"));
 
             var sql = conn.LastCommandText;
             Assert.Contains("COALESCE(", sql);
@@ -915,8 +918,8 @@ namespace GoldLapel.Tests
         {
             var conn = new SpyConnection();
             Assert.Throws<ArgumentException>(() =>
-                Utils.DocAggregate(conn, "users",
-                    "[{\"$lookup\": {\"localField\": \"uid\", \"foreignField\": \"uid\", \"as\": \"x\"}}]"));
+                Utils.DocAggregate(conn,"users",
+                    "[{\"$lookup\": {\"localField\": \"uid\", \"foreignField\": \"uid\", \"as\": \"x\"}}]", DocTestHelpers.FakePatterns("users")));
         }
 
         [Fact]
@@ -924,12 +927,12 @@ namespace GoldLapel.Tests
         {
             var conn = new SpyConnection();
             Assert.Throws<ArgumentException>(() =>
-                Utils.DocAggregate(conn, "users",
+                Utils.DocAggregate(conn,"users",
                     "[{\"$lookup\": {" +
                     "\"from\": \"DROP TABLE; --\", " +
                     "\"localField\": \"uid\", " +
                     "\"foreignField\": \"uid\", " +
-                    "\"as\": \"x\"}}]"));
+                    "\"as\": \"x\"}}]", DocTestHelpers.FakePatterns("users")));
         }
     }
 
@@ -941,12 +944,12 @@ namespace GoldLapel.Tests
         public void UnwindGroupMatchSortLimit()
         {
             var conn = new SpyConnection();
-            Utils.DocAggregate(conn, "posts",
+            Utils.DocAggregate(conn,"posts",
                 "[{\"$match\": {\"status\":\"published\"}}, " +
                 "{\"$unwind\": \"$tags\"}, " +
                 "{\"$group\": {\"_id\": \"$tags\", \"count\": {\"$sum\": 1}}}, " +
                 "{\"$sort\": {\"count\": -1}}, " +
-                "{\"$limit\": 5}]");
+                "{\"$limit\": 5}]", DocTestHelpers.FakePatterns("posts"));
 
             var sql = conn.LastCommandText;
             // FROM has the unwind cross join
@@ -1113,7 +1116,7 @@ namespace GoldLapel.Tests
         public void SingleDottedKeyExpandsToNestedObject()
         {
             var conn = new SpyConnection();
-            Utils.DocFind(conn, "users", filterJson: "{\"addr.city\": \"NY\"}");
+            Utils.DocFind(conn,"users", DocTestHelpers.FakePatterns("users"), filterJson: "{\"addr.city\": \"NY\"}");
 
             var sql = conn.LastCommandText;
             Assert.Contains("data @> @p0::jsonb", sql);
@@ -1124,7 +1127,7 @@ namespace GoldLapel.Tests
         public void MultiLevelDottedKeyExpandsToDeeplyNested()
         {
             var conn = new SpyConnection();
-            Utils.DocFind(conn, "users", filterJson: "{\"a.b.c\": 42}");
+            Utils.DocFind(conn,"users", DocTestHelpers.FakePatterns("users"), filterJson: "{\"a.b.c\": 42}");
 
             Assert.Equal("{\"a\": {\"b\": {\"c\": 42}}}", conn.LastCommand.ParamValue("@p0"));
         }
@@ -1133,7 +1136,7 @@ namespace GoldLapel.Tests
         public void NonDottedKeyPassesThroughUnchanged()
         {
             var conn = new SpyConnection();
-            Utils.DocFind(conn, "users", filterJson: "{\"status\": \"active\"}");
+            Utils.DocFind(conn,"users", DocTestHelpers.FakePatterns("users"), filterJson: "{\"status\": \"active\"}");
 
             Assert.Equal("{\"status\": \"active\"}", conn.LastCommand.ParamValue("@p0"));
         }
@@ -1142,7 +1145,7 @@ namespace GoldLapel.Tests
         public void MixedDottedAndPlainKeys()
         {
             var conn = new SpyConnection();
-            Utils.DocFind(conn, "users", filterJson: "{\"addr.city\": \"NY\", \"active\": true}");
+            Utils.DocFind(conn,"users", DocTestHelpers.FakePatterns("users"), filterJson: "{\"addr.city\": \"NY\", \"active\": true}");
 
             Assert.Equal("{\"addr\": {\"city\": \"NY\"}, \"active\": true}", conn.LastCommand.ParamValue("@p0"));
         }
@@ -1151,7 +1154,7 @@ namespace GoldLapel.Tests
         public void MultipleDottedKeysSharingPrefixMerge()
         {
             var conn = new SpyConnection();
-            Utils.DocFind(conn, "users", filterJson: "{\"addr.city\": \"NY\", \"addr.zip\": \"10001\"}");
+            Utils.DocFind(conn,"users", DocTestHelpers.FakePatterns("users"), filterJson: "{\"addr.city\": \"NY\", \"addr.zip\": \"10001\"}");
 
             Assert.Equal("{\"addr\": {\"city\": \"NY\", \"zip\": \"10001\"}}", conn.LastCommand.ParamValue("@p0"));
         }
@@ -1161,7 +1164,7 @@ namespace GoldLapel.Tests
         {
             var conn = new SpyConnection();
             conn.NextScalarResult = 3L;
-            Utils.DocCount(conn, "orders", filterJson: "{\"ship.country\": \"US\"}");
+            Utils.DocCount(conn,"orders", DocTestHelpers.FakePatterns("orders"), filterJson: "{\"ship.country\": \"US\"}");
 
             var sql = conn.LastCommandText;
             Assert.Contains("data @> @p0::jsonb", sql);
@@ -1172,7 +1175,7 @@ namespace GoldLapel.Tests
         public void DotExpansionWorksInDocUpdate()
         {
             var conn = new SpyConnection();
-            Utils.DocUpdate(conn, "users", "{\"profile.verified\": true}", "{\"level\":\"pro\"}");
+            Utils.DocUpdate(conn,"users", "{\"profile.verified\": true}", "{\"level\":\"pro\"}", DocTestHelpers.FakePatterns("users"));
 
             Assert.Equal("{\"level\":\"pro\"}", conn.LastCommand.ParamValue("@p0"));
             Assert.Equal("{\"profile\": {\"verified\": true}}", conn.LastCommand.ParamValue("@p1"));
@@ -1182,7 +1185,7 @@ namespace GoldLapel.Tests
         public void DotExpansionWorksInDocDelete()
         {
             var conn = new SpyConnection();
-            Utils.DocDelete(conn, "logs", "{\"meta.source\": \"test\"}");
+            Utils.DocDelete(conn,"logs", "{\"meta.source\": \"test\"}", DocTestHelpers.FakePatterns("logs"));
 
             Assert.Equal("{\"meta\": {\"source\": \"test\"}}", conn.LastCommand.ParamValue("@p0"));
         }
@@ -1198,7 +1201,7 @@ namespace GoldLapel.Tests
             var conn = new SpyConnection();
             // DocWatch will fail when trying to create a listen connection
             // (SpyConnection isn't Npgsql), but trigger DDL is executed first
-            try { Utils.DocWatch(conn, "events", (ch, msg) => { }); }
+            try { Utils.DocWatch(conn,"events", (ch, msg) => { }, DocTestHelpers.FakePatterns("events")); }
             catch (Exception) { }
 
             var sqls = conn.Commands.Select(c => c.CommandText).ToList();
@@ -1211,7 +1214,7 @@ namespace GoldLapel.Tests
         public void TriggerUsesCorrectChannel()
         {
             var conn = new SpyConnection();
-            try { Utils.DocWatch(conn, "orders", (ch, msg) => { }); }
+            try { Utils.DocWatch(conn,"orders", (ch, msg) => { }, DocTestHelpers.FakePatterns("orders")); }
             catch (Exception) { }
 
             var sqls = conn.Commands.Select(c => c.CommandText).ToList();
@@ -1223,7 +1226,7 @@ namespace GoldLapel.Tests
         {
             var conn = new SpyConnection();
             Assert.Throws<ArgumentException>(() =>
-                Utils.DocWatch(conn, "bad; name", (ch, msg) => { }));
+                Utils.DocWatch(conn,"bad; name", (ch, msg) => { }, DocTestHelpers.FakePatterns("bad; name")));
         }
     }
 
@@ -1235,7 +1238,7 @@ namespace GoldLapel.Tests
         public void DropsTriggerAndFunction()
         {
             var conn = new SpyConnection();
-            Utils.DocUnwatch(conn, "events");
+            Utils.DocUnwatch(conn,"events", DocTestHelpers.FakePatterns("events"));
 
             var sqls = conn.Commands.Select(c => c.CommandText).ToList();
             Assert.Contains("DROP TRIGGER IF EXISTS _gl_watch_events_trigger ON events", sqls);
@@ -1247,7 +1250,7 @@ namespace GoldLapel.Tests
         {
             var conn = new SpyConnection();
             Assert.Throws<ArgumentException>(() =>
-                Utils.DocUnwatch(conn, "bad; name"));
+                Utils.DocUnwatch(conn,"bad; name", DocTestHelpers.FakePatterns("bad; name")));
         }
     }
 
@@ -1259,7 +1262,7 @@ namespace GoldLapel.Tests
         public void CreatesIndexAndTrigger()
         {
             var conn = new SpyConnection();
-            Utils.DocCreateTtlIndex(conn, "sessions", 3600);
+            Utils.DocCreateTtlIndex(conn,"sessions", 3600, DocTestHelpers.FakePatterns("sessions"));
 
             var sqls = conn.Commands.Select(c => c.CommandText).ToList();
             Assert.True(sqls.Any(s => s.Contains("CREATE INDEX IF NOT EXISTS idx_sessions_ttl")));
@@ -1273,7 +1276,7 @@ namespace GoldLapel.Tests
         {
             var conn = new SpyConnection();
             Assert.Throws<ArgumentException>(() =>
-                Utils.DocCreateTtlIndex(conn, "bad; name", 3600));
+                Utils.DocCreateTtlIndex(conn,"bad; name", 3600, DocTestHelpers.FakePatterns("bad; name")));
         }
     }
 
@@ -1285,7 +1288,7 @@ namespace GoldLapel.Tests
         public void DropsTriggerFunctionAndIndex()
         {
             var conn = new SpyConnection();
-            Utils.DocRemoveTtlIndex(conn, "sessions");
+            Utils.DocRemoveTtlIndex(conn,"sessions", DocTestHelpers.FakePatterns("sessions"));
 
             var sqls = conn.Commands.Select(c => c.CommandText).ToList();
             Assert.Contains("DROP TRIGGER IF EXISTS _gl_ttl_sessions_trigger ON sessions", sqls);
@@ -1298,7 +1301,7 @@ namespace GoldLapel.Tests
         {
             var conn = new SpyConnection();
             Assert.Throws<ArgumentException>(() =>
-                Utils.DocRemoveTtlIndex(conn, "bad; name"));
+                Utils.DocRemoveTtlIndex(conn,"bad; name", DocTestHelpers.FakePatterns("bad; name")));
         }
     }
 
@@ -1306,32 +1309,28 @@ namespace GoldLapel.Tests
 
     public class DocCreateCollectionTest
     {
+        // DocCreateCollection is now a no-op on the wrapper side: by the time
+        // it's called, the proxy has already issued the canonical CREATE TABLE
+        // (with the right `unlogged` flag) on its mgmt connection. Wrapper
+        // verbs that materialize collections do so by fetching DDL patterns,
+        // which is exercised end-to-end by the integration tests.
+
         [Fact]
-        public void CreatesRegularTableByDefault()
+        public void IsNoOpOnTheWrapperSide()
         {
             var conn = new SpyConnection();
-            Utils.DocCreateCollection(conn, "users");
-
-            Assert.Single(conn.Commands);
-            var sql = conn.Commands[0].CommandText;
-            Assert.Contains("CREATE TABLE IF NOT EXISTS users", sql);
-            Assert.DoesNotContain("UNLOGGED", sql);
-            Assert.Contains("_id UUID PRIMARY KEY DEFAULT gen_random_uuid()", sql);
-            Assert.Contains("data JSONB NOT NULL", sql);
-            Assert.Contains("created_at TIMESTAMPTZ", sql);
-            Assert.Contains("updated_at TIMESTAMPTZ", sql);
+            Utils.DocCreateCollection(conn,"users", DocTestHelpers.FakePatterns("users"));
+            Assert.Empty(conn.Commands);
         }
 
         [Fact]
-        public void CreatesUnloggedTable()
+        public void RequiresPatterns()
         {
+            // Direct callers without proxy-supplied patterns get a loud,
+            // actionable error pointing them at the namespace API.
             var conn = new SpyConnection();
-            Utils.DocCreateCollection(conn, "ephemeral", true);
-
-            Assert.Single(conn.Commands);
-            var sql = conn.Commands[0].CommandText;
-            Assert.Contains("CREATE UNLOGGED TABLE IF NOT EXISTS ephemeral", sql);
-            Assert.DoesNotContain("CREATE TABLE IF NOT EXISTS", sql);
+            Assert.Throws<InvalidOperationException>(() =>
+                Utils.DocCreateCollection(conn,"users", patterns: null));
         }
 
         [Fact]
@@ -1339,7 +1338,7 @@ namespace GoldLapel.Tests
         {
             var conn = new SpyConnection();
             Assert.Throws<ArgumentException>(() =>
-                Utils.DocCreateCollection(conn, "bad; name"));
+                Utils.DocCreateCollection(conn,"bad; name", DocTestHelpers.FakePatterns("bad; name")));
         }
     }
 
@@ -1348,16 +1347,20 @@ namespace GoldLapel.Tests
     public class DocCreateCappedTest
     {
         [Fact]
-        public void EnsuresCollectionAndCreatesTrigger()
+        public void CreatesIndexFunctionAndTrigger()
         {
             var conn = new SpyConnection();
-            Utils.DocCreateCapped(conn, "logs", 1000);
+            Utils.DocCreateCapped(conn,"logs", 1000, DocTestHelpers.FakePatterns("logs"));
 
             var sqls = conn.Commands.Select(c => c.CommandText).ToList();
-            Assert.True(sqls.Any(s => s.Contains("CREATE TABLE IF NOT EXISTS logs")));
+            // Proxy owns the table — wrapper drives the supporting index +
+            // trigger / function. Index name uses the canonical bare-table
+            // form (idx_<table>_<suffix>) for stable cross-wrapper output.
+            Assert.True(sqls.Any(s => s.Contains("CREATE INDEX IF NOT EXISTS idx_logs_created_at")));
             Assert.True(sqls.Any(s => s.Contains("CREATE OR REPLACE FUNCTION _gl_cap_logs()")));
             Assert.True(sqls.Any(s => s.Contains("COUNT(*) - 1000")));
             Assert.True(sqls.Any(s => s.Contains("AFTER INSERT ON logs")));
+            Assert.False(sqls.Any(s => s.Contains("CREATE TABLE")));
         }
 
         [Fact]
@@ -1365,7 +1368,7 @@ namespace GoldLapel.Tests
         {
             var conn = new SpyConnection();
             Assert.Throws<ArgumentException>(() =>
-                Utils.DocCreateCapped(conn, "bad; name", 1000));
+                Utils.DocCreateCapped(conn,"bad; name", 1000, DocTestHelpers.FakePatterns("bad; name")));
         }
     }
 
@@ -1377,7 +1380,7 @@ namespace GoldLapel.Tests
         public void DropsTriggerAndFunction()
         {
             var conn = new SpyConnection();
-            Utils.DocRemoveCap(conn, "logs");
+            Utils.DocRemoveCap(conn,"logs", DocTestHelpers.FakePatterns("logs"));
 
             var sqls = conn.Commands.Select(c => c.CommandText).ToList();
             Assert.Contains("DROP TRIGGER IF EXISTS _gl_cap_logs_trigger ON logs", sqls);
@@ -1389,7 +1392,7 @@ namespace GoldLapel.Tests
         {
             var conn = new SpyConnection();
             Assert.Throws<ArgumentException>(() =>
-                Utils.DocRemoveCap(conn, "bad; name"));
+                Utils.DocRemoveCap(conn,"bad; name", DocTestHelpers.FakePatterns("bad; name")));
         }
     }
 
@@ -1484,7 +1487,7 @@ namespace GoldLapel.Tests
         public void OrInDocFind()
         {
             var conn = new SpyConnection();
-            Utils.DocFind(conn, "users",
+            Utils.DocFind(conn,"users", DocTestHelpers.FakePatterns("users"),
                 filterJson: "{\"$or\": [{\"status\":\"active\"}, {\"status\":\"inactive\"}]}");
             Assert.Contains("OR", conn.LastCommandText);
         }
@@ -1494,7 +1497,7 @@ namespace GoldLapel.Tests
         {
             var conn = new SpyConnection();
             conn.NextScalarResult = 5L;
-            Utils.DocCount(conn, "users", filterJson: "{\"$not\": {\"status\":\"suspended\"}}");
+            Utils.DocCount(conn,"users", DocTestHelpers.FakePatterns("users"), filterJson: "{\"$not\": {\"status\":\"suspended\"}}");
             Assert.Contains("NOT", conn.LastCommandText);
         }
     }
@@ -1598,9 +1601,9 @@ namespace GoldLapel.Tests
         public void SetInDocUpdate()
         {
             var conn = new SpyConnection();
-            Utils.DocUpdate(conn, "users",
+            Utils.DocUpdate(conn,"users",
                 "{\"status\": \"old\"}",
-                "{\"$set\": {\"status\": \"new\"}}");
+                "{\"$set\": {\"status\": \"new\"}}", DocTestHelpers.FakePatterns("users"));
 
             var sql = conn.LastCommandText;
             Assert.Contains("|| @p0::jsonb", sql);
@@ -1611,9 +1614,9 @@ namespace GoldLapel.Tests
         public void IncInDocUpdateOne()
         {
             var conn = new SpyConnection();
-            Utils.DocUpdateOne(conn, "users",
+            Utils.DocUpdateOne(conn,"users",
                 "{\"name\": \"alice\"}",
-                "{\"$inc\": {\"score\": 10}}");
+                "{\"$inc\": {\"score\": 10}}", DocTestHelpers.FakePatterns("users"));
 
             var sql = conn.LastCommandText;
             Assert.Contains("jsonb_set", sql);
@@ -1681,9 +1684,9 @@ namespace GoldLapel.Tests
         public void PushInDocUpdate()
         {
             var conn = new SpyConnection();
-            Utils.DocUpdate(conn, "users",
+            Utils.DocUpdate(conn,"users",
                 "{\"name\":\"alice\"}",
-                "{\"$push\": {\"tags\": \"python\"}}");
+                "{\"$push\": {\"tags\": \"python\"}}", DocTestHelpers.FakePatterns("users"));
 
             var sql = conn.LastCommandText;
             Assert.Contains("jsonb_set", sql);
@@ -1708,8 +1711,8 @@ namespace GoldLapel.Tests
         public void SqlGeneration()
         {
             var conn = new SpyConnection();
-            Utils.DocFindOneAndUpdate(conn, "users",
-                "{\"name\":\"alice\"}", "{\"$inc\": {\"score\": 5}}");
+            Utils.DocFindOneAndUpdate(conn,"users",
+                "{\"name\":\"alice\"}", "{\"$inc\": {\"score\": 5}}", DocTestHelpers.FakePatterns("users"));
 
             var sql = conn.LastCommandText;
             Assert.Contains("WITH target AS", sql);
@@ -1723,8 +1726,8 @@ namespace GoldLapel.Tests
         public void PlainUpdate()
         {
             var conn = new SpyConnection();
-            Utils.DocFindOneAndUpdate(conn, "users",
-                "{\"name\":\"alice\"}", "{\"status\":\"updated\"}");
+            Utils.DocFindOneAndUpdate(conn,"users",
+                "{\"name\":\"alice\"}", "{\"status\":\"updated\"}", DocTestHelpers.FakePatterns("users"));
 
             var sql = conn.LastCommandText;
             Assert.Contains("|| @p1::jsonb", sql);
@@ -1736,7 +1739,7 @@ namespace GoldLapel.Tests
         {
             var conn = new SpyConnection();
             Assert.Throws<ArgumentException>(() =>
-                Utils.DocFindOneAndUpdate(conn, "bad; name", "{}", "{\"a\":1}"));
+                Utils.DocFindOneAndUpdate(conn,"bad; name", "{}", "{\"a\":1}", DocTestHelpers.FakePatterns("bad; name")));
         }
     }
 
@@ -1748,7 +1751,7 @@ namespace GoldLapel.Tests
         public void SqlGeneration()
         {
             var conn = new SpyConnection();
-            Utils.DocFindOneAndDelete(conn, "users", "{\"name\":\"alice\"}");
+            Utils.DocFindOneAndDelete(conn,"users", "{\"name\":\"alice\"}", DocTestHelpers.FakePatterns("users"));
 
             var sql = conn.LastCommandText;
             Assert.Contains("WITH target AS", sql);
@@ -1762,7 +1765,7 @@ namespace GoldLapel.Tests
         public void WithoutFilter()
         {
             var conn = new SpyConnection();
-            Utils.DocFindOneAndDelete(conn, "users", null);
+            Utils.DocFindOneAndDelete(conn,"users", null, DocTestHelpers.FakePatterns("users"));
 
             var sql = conn.LastCommandText;
             Assert.Contains("WITH target AS", sql);
@@ -1775,7 +1778,7 @@ namespace GoldLapel.Tests
         {
             var conn = new SpyConnection();
             Assert.Throws<ArgumentException>(() =>
-                Utils.DocFindOneAndDelete(conn, "bad; name", "{}"));
+                Utils.DocFindOneAndDelete(conn,"bad; name", "{}", DocTestHelpers.FakePatterns("bad; name")));
         }
     }
 
@@ -1787,7 +1790,7 @@ namespace GoldLapel.Tests
         public void BasicDistinct()
         {
             var conn = new SpyConnection();
-            Utils.DocDistinct(conn, "users", "status");
+            Utils.DocDistinct(conn,"users", "status", DocTestHelpers.FakePatterns("users"));
 
             var sql = conn.LastCommandText;
             Assert.Contains("SELECT DISTINCT", sql);
@@ -1799,7 +1802,7 @@ namespace GoldLapel.Tests
         public void DotNotation()
         {
             var conn = new SpyConnection();
-            Utils.DocDistinct(conn, "users", "address.city");
+            Utils.DocDistinct(conn,"users", "address.city", DocTestHelpers.FakePatterns("users"));
 
             var sql = conn.LastCommandText;
             Assert.Contains("data->'address'->>'city'", sql);
@@ -1809,7 +1812,7 @@ namespace GoldLapel.Tests
         public void WithFilter()
         {
             var conn = new SpyConnection();
-            Utils.DocDistinct(conn, "users", "status",
+            Utils.DocDistinct(conn,"users", "status", DocTestHelpers.FakePatterns("users"),
                 filterJson: "{\"age\": {\"$gt\": 25}}");
 
             var sql = conn.LastCommandText;
@@ -1822,7 +1825,7 @@ namespace GoldLapel.Tests
         public void NoFilter()
         {
             var conn = new SpyConnection();
-            Utils.DocDistinct(conn, "users", "status");
+            Utils.DocDistinct(conn,"users", "status", DocTestHelpers.FakePatterns("users"));
 
             var sql = conn.LastCommandText;
             Assert.Contains("SELECT DISTINCT", sql);
@@ -1834,7 +1837,7 @@ namespace GoldLapel.Tests
         {
             var conn = new SpyConnection();
             Assert.Throws<ArgumentException>(() =>
-                Utils.DocDistinct(conn, "users", "bad;field"));
+                Utils.DocDistinct(conn,"users", "bad;field", DocTestHelpers.FakePatterns("users")));
         }
 
         [Fact]
@@ -1842,7 +1845,7 @@ namespace GoldLapel.Tests
         {
             var conn = new SpyConnection();
             Assert.Throws<ArgumentException>(() =>
-                Utils.DocDistinct(conn, "bad; name", "status"));
+                Utils.DocDistinct(conn,"bad; name", "status", DocTestHelpers.FakePatterns("bad; name")));
         }
     }
 
@@ -1941,7 +1944,7 @@ namespace GoldLapel.Tests
         public void InDocFind()
         {
             var conn = new SpyConnection();
-            Utils.DocFind(conn, "users",
+            Utils.DocFind(conn,"users", DocTestHelpers.FakePatterns("users"),
                 filterJson: "{\"scores\": {\"$elemMatch\": {\"$gt\": 80}}}");
             var sql = conn.LastCommandText;
             Assert.Contains("EXISTS", sql);
@@ -2034,7 +2037,7 @@ namespace GoldLapel.Tests
         public void InDocFind()
         {
             var conn = new SpyConnection();
-            Utils.DocFind(conn, "users",
+            Utils.DocFind(conn,"users", DocTestHelpers.FakePatterns("users"),
                 filterJson: "{\"$text\": {\"$search\": \"hello\"}}");
             var sql = conn.LastCommandText;
             Assert.Contains("to_tsvector", sql);
@@ -2046,7 +2049,7 @@ namespace GoldLapel.Tests
         {
             var conn = new SpyConnection();
             conn.NextScalarResult = 3L;
-            Utils.DocCount(conn, "users",
+            Utils.DocCount(conn,"users", DocTestHelpers.FakePatterns("users"),
                 filterJson: "{\"bio\": {\"$text\": {\"$search\": \"python\"}}}");
             var sql = conn.LastCommandText;
             Assert.Contains("to_tsvector", sql);
@@ -2073,7 +2076,7 @@ namespace GoldLapel.Tests
             var conn = new SpyConnection();
             // Default FakeDataReader returns false from Read() — empty result set
             var results = new List<Dictionary<string, object>>();
-            foreach (var row in Utils.DocFindCursor(conn, "users"))
+            foreach (var row in Utils.DocFindCursor(conn,"users", DocTestHelpers.FakePatterns("users")))
                 results.Add(row);
 
             Assert.Empty(results);
@@ -2092,7 +2095,7 @@ namespace GoldLapel.Tests
         public void WithFilter()
         {
             var conn = new SpyConnection();
-            foreach (var _ in Utils.DocFindCursor(conn, "users",
+            foreach (var _ in Utils.DocFindCursor(conn,"users", DocTestHelpers.FakePatterns("users"),
                 filterJson: "{\"active\":true}")) { }
 
             var declareSql = conn.Commands[1].CommandText;
@@ -2104,7 +2107,7 @@ namespace GoldLapel.Tests
         public void WithSort()
         {
             var conn = new SpyConnection();
-            foreach (var _ in Utils.DocFindCursor(conn, "users",
+            foreach (var _ in Utils.DocFindCursor(conn,"users", DocTestHelpers.FakePatterns("users"),
                 sortJson: "{\"name\": 1}")) { }
 
             var declareSql = conn.Commands[1].CommandText;
@@ -2115,7 +2118,7 @@ namespace GoldLapel.Tests
         public void WithLimitAndSkip()
         {
             var conn = new SpyConnection();
-            foreach (var _ in Utils.DocFindCursor(conn, "users",
+            foreach (var _ in Utils.DocFindCursor(conn,"users", DocTestHelpers.FakePatterns("users"),
                 limit: 100, skip: 50)) { }
 
             var declareSql = conn.Commands[1].CommandText;
@@ -2129,7 +2132,7 @@ namespace GoldLapel.Tests
         public void BatchSizeInFetch()
         {
             var conn = new SpyConnection();
-            foreach (var _ in Utils.DocFindCursor(conn, "users",
+            foreach (var _ in Utils.DocFindCursor(conn,"users", DocTestHelpers.FakePatterns("users"),
                 batchSize: 50)) { }
 
             var fetchSql = conn.Commands[2].CommandText;
@@ -2142,7 +2145,7 @@ namespace GoldLapel.Tests
             var conn = new SpyConnection();
             Assert.Throws<ArgumentException>(() =>
             {
-                foreach (var _ in Utils.DocFindCursor(conn, "bad; name")) { }
+                foreach (var _ in Utils.DocFindCursor(conn,"bad; name", DocTestHelpers.FakePatterns("bad; name"))) { }
             });
         }
 
@@ -2150,7 +2153,7 @@ namespace GoldLapel.Tests
         public void ReturnsEnumerable()
         {
             var conn = new SpyConnection();
-            var result = Utils.DocFindCursor(conn, "users");
+            var result = Utils.DocFindCursor(conn,"users", DocTestHelpers.FakePatterns("users"));
             Assert.IsAssignableFrom<IEnumerable<Dictionary<string, object>>>(result);
         }
     }

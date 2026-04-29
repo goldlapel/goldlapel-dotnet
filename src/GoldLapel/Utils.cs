@@ -1297,32 +1297,50 @@ namespace GoldLapel
 
         // ── DocX: MongoDB-like document store ────────────────────
 
-        private static void EnsureCollection(DbConnection conn, string collection, bool unlogged = false)
+        /// <summary>
+        /// Resolve the canonical doc-store table from proxy-fetched DDL patterns.
+        /// Returns the FQ table name (e.g. <c>_goldlapel.doc_users</c>). The
+        /// wrapper never builds DDL itself anymore — the proxy owns it via
+        /// <c>POST /api/ddl/doc_store/create</c>; <c>gl.Documents.&lt;Verb&gt;Async</c>
+        /// always supplies the resulting patterns.
+        /// </summary>
+        internal static string ResolveDocTable(DdlEntry patterns)
         {
-            ValidateIdentifier(collection);
-
-            var prefix = unlogged ? "CREATE UNLOGGED TABLE" : "CREATE TABLE";
-            using (var cmd = conn.CreateCommand())
-            {
-                cmd.CommandText =
-                    prefix + " IF NOT EXISTS " + collection + " (" +
-                    "_id UUID PRIMARY KEY DEFAULT gen_random_uuid(), " +
-                    "data JSONB NOT NULL, " +
-                    "created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), " +
-                    "updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())";
-                cmd.ExecuteNonQuery();
-            }
+            if (patterns == null || patterns.Tables == null || !patterns.Tables.TryGetValue("main", out var table))
+                throw new InvalidOperationException(
+                    "Doc utils now require DDL patterns from the proxy — call via "
+                    + "`gl.Documents.<Verb>Async(...)` rather than the Utils function directly.");
+            return table;
         }
 
         /// <summary>
-        /// Explicitly create a collection table. Like MongoDB createCollection().
-        /// Optionally creates an UNLOGGED table for high-throughput ephemeral data.
-        /// UNLOGGED tables are not crash-safe but significantly faster for writes.
+        /// Build a deterministic index name from a (possibly schema-qualified)
+        /// table reference. Strips any <c>schema.</c> prefix so the index name
+        /// doesn't contain a dot — Postgres rejects those without quoting.
         /// </summary>
-        public static void DocCreateCollection(DbConnection conn, string collection, bool unlogged = false)
+        internal static string DocIndexName(string table, string suffix)
+        {
+            var dot = table.LastIndexOf('.');
+            var bare = dot >= 0 ? table.Substring(dot + 1) : table;
+            return "idx_" + bare + "_" + suffix;
+        }
+
+        /// <summary>
+        /// Eagerly materialize a doc-store collection.
+        ///
+        /// In the proxy-owns-DDL world (Phase 4 of schema-to-core), the actual
+        /// CREATE TABLE has already been issued by the proxy at the moment
+        /// <c>gl.Documents.&lt;Verb&gt;Async</c> fetched the canonical patterns —
+        /// nothing left for the wrapper to do. <paramref name="patterns"/> is
+        /// required so direct callers fail loud instead of silently no-oping.
+        /// </summary>
+        public static void DocCreateCollection(DbConnection conn, string collection, DdlEntry patterns)
         {
             ValidateIdentifier(collection);
-            EnsureCollection(conn, collection, unlogged);
+            // Surface the same "you forgot patterns" error as every other doc
+            // verb. The patterns themselves are not consumed here — the proxy
+            // already executed the DDL on its mgmt connection.
+            ResolveDocTable(patterns);
         }
 
         private static Dictionary<string, object> ReadRow(DbDataReader reader)
@@ -1335,14 +1353,15 @@ namespace GoldLapel
             return row;
         }
 
-        public static Dictionary<string, object> DocInsert(DbConnection conn, string collection, string documentJson)
+        public static Dictionary<string, object> DocInsert(DbConnection conn, string collection, string documentJson, DdlEntry patterns)
         {
-            EnsureCollection(conn, collection);
+            ValidateIdentifier(collection);
+            var table = ResolveDocTable(patterns);
 
             using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText =
-                    "INSERT INTO " + collection + " (data) VALUES (@doc::jsonb) " +
+                    "INSERT INTO " + table + " (data) VALUES (@doc::jsonb) " +
                     "RETURNING _id, data, created_at, updated_at";
                 AddParameter(cmd, "@doc", documentJson);
 
@@ -1355,9 +1374,10 @@ namespace GoldLapel
             }
         }
 
-        public static List<Dictionary<string, object>> DocInsertMany(DbConnection conn, string collection, List<string> documents)
+        public static List<Dictionary<string, object>> DocInsertMany(DbConnection conn, string collection, List<string> documents, DdlEntry patterns)
         {
-            EnsureCollection(conn, collection);
+            ValidateIdentifier(collection);
+            var table = ResolveDocTable(patterns);
 
             var results = new List<Dictionary<string, object>>();
             for (int i = 0; i < documents.Count; i++)
@@ -1365,7 +1385,7 @@ namespace GoldLapel
                 using (var cmd = conn.CreateCommand())
                 {
                     cmd.CommandText =
-                        "INSERT INTO " + collection + " (data) VALUES (@doc::jsonb) " +
+                        "INSERT INTO " + table + " (data) VALUES (@doc::jsonb) " +
                         "RETURNING _id, data, created_at, updated_at";
                     AddParameter(cmd, "@doc", documents[i]);
 
@@ -1380,14 +1400,16 @@ namespace GoldLapel
         }
 
         public static List<Dictionary<string, object>> DocFind(DbConnection conn, string collection,
+            DdlEntry patterns,
             string filterJson = null, Dictionary<string, int> sort = null, int? limit = null, int? skip = null)
         {
             ValidateIdentifier(collection);
+            var table = ResolveDocTable(patterns);
             var filter = BuildFilter(filterJson);
 
             using (var cmd = conn.CreateCommand())
             {
-                var sql = "SELECT _id, data, created_at, updated_at FROM " + collection;
+                var sql = "SELECT _id, data, created_at, updated_at FROM " + table;
 
                 if (!string.IsNullOrEmpty(filter.WhereClause))
                 {
@@ -1434,12 +1456,14 @@ namespace GoldLapel
         }
 
         public static IEnumerable<Dictionary<string, object>> DocFindCursor(DbConnection conn, string collection,
+            DdlEntry patterns,
             string filterJson = null, string sortJson = null, int? limit = null, int? skip = null, int batchSize = 100)
         {
             ValidateIdentifier(collection);
+            var table = ResolveDocTable(patterns);
             var filter = BuildFilter(filterJson);
 
-            var sql = "SELECT _id, data, created_at, updated_at FROM " + collection;
+            var sql = "SELECT _id, data, created_at, updated_at FROM " + table;
             var filterParams = new List<KeyValuePair<string, object>>();
 
             if (!string.IsNullOrEmpty(filter.WhereClause))
@@ -1536,14 +1560,15 @@ namespace GoldLapel
             }
         }
 
-        public static Dictionary<string, object> DocFindOne(DbConnection conn, string collection, string filterJson = null)
+        public static Dictionary<string, object> DocFindOne(DbConnection conn, string collection, DdlEntry patterns, string filterJson = null)
         {
             ValidateIdentifier(collection);
+            var table = ResolveDocTable(patterns);
             var filter = BuildFilter(filterJson);
 
             using (var cmd = conn.CreateCommand())
             {
-                var sql = "SELECT _id, data, created_at, updated_at FROM " + collection;
+                var sql = "SELECT _id, data, created_at, updated_at FROM " + table;
 
                 if (!string.IsNullOrEmpty(filter.WhereClause))
                 {
@@ -1563,16 +1588,17 @@ namespace GoldLapel
             }
         }
 
-        public static int DocUpdate(DbConnection conn, string collection, string filterJson, string updateJson)
+        public static int DocUpdate(DbConnection conn, string collection, string filterJson, string updateJson, DdlEntry patterns)
         {
             ValidateIdentifier(collection);
+            var table = ResolveDocTable(patterns);
             int paramIdx = 0;
             var update = BuildUpdate(updateJson, ref paramIdx);
             var filter = BuildFilter(filterJson, ref paramIdx);
 
             using (var cmd = conn.CreateCommand())
             {
-                var sql = "UPDATE " + collection + " SET data = " + update.Expression + ", updated_at = NOW()";
+                var sql = "UPDATE " + table + " SET data = " + update.Expression + ", updated_at = NOW()";
                 ApplyUpdateParams(cmd, update, 0);
 
                 if (!string.IsNullOrEmpty(filter.WhereClause))
@@ -1586,9 +1612,10 @@ namespace GoldLapel
             }
         }
 
-        public static int DocUpdateOne(DbConnection conn, string collection, string filterJson, string updateJson)
+        public static int DocUpdateOne(DbConnection conn, string collection, string filterJson, string updateJson, DdlEntry patterns)
         {
             ValidateIdentifier(collection);
+            var table = ResolveDocTable(patterns);
             // Filter params come first (used in subquery), then update params
             int paramIdx = 0;
             var filter = BuildFilter(filterJson, ref paramIdx);
@@ -1596,8 +1623,8 @@ namespace GoldLapel
 
             using (var cmd = conn.CreateCommand())
             {
-                var sql = "UPDATE " + collection + " SET data = " + update.Expression + ", updated_at = NOW() " +
-                    "WHERE _id = (SELECT _id FROM " + collection;
+                var sql = "UPDATE " + table + " SET data = " + update.Expression + ", updated_at = NOW() " +
+                    "WHERE _id = (SELECT _id FROM " + table;
 
                 ApplyFilterParams(cmd, filter);
                 ApplyUpdateParams(cmd, update, filter.ParamOffset + filter.Params.Count);
@@ -1614,14 +1641,15 @@ namespace GoldLapel
             }
         }
 
-        public static int DocDelete(DbConnection conn, string collection, string filterJson)
+        public static int DocDelete(DbConnection conn, string collection, string filterJson, DdlEntry patterns)
         {
             ValidateIdentifier(collection);
+            var table = ResolveDocTable(patterns);
             var filter = BuildFilter(filterJson);
 
             using (var cmd = conn.CreateCommand())
             {
-                var sql = "DELETE FROM " + collection;
+                var sql = "DELETE FROM " + table;
 
                 if (!string.IsNullOrEmpty(filter.WhereClause))
                 {
@@ -1634,15 +1662,16 @@ namespace GoldLapel
             }
         }
 
-        public static int DocDeleteOne(DbConnection conn, string collection, string filterJson)
+        public static int DocDeleteOne(DbConnection conn, string collection, string filterJson, DdlEntry patterns)
         {
             ValidateIdentifier(collection);
+            var table = ResolveDocTable(patterns);
             var filter = BuildFilter(filterJson);
 
             using (var cmd = conn.CreateCommand())
             {
-                var sql = "DELETE FROM " + collection + " WHERE _id = (" +
-                    "SELECT _id FROM " + collection;
+                var sql = "DELETE FROM " + table + " WHERE _id = (" +
+                    "SELECT _id FROM " + table;
 
                 if (!string.IsNullOrEmpty(filter.WhereClause))
                 {
@@ -1656,14 +1685,15 @@ namespace GoldLapel
             }
         }
 
-        public static long DocCount(DbConnection conn, string collection, string filterJson = null)
+        public static long DocCount(DbConnection conn, string collection, DdlEntry patterns, string filterJson = null)
         {
             ValidateIdentifier(collection);
+            var table = ResolveDocTable(patterns);
             var filter = BuildFilter(filterJson);
 
             using (var cmd = conn.CreateCommand())
             {
-                var sql = "SELECT COUNT(*) FROM " + collection;
+                var sql = "SELECT COUNT(*) FROM " + table;
 
                 if (!string.IsNullOrEmpty(filter.WhereClause))
                 {
@@ -1677,9 +1707,10 @@ namespace GoldLapel
         }
 
         public static Dictionary<string, object> DocFindOneAndUpdate(DbConnection conn, string collection,
-            string filterJson, string updateJson)
+            string filterJson, string updateJson, DdlEntry patterns)
         {
             ValidateIdentifier(collection);
+            var table = ResolveDocTable(patterns);
             int paramIdx = 0;
             var filter = BuildFilter(filterJson, ref paramIdx);
             var update = BuildUpdate(updateJson, ref paramIdx);
@@ -1690,11 +1721,11 @@ namespace GoldLapel
                 if (!string.IsNullOrEmpty(filter.WhereClause))
                     cteWhere = " WHERE " + filter.WhereClause;
 
-                var sql = "WITH target AS (SELECT _id FROM " + collection + cteWhere + " LIMIT 1) " +
-                    "UPDATE " + collection + " SET data = " + update.Expression + ", updated_at = NOW() " +
-                    "FROM target WHERE " + collection + "._id = target._id " +
-                    "RETURNING " + collection + "._id, " + collection + ".data, " +
-                    collection + ".created_at, " + collection + ".updated_at";
+                var sql = "WITH target AS (SELECT _id FROM " + table + cteWhere + " LIMIT 1) " +
+                    "UPDATE " + table + " SET data = " + update.Expression + ", updated_at = NOW() " +
+                    "FROM target WHERE " + table + "._id = target._id " +
+                    "RETURNING " + table + "._id, " + table + ".data, " +
+                    table + ".created_at, " + table + ".updated_at";
 
                 ApplyFilterParams(cmd, filter);
                 ApplyUpdateParams(cmd, update, filter.ParamOffset + filter.Params.Count);
@@ -1711,9 +1742,10 @@ namespace GoldLapel
         }
 
         public static Dictionary<string, object> DocFindOneAndDelete(DbConnection conn, string collection,
-            string filterJson)
+            string filterJson, DdlEntry patterns)
         {
             ValidateIdentifier(collection);
+            var table = ResolveDocTable(patterns);
             var filter = BuildFilter(filterJson);
 
             using (var cmd = conn.CreateCommand())
@@ -1722,11 +1754,11 @@ namespace GoldLapel
                 if (!string.IsNullOrEmpty(filter.WhereClause))
                     cteWhere = " WHERE " + filter.WhereClause;
 
-                var sql = "WITH target AS (SELECT _id FROM " + collection + cteWhere + " LIMIT 1) " +
-                    "DELETE FROM " + collection + " USING target " +
-                    "WHERE " + collection + "._id = target._id " +
-                    "RETURNING " + collection + "._id, " + collection + ".data, " +
-                    collection + ".created_at, " + collection + ".updated_at";
+                var sql = "WITH target AS (SELECT _id FROM " + table + cteWhere + " LIMIT 1) " +
+                    "DELETE FROM " + table + " USING target " +
+                    "WHERE " + table + "._id = target._id " +
+                    "RETURNING " + table + "._id, " + table + ".data, " +
+                    table + ".created_at, " + table + ".updated_at";
 
                 ApplyFilterParams(cmd, filter);
                 cmd.CommandText = sql;
@@ -1741,15 +1773,16 @@ namespace GoldLapel
         }
 
         public static List<string> DocDistinct(DbConnection conn, string collection, string field,
-            string filterJson = null)
+            DdlEntry patterns, string filterJson = null)
         {
             ValidateIdentifier(collection);
+            var table = ResolveDocTable(patterns);
             var fieldExpr = FieldPath(field);
             var filter = BuildFilter(filterJson);
 
             using (var cmd = conn.CreateCommand())
             {
-                var sql = "SELECT DISTINCT " + fieldExpr + " FROM " + collection;
+                var sql = "SELECT DISTINCT " + fieldExpr + " FROM " + table;
                 var whereParts = new List<string> { fieldExpr + " IS NOT NULL" };
 
                 if (!string.IsNullOrEmpty(filter.WhereClause))
@@ -1773,9 +1806,12 @@ namespace GoldLapel
             }
         }
 
-        public static List<Dictionary<string, object>> DocAggregate(DbConnection conn, string collection, string pipelineJson)
+        public static List<Dictionary<string, object>> DocAggregate(DbConnection conn, string collection,
+            string pipelineJson, DdlEntry patterns,
+            Dictionary<string, string> lookupTables = null)
         {
             ValidateIdentifier(collection);
+            var table = ResolveDocTable(patterns);
             if (pipelineJson == null)
                 throw new ArgumentException("Pipeline must not be null");
 
@@ -1964,10 +2000,17 @@ namespace GoldLapel
                 selectExprs = projectExprs;
             }
 
-            // Append $lookup subqueries to SELECT
+            // Append $lookup subqueries to SELECT. Each $lookup.from is a
+            // user-facing collection name; the proxy maps it to its canonical
+            // FQ table (`_goldlapel.doc_<name>`). DocumentsApi.AggregateAsync
+            // pre-resolves each unique `from` and passes the result map in via
+            // `lookupTables`. Direct callers may supply their own map; absent
+            // a mapping, the literal `from` is used verbatim.
             foreach (var lookup in lookupStages)
             {
                 var fromTable = lookup["from"];
+                if (lookupTables != null && lookupTables.TryGetValue(fromTable, out var resolved))
+                    fromTable = resolved;
                 var localField = lookup["localField"];
                 var foreignField = lookup["foreignField"];
                 var asName = lookup["as"];
@@ -1986,7 +2029,7 @@ namespace GoldLapel
                 }
 
                 var subquery = "COALESCE((SELECT json_agg(b.data) FROM " + fromTable + " b" +
-                    " WHERE " + foreignExpr + " = " + collection + "." + localExpr +
+                    " WHERE " + foreignExpr + " = " + table + "." + localExpr +
                     "), '[]'::json) AS " + asName;
                 selectExprs.Add(subquery);
             }
@@ -2000,7 +2043,7 @@ namespace GoldLapel
                     sql = "SELECT _id, data, created_at, updated_at";
 
                 // Build FROM clause
-                var fromClause = collection;
+                var fromClause = table;
                 foreach (var extra in fromExtras)
                     fromClause += ", " + extra;
 
@@ -2044,18 +2087,23 @@ namespace GoldLapel
             }
         }
 
-        public static void DocCreateIndex(DbConnection conn, string collection, List<string> keys = null)
+        public static void DocCreateIndex(DbConnection conn, string collection, DdlEntry patterns, List<string> keys = null)
         {
-            EnsureCollection(conn, collection);
+            ValidateIdentifier(collection);
+            var table = ResolveDocTable(patterns);
 
             if (keys == null || keys.Count == 0)
             {
-                // Default: GIN index on the entire data column
+                // Default: GIN index on the entire data column. Index name
+                // strips the schema prefix from the canonical proxy table so
+                // the identifier stays unqualified (Postgres rejects dots in
+                // un-quoted index names).
+                var indexName = DocIndexName(table, "data_gin");
                 using (var cmd = conn.CreateCommand())
                 {
                     cmd.CommandText =
-                        "CREATE INDEX IF NOT EXISTS " + collection + "_data_gin ON " +
-                        collection + " USING GIN (data)";
+                        "CREATE INDEX IF NOT EXISTS " + indexName + " ON " +
+                        table + " USING GIN (data)";
                     cmd.ExecuteNonQuery();
                 }
             }
@@ -2065,7 +2113,7 @@ namespace GoldLapel
                 foreach (var key in keys)
                     ValidateIdentifier(key);
 
-                var indexName = collection + "_" + string.Join("_", keys) + "_idx";
+                var indexName = DocIndexName(table, string.Join("_", keys));
                 var indexExprs = string.Join(", ",
                     keys.Select(k => "(data->>'" + k + "')"));
 
@@ -2073,7 +2121,7 @@ namespace GoldLapel
                 {
                     cmd.CommandText =
                         "CREATE INDEX IF NOT EXISTS " + indexName + " ON " +
-                        collection + " (" + indexExprs + ")";
+                        table + " (" + indexExprs + ")";
                     cmd.ExecuteNonQuery();
                 }
             }
@@ -3312,7 +3360,7 @@ namespace GoldLapel
             }
         }
 
-        private static void ValidateIdentifier(string name)
+        internal static void ValidateIdentifier(string name)
         {
             if (string.IsNullOrEmpty(name))
                 throw new ArgumentException("Identifier must be a non-empty string");
@@ -3329,9 +3377,10 @@ namespace GoldLapel
         /// and a JSON payload with operationType, _id, and fullDocument.
         /// </summary>
         public static void DocWatch(DbConnection conn, string collection,
-            Action<string, string> callback, bool blocking = true)
+            Action<string, string> callback, DdlEntry patterns, bool blocking = true)
         {
             ValidateIdentifier(collection);
+            var table = ResolveDocTable(patterns);
 
             var funcName = "_gl_watch_" + collection;
             var triggerName = funcName + "_trigger";
@@ -3362,7 +3411,7 @@ namespace GoldLapel
             {
                 cmd.CommandText =
                     "CREATE OR REPLACE TRIGGER " + triggerName +
-                    " AFTER INSERT OR UPDATE OR DELETE ON " + collection +
+                    " AFTER INSERT OR UPDATE OR DELETE ON " + table +
                     " FOR EACH ROW EXECUTE FUNCTION " + funcName + "()";
                 cmd.ExecuteNonQuery();
             }
@@ -3383,9 +3432,10 @@ namespace GoldLapel
         /// <summary>
         /// Remove change stream trigger from a collection.
         /// </summary>
-        public static void DocUnwatch(DbConnection conn, string collection)
+        public static void DocUnwatch(DbConnection conn, string collection, DdlEntry patterns)
         {
             ValidateIdentifier(collection);
+            var table = ResolveDocTable(patterns);
 
             var funcName = "_gl_watch_" + collection;
             var triggerName = funcName + "_trigger";
@@ -3393,7 +3443,7 @@ namespace GoldLapel
             using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText =
-                    "DROP TRIGGER IF EXISTS " + triggerName + " ON " + collection;
+                    "DROP TRIGGER IF EXISTS " + triggerName + " ON " + table;
                 cmd.ExecuteNonQuery();
             }
 
@@ -3412,16 +3462,18 @@ namespace GoldLapel
         /// Like MongoDB TTL indexes. Uses a BEFORE INSERT trigger.
         /// </summary>
         public static void DocCreateTtlIndex(DbConnection conn, string collection,
-            int expireAfterSeconds, string field = "created_at")
+            int expireAfterSeconds, DdlEntry patterns, string field = "created_at")
         {
             ValidateIdentifier(collection);
             ValidateIdentifier(field);
+            var table = ResolveDocTable(patterns);
+            var idxTtl = DocIndexName(table, "ttl");
 
             using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText =
-                    "CREATE INDEX IF NOT EXISTS idx_" + collection + "_ttl ON " +
-                    collection + " (" + field + ")";
+                    "CREATE INDEX IF NOT EXISTS " + idxTtl + " ON " +
+                    table + " (" + field + ")";
                 cmd.ExecuteNonQuery();
             }
 
@@ -3432,7 +3484,7 @@ namespace GoldLapel
                 cmd.CommandText =
                     "CREATE OR REPLACE FUNCTION " + funcName + "() RETURNS TRIGGER AS $$ " +
                     "BEGIN " +
-                    "DELETE FROM " + collection + " WHERE " + field +
+                    "DELETE FROM " + table + " WHERE " + field +
                     " < NOW() - INTERVAL '" + expireAfterSeconds + " seconds'; " +
                     "RETURN NEW; " +
                     "END; " +
@@ -3446,7 +3498,7 @@ namespace GoldLapel
             {
                 cmd.CommandText =
                     "CREATE OR REPLACE TRIGGER " + funcName + "_trigger" +
-                    " BEFORE INSERT ON " + collection +
+                    " BEFORE INSERT ON " + table +
                     " FOR EACH STATEMENT EXECUTE FUNCTION " + funcName + "()";
                 cmd.ExecuteNonQuery();
             }
@@ -3455,16 +3507,18 @@ namespace GoldLapel
         /// <summary>
         /// Remove TTL trigger, function, and index from a collection.
         /// </summary>
-        public static void DocRemoveTtlIndex(DbConnection conn, string collection)
+        public static void DocRemoveTtlIndex(DbConnection conn, string collection, DdlEntry patterns)
         {
             ValidateIdentifier(collection);
+            var table = ResolveDocTable(patterns);
+            var idxTtl = DocIndexName(table, "ttl");
 
             var funcName = "_gl_ttl_" + collection;
 
             using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText =
-                    "DROP TRIGGER IF EXISTS " + funcName + "_trigger ON " + collection;
+                    "DROP TRIGGER IF EXISTS " + funcName + "_trigger ON " + table;
                 cmd.ExecuteNonQuery();
             }
 
@@ -3476,7 +3530,7 @@ namespace GoldLapel
 
             using (var cmd = conn.CreateCommand())
             {
-                cmd.CommandText = "DROP INDEX IF EXISTS idx_" + collection + "_ttl";
+                cmd.CommandText = "DROP INDEX IF EXISTS " + idxTtl;
                 cmd.ExecuteNonQuery();
             }
         }
@@ -3487,17 +3541,17 @@ namespace GoldLapel
         /// Create a capped collection that auto-deletes oldest rows.
         /// Like MongoDB capped collections. Uses an AFTER INSERT trigger.
         /// </summary>
-        public static void DocCreateCapped(DbConnection conn, string collection, int maxDocuments)
+        public static void DocCreateCapped(DbConnection conn, string collection, int maxDocuments, DdlEntry patterns)
         {
             ValidateIdentifier(collection);
-
-            EnsureCollection(conn, collection);
+            var table = ResolveDocTable(patterns);
+            var idxCreated = DocIndexName(table, "created_at");
 
             using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText =
-                    "CREATE INDEX IF NOT EXISTS idx_" + collection +
-                    "_created_at ON " + collection + " (created_at ASC)";
+                    "CREATE INDEX IF NOT EXISTS " + idxCreated +
+                    " ON " + table + " (created_at ASC)";
                 cmd.ExecuteNonQuery();
             }
 
@@ -3509,10 +3563,10 @@ namespace GoldLapel
                     "CREATE OR REPLACE FUNCTION " + funcName + "() RETURNS TRIGGER AS $$ " +
                     "DECLARE excess INTEGER; " +
                     "BEGIN " +
-                    "SELECT COUNT(*) - " + maxDocuments + " INTO excess FROM " + collection + "; " +
+                    "SELECT COUNT(*) - " + maxDocuments + " INTO excess FROM " + table + "; " +
                     "IF excess > 0 THEN " +
-                    "DELETE FROM " + collection + " WHERE _id IN (" +
-                    "SELECT _id FROM " + collection + " ORDER BY created_at ASC LIMIT excess" +
+                    "DELETE FROM " + table + " WHERE _id IN (" +
+                    "SELECT _id FROM " + table + " ORDER BY created_at ASC LIMIT excess" +
                     "); " +
                     "END IF; " +
                     "RETURN NULL; " +
@@ -3527,7 +3581,7 @@ namespace GoldLapel
             {
                 cmd.CommandText =
                     "CREATE OR REPLACE TRIGGER " + funcName + "_trigger" +
-                    " AFTER INSERT ON " + collection +
+                    " AFTER INSERT ON " + table +
                     " FOR EACH STATEMENT EXECUTE FUNCTION " + funcName + "()";
                 cmd.ExecuteNonQuery();
             }
@@ -3536,16 +3590,17 @@ namespace GoldLapel
         /// <summary>
         /// Remove capped collection trigger and function.
         /// </summary>
-        public static void DocRemoveCap(DbConnection conn, string collection)
+        public static void DocRemoveCap(DbConnection conn, string collection, DdlEntry patterns)
         {
             ValidateIdentifier(collection);
+            var table = ResolveDocTable(patterns);
 
             var funcName = "_gl_cap_" + collection;
 
             using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText =
-                    "DROP TRIGGER IF EXISTS " + funcName + "_trigger ON " + collection;
+                    "DROP TRIGGER IF EXISTS " + funcName + "_trigger ON " + table;
                 cmd.ExecuteNonQuery();
             }
 

@@ -129,7 +129,7 @@ namespace GoldLapel.Tests
             // the INSERT gets rolled back, and we avoid a DDL-in-transaction
             // path that has historically interacted poorly with the proxy's
             // prepared-statement cache.
-            await gl.DocCreateCollectionAsync(collection);
+            await gl.Documents.CreateCollectionAsync(collection);
 
             await using var userConn = new NpgsqlConnection(gl.Url);
             await userConn.OpenAsync();
@@ -138,7 +138,7 @@ namespace GoldLapel.Tests
             {
                 await gl.UsingAsync(userConn, async scoped =>
                 {
-                    await scoped.DocInsertAsync(collection, "{\"via\":\"using-tx\"}");
+                    await scoped.Documents.InsertAsync(collection, "{\"via\":\"using-tx\"}");
                 });
                 // Rollback — if UsingAsync used userConn, the insert is undone.
                 await tx.RollbackAsync();
@@ -147,7 +147,7 @@ namespace GoldLapel.Tests
             // Verify: collection exists (pre-created) but has zero rows. If
             // UsingAsync had used the internal connection, the insert would
             // have persisted outside the rolled-back tx and count would be 1.
-            var count = await gl.DocCountAsync(collection);
+            var count = await gl.Documents.CountAsync(collection);
             Assert.Equal(0L, count);
 
             // Cleanup.
@@ -298,8 +298,8 @@ namespace GoldLapel.Tests
             await userConn.OpenAsync();
 
             // connection: per-call overrides the internal conn for this one call.
-            await gl.DocInsertAsync(collection, "{\"via\":\"per-call\"}", connection: userConn);
-            var count = await gl.DocCountAsync(collection, connection: userConn);
+            await gl.Documents.InsertAsync(collection, "{\"via\":\"per-call\"}", connection: userConn);
+            var count = await gl.Documents.CountAsync(collection, connection: userConn);
             Assert.Equal(1L, count);
 
             // Cleanup.

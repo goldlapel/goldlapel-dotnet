@@ -24,6 +24,27 @@ namespace GoldLapel.Tests
         }
 
         /// <summary>
+        /// Pre-populate the instance's DDL cache with a doc-store entry whose
+        /// canonical table is the user-facing collection name. SQL-shape
+        /// tests assert against literal collection names (e.g.
+        /// <c>"INSERT INTO users"</c>), so we install <c>main = users</c>
+        /// instead of the production <c>main = _goldlapel.doc_users</c>.
+        /// Any namespace verb on <c>gl.Documents</c> will short-circuit
+        /// the DDL HTTP fetch when the cache has an entry for the key.
+        /// </summary>
+        public static void InjectDocPatterns(GL gl, string collection)
+        {
+            var entry = new DdlEntry
+            {
+                Tables = new Dictionary<string, string> { ["main"] = collection },
+                QueryPatterns = new Dictionary<string, string>(),
+            };
+            var cacheField = typeof(GL).GetField("_ddlCache", BindingFlags.NonPublic | BindingFlags.Instance);
+            var cache = (System.Collections.Concurrent.ConcurrentDictionary<string, DdlEntry>) cacheField.GetValue(gl);
+            cache["doc_store:" + collection] = entry;
+        }
+
+        /// <summary>
         /// Pre-populate the instance's DDL cache with canonical stream patterns
         /// so stream* methods can run without hitting the dashboard.
         /// </summary>
@@ -67,32 +88,38 @@ namespace GoldLapel.Tests
         public InstanceDocMethodsTest()
         {
             _gl = TestHelpers.MakeWithSpy(out _spy);
+            // Pre-populate the DDL cache so gl.Documents.* methods skip the
+            // HTTP round-trip to the dashboard. Tests assert SQL shape, not
+            // proxy IO.
+            foreach (var c in new[] { "users", "items", "orders" })
+                TestHelpers.InjectDocPatterns(_gl, c);
         }
 
         [Fact]
         public async Task DocInsertAsyncDelegates()
         {
-            await _gl.DocInsertAsync("users", "{\"name\":\"alice\"}");
+            await _gl.Documents.InsertAsync("users", "{\"name\":\"alice\"}");
 
-            Assert.Equal(2, _spy.Commands.Count);
-            Assert.Contains("CREATE TABLE IF NOT EXISTS users", _spy.Commands[0].CommandText);
-            Assert.Contains("INSERT INTO users", _spy.Commands[1].CommandText);
-            Assert.Equal("{\"name\":\"alice\"}", _spy.Commands[1].ParamValue("@doc"));
+            // Proxy owns DDL — only the INSERT runs through the wrapper.
+            Assert.Single(_spy.Commands);
+            Assert.Contains("INSERT INTO users", _spy.Commands[0].CommandText);
+            Assert.Equal("{\"name\":\"alice\"}", _spy.Commands[0].ParamValue("@doc"));
         }
 
         [Fact]
         public async Task DocInsertManyAsyncDelegates()
         {
             var docs = new List<string> { "{\"a\":1}", "{\"b\":2}" };
-            await _gl.DocInsertManyAsync("items", docs);
+            await _gl.Documents.InsertManyAsync("items", docs);
 
-            Assert.Equal(3, _spy.Commands.Count);
+            // Proxy owns DDL — 2 inserts only (no leading CREATE TABLE).
+            Assert.Equal(2, _spy.Commands.Count);
         }
 
         [Fact]
         public async Task DocFindAsyncDelegates()
         {
-            await _gl.DocFindAsync("users", filterJson: "{\"active\":true}");
+            await _gl.Documents.FindAsync("users", filterJson: "{\"active\":true}");
 
             var sql = _spy.LastCommandText;
             Assert.Contains("SELECT _id, data, created_at, updated_at FROM users", sql);
@@ -101,10 +128,12 @@ namespace GoldLapel.Tests
         }
 
         [Fact]
-        public void DocFindCursorDelegates()
+        public async Task DocFindCursorDelegates()
         {
-            // Cursor stays synchronous-iterable (IEnumerable) — exhaust to issue SQL.
-            foreach (var _ in _gl.DocFindCursor("users")) { }
+            // FindCursorAsync now awaits the DDL fetch up-front, then returns
+            // an IEnumerable to stream batches. Iterate to issue SQL.
+            TestHelpers.InjectDocPatterns(_gl, "users");
+            foreach (var _ in await _gl.Documents.FindCursorAsync("users")) { }
 
             var sqls = _spy.Commands.Select(c => c.CommandText).ToList();
             Assert.Equal("BEGIN", sqls[0]);
@@ -115,7 +144,7 @@ namespace GoldLapel.Tests
         [Fact]
         public async Task DocFindOneAsyncDelegates()
         {
-            await _gl.DocFindOneAsync("users", filterJson: "{\"id\":1}");
+            await _gl.Documents.FindOneAsync("users", filterJson: "{\"id\":1}");
 
             var sql = _spy.LastCommandText;
             Assert.Contains("FROM users", sql);
@@ -125,7 +154,7 @@ namespace GoldLapel.Tests
         [Fact]
         public async Task DocUpdateAsyncDelegates()
         {
-            await _gl.DocUpdateAsync("users", "{\"active\":true}", "{\"role\":\"admin\"}");
+            await _gl.Documents.UpdateAsync("users", "{\"active\":true}", "{\"role\":\"admin\"}");
 
             var sql = _spy.LastCommandText;
             Assert.Contains("UPDATE users", sql);
@@ -135,7 +164,7 @@ namespace GoldLapel.Tests
         [Fact]
         public async Task DocDeleteAsyncDelegates()
         {
-            await _gl.DocDeleteAsync("users", "{\"active\":false}");
+            await _gl.Documents.DeleteAsync("users", "{\"active\":false}");
 
             var sql = _spy.LastCommandText;
             Assert.Contains("DELETE FROM users", sql);
@@ -146,7 +175,7 @@ namespace GoldLapel.Tests
         public async Task DocCountAsyncDelegates()
         {
             _spy.NextScalarResult = 42L;
-            await _gl.DocCountAsync("users");
+            await _gl.Documents.CountAsync("users");
 
             Assert.Contains("SELECT COUNT(*) FROM users", _spy.LastCommandText);
         }
@@ -154,16 +183,17 @@ namespace GoldLapel.Tests
         [Fact]
         public async Task DocCreateIndexAsyncDelegates()
         {
-            await _gl.DocCreateIndexAsync("users");
+            await _gl.Documents.CreateIndexAsync("users");
 
-            Assert.Equal(2, _spy.Commands.Count);
-            Assert.Contains("CREATE INDEX IF NOT EXISTS users_data_gin", _spy.Commands[1].CommandText);
+            // Proxy owns DDL — only the CREATE INDEX runs through the wrapper.
+            Assert.Single(_spy.Commands);
+            Assert.Contains("CREATE INDEX IF NOT EXISTS idx_users_data_gin", _spy.Commands[0].CommandText);
         }
 
         [Fact]
         public async Task DocAggregateAsyncDelegates()
         {
-            await _gl.DocAggregateAsync("orders",
+            await _gl.Documents.AggregateAsync("orders",
                 "[{\"$group\": {\"_id\": \"$region\", \"total\": {\"$sum\": \"$amount\"}}}]");
 
             var sql = _spy.LastCommandText;
@@ -524,7 +554,7 @@ namespace GoldLapel.Tests
                 new object[][] { new object[] { 1L, DateTime.UtcNow } },
                 new[] { "id", "created_at" }
             );
-            var id = await _gl.StreamAddAsync("events", "{\"type\":\"click\"}");
+            var id = await _gl.Streams.AddAsync("events", "{\"type\":\"click\"}");
 
             Assert.Equal(1L, id);
             Assert.Contains("INSERT INTO _goldlapel.stream_events", _spy.LastCommandText);
@@ -536,7 +566,7 @@ namespace GoldLapel.Tests
         public async Task StreamCreateGroupAsyncDelegates()
         {
             TestHelpers.InjectStreamPatterns(_gl, "events");
-            await _gl.StreamCreateGroupAsync("events", "workers");
+            await _gl.Streams.CreateGroupAsync("events", "workers");
 
             // Only one statement should run (the INSERT into groups); the
             // CREATE TABLEs that used to live here are now proxy-side.
@@ -549,7 +579,7 @@ namespace GoldLapel.Tests
         {
             TestHelpers.InjectStreamPatterns(_gl, "events");
             // cursor lookup returns no row → streamRead returns early.
-            await _gl.StreamReadAsync("events", "workers", "w1");
+            await _gl.Streams.ReadAsync("events", "workers", "w1");
 
             Assert.Contains("last_delivered_id FROM _goldlapel.stream_events_groups", _spy.LastCommandText);
         }
@@ -558,7 +588,7 @@ namespace GoldLapel.Tests
         public async Task StreamAckAsyncDelegates()
         {
             TestHelpers.InjectStreamPatterns(_gl, "events");
-            await _gl.StreamAckAsync("events", "workers", 1);
+            await _gl.Streams.AckAsync("events", "workers", 1);
 
             Assert.Contains("DELETE FROM _goldlapel.stream_events_pending", _spy.LastCommandText);
         }
@@ -567,7 +597,7 @@ namespace GoldLapel.Tests
         public async Task StreamClaimAsyncDelegates()
         {
             TestHelpers.InjectStreamPatterns(_gl, "events");
-            await _gl.StreamClaimAsync("events", "workers", "w2");
+            await _gl.Streams.ClaimAsync("events", "workers", "w2");
 
             Assert.Contains("delivery_count + 1", _spy.LastCommandText);
         }
@@ -649,13 +679,17 @@ namespace GoldLapel.Tests
         public InstanceOperationalMethodsTest()
         {
             _gl = TestHelpers.MakeWithSpy(out _spy);
+            // Same DDL-cache pre-seeding as InstanceDocMethodsTest — every
+            // `gl.Documents.<verb>Async` consults the cache first.
+            foreach (var c in new[] { "events", "sessions", "logs" })
+                TestHelpers.InjectDocPatterns(_gl, c);
         }
 
         [Fact]
         public async Task DocWatchAsyncDelegates()
         {
             // DocWatch creates trigger DDL then tries to LISTEN (which fails on SpyConnection).
-            try { await _gl.DocWatchAsync("events", (ch, msg) => { }); }
+            try { await _gl.Documents.WatchAsync("events", (ch, msg) => { }); }
             catch (Exception) { }
 
             var sqls = _spy.Commands.Select(c => c.CommandText).ToList();
@@ -666,7 +700,7 @@ namespace GoldLapel.Tests
         [Fact]
         public async Task DocUnwatchAsyncDelegates()
         {
-            await _gl.DocUnwatchAsync("events");
+            await _gl.Documents.UnwatchAsync("events");
 
             var sqls = _spy.Commands.Select(c => c.CommandText).ToList();
             Assert.Contains("DROP TRIGGER IF EXISTS _gl_watch_events_trigger ON events", sqls);
@@ -676,7 +710,7 @@ namespace GoldLapel.Tests
         [Fact]
         public async Task DocCreateTtlIndexAsyncDelegates()
         {
-            await _gl.DocCreateTtlIndexAsync("sessions", 3600);
+            await _gl.Documents.CreateTtlIndexAsync("sessions", 3600);
 
             var sqls = _spy.Commands.Select(c => c.CommandText).ToList();
             Assert.True(sqls.Any(s => s.Contains("CREATE INDEX IF NOT EXISTS idx_sessions_ttl")));
@@ -686,7 +720,7 @@ namespace GoldLapel.Tests
         [Fact]
         public async Task DocRemoveTtlIndexAsyncDelegates()
         {
-            await _gl.DocRemoveTtlIndexAsync("sessions");
+            await _gl.Documents.RemoveTtlIndexAsync("sessions");
 
             var sqls = _spy.Commands.Select(c => c.CommandText).ToList();
             Assert.Contains("DROP TRIGGER IF EXISTS _gl_ttl_sessions_trigger ON sessions", sqls);
@@ -697,18 +731,22 @@ namespace GoldLapel.Tests
         [Fact]
         public async Task DocCreateCappedAsyncDelegates()
         {
-            await _gl.DocCreateCappedAsync("logs", 1000);
+            await _gl.Documents.CreateCappedAsync("logs", 1000);
 
             var sqls = _spy.Commands.Select(c => c.CommandText).ToList();
-            Assert.True(sqls.Any(s => s.Contains("CREATE TABLE IF NOT EXISTS logs")));
+            // Proxy owns the table — wrapper drives only the supporting
+            // index + trigger / function. Index name uses the canonical
+            // bare-table form (idx_<table>_<suffix>).
+            Assert.True(sqls.Any(s => s.Contains("CREATE INDEX IF NOT EXISTS idx_logs_created_at")));
             Assert.True(sqls.Any(s => s.Contains("CREATE OR REPLACE FUNCTION _gl_cap_logs()")));
             Assert.True(sqls.Any(s => s.Contains("COUNT(*) - 1000")));
+            Assert.False(sqls.Any(s => s.Contains("CREATE TABLE")));
         }
 
         [Fact]
         public async Task DocRemoveCapAsyncDelegates()
         {
-            await _gl.DocRemoveCapAsync("logs");
+            await _gl.Documents.RemoveCapAsync("logs");
 
             var sqls = _spy.Commands.Select(c => c.CommandText).ToList();
             Assert.Contains("DROP TRIGGER IF EXISTS _gl_cap_logs_trigger ON logs", sqls);
@@ -726,23 +764,35 @@ namespace GoldLapel.Tests
                 .SetValue(gl, conn);
         }
 
+        // Pre-seed the DDL cache for any collection name we reach for in
+        // these tests so `gl.Documents.<verb>Async` skips the HTTP fetch.
+        // Without this, the proxy-fetch path tries port 7933 and fails.
+        private static GL MakeGlWithDocPatterns(params string[] collections)
+        {
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb");
+            foreach (var c in collections)
+                TestHelpers.InjectDocPatterns(gl, c);
+            return gl;
+        }
+
         [Fact]
         public async Task UsingAsyncOverridesConnection()
         {
             var spyDefault = new SpyConnection();
             var spyScoped = new SpyConnection();
 
-            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb");
+            var gl = MakeGlWithDocPatterns("events");
             InjectTestConn(gl, spyDefault);
 
             await gl.UsingAsync(spyScoped, async scoped =>
             {
-                await scoped.DocInsertAsync("events", "{\"type\":\"x\"}");
+                await scoped.Documents.InsertAsync("events", "{\"type\":\"x\"}");
             });
 
             Assert.Empty(spyDefault.Commands);
-            Assert.Equal(2, spyScoped.Commands.Count); // CREATE TABLE + INSERT
-            Assert.Contains("INSERT INTO events", spyScoped.Commands[1].CommandText);
+            // Proxy owns DDL — only the INSERT runs through the wrapper.
+            Assert.Single(spyScoped.Commands);
+            Assert.Contains("INSERT INTO events", spyScoped.Commands[0].CommandText);
         }
 
         [Fact]
@@ -751,7 +801,7 @@ namespace GoldLapel.Tests
             var spyDefault = new SpyConnection();
             var spyScoped = new SpyConnection();
 
-            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb");
+            var gl = MakeGlWithDocPatterns("users");
             InjectTestConn(gl, spyDefault);
 
             await Assert.ThrowsAsync<InvalidOperationException>(async () =>
@@ -763,8 +813,9 @@ namespace GoldLapel.Tests
             });
 
             // After UsingAsync returns, scope unwound — subsequent calls hit default.
-            await gl.DocInsertAsync("users", "{\"name\":\"a\"}");
-            Assert.Equal(2, spyDefault.Commands.Count);
+            await gl.Documents.InsertAsync("users", "{\"name\":\"a\"}");
+            // Proxy owns DDL — single INSERT.
+            Assert.Single(spyDefault.Commands);
         }
 
         [Fact]
@@ -773,20 +824,20 @@ namespace GoldLapel.Tests
             var spyDefault = new SpyConnection();
             var spyScoped = new SpyConnection();
 
-            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb");
+            var gl = MakeGlWithDocPatterns("events");
             InjectTestConn(gl, spyDefault);
 
             await gl.UsingAsync(spyScoped, async scoped =>
             {
-                await scoped.DocInsertAsync("events", "{\"n\":1}");
+                await scoped.Documents.InsertAsync("events", "{\"n\":1}");
                 await Task.Yield();            // force an await boundary
                 await Task.Delay(1);
-                await scoped.DocInsertAsync("events", "{\"n\":2}");
+                await scoped.Documents.InsertAsync("events", "{\"n\":2}");
             });
 
             Assert.Empty(spyDefault.Commands);
-            // CREATE TABLE + 2 inserts all land on the scoped spy.
-            Assert.True(spyScoped.Commands.Count >= 3);
+            // 2 inserts land on the scoped spy (proxy owns DDL).
+            Assert.Equal(2, spyScoped.Commands.Count);
         }
 
         [Fact]
@@ -796,23 +847,24 @@ namespace GoldLapel.Tests
             var b = new SpyConnection();
             var c = new SpyConnection();
 
-            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb");
+            var gl = MakeGlWithDocPatterns("x");
             InjectTestConn(gl, a);
 
             await gl.UsingAsync(b, async gl2 =>
             {
-                await gl2.DocInsertAsync("x", "{}");
+                await gl2.Documents.InsertAsync("x", "{}");
                 await gl2.UsingAsync(c, async gl3 =>
                 {
-                    await gl3.DocInsertAsync("x", "{}");
+                    await gl3.Documents.InsertAsync("x", "{}");
                 });
-                await gl2.DocInsertAsync("x", "{}");
+                await gl2.Documents.InsertAsync("x", "{}");
             });
-            await gl.DocInsertAsync("x", "{}");
+            await gl.Documents.InsertAsync("x", "{}");
 
-            Assert.Equal(2, a.Commands.Count); // create + 1 insert
-            Assert.True(b.Commands.Count >= 3); // create + 2 inserts
-            Assert.True(c.Commands.Count >= 2); // create + 1 insert
+            // Proxy owns DDL — counts are now just inserts.
+            Assert.Single(a.Commands);     // 1 insert (the trailing call on gl)
+            Assert.Equal(2, b.Commands.Count); // 2 inserts inside gl.UsingAsync(b, ...)
+            Assert.Single(c.Commands);     // 1 insert in the inner UsingAsync(c, ...)
         }
 
         [Fact]
@@ -849,26 +901,26 @@ namespace GoldLapel.Tests
             var gl1Scoped = new SpyConnection();
             var gl2Default = new SpyConnection();
 
-            var gl1 = GL.CreateForTest("postgresql://localhost:5432/mydb");
+            var gl1 = MakeGlWithDocPatterns("events");
             InjectTestConn(gl1, gl1Default);
 
-            var gl2 = GL.CreateForTest("postgresql://localhost:5432/mydb");
+            var gl2 = MakeGlWithDocPatterns("events");
             InjectTestConn(gl2, gl2Default);
 
             await gl1.UsingAsync(gl1Scoped, async _ =>
             {
                 // Inside gl1's scope — a wrapper call on gl2 must hit gl2's default,
                 // NOT gl1Scoped (which would happen if the scope field were static).
-                await gl2.DocInsertAsync("events", "{\"n\":1}");
+                await gl2.Documents.InsertAsync("events", "{\"n\":1}");
             });
 
             // gl1's scoped conn saw no traffic — gl2 correctly ignored it.
             Assert.Empty(gl1Scoped.Commands);
             // gl1's default also untouched — nothing ran through gl1 at all.
             Assert.Empty(gl1Default.Commands);
-            // gl2 routed to its own default (CREATE TABLE + INSERT).
-            Assert.Equal(2, gl2Default.Commands.Count);
-            Assert.Contains("INSERT INTO events", gl2Default.Commands[1].CommandText);
+            // gl2 routed to its own default — proxy owns DDL, single INSERT.
+            Assert.Single(gl2Default.Commands);
+            Assert.Contains("INSERT INTO events", gl2Default.Commands[0].CommandText);
         }
 
         [Fact(DisplayName = "UsingAsync scope does not leak across sibling Task.WhenAll tasks")]
@@ -891,7 +943,7 @@ namespace GoldLapel.Tests
             var spyDefault = new SpyConnection();
             var spyScoped = new SpyConnection();
 
-            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb");
+            var gl = MakeGlWithDocPatterns("scoped_events", "sibling_events");
             InjectTestConn(gl, spyDefault);
 
             var enterUsing = new TaskCompletionSource();
@@ -906,7 +958,7 @@ namespace GoldLapel.Tests
                     // Hold the scope open until B has observed its own routing.
                     await bFinished.Task;
                     // Still inside using: a call on `scoped` must go to spyScoped.
-                    await scoped.DocInsertAsync("scoped_events", "{\"from\":\"A\"}");
+                    await scoped.Documents.InsertAsync("scoped_events", "{\"from\":\"A\"}");
                 });
             }
 
@@ -920,7 +972,7 @@ namespace GoldLapel.Tests
                     // route to spyDefault. If UsingAsync used instance state,
                     // this would route to spyScoped and the assertions below
                     // on spyScoped.Commands / spyDefault.Commands would flip.
-                    await gl.DocInsertAsync("sibling_events", "{\"from\":\"B\"}");
+                    await gl.Documents.InsertAsync("sibling_events", "{\"from\":\"B\"}");
                 }
                 finally
                 {
@@ -955,9 +1007,12 @@ namespace GoldLapel.Tests
         public async Task WrapperWithoutConnectionThrows()
         {
             var gl = GL.CreateForTest("postgresql://localhost:5432/mydb");
+            // Seed the DDL cache so the patterns fetch is bypassed; we want
+            // ResolveActive itself to be the failing step.
+            TestHelpers.InjectDocPatterns(gl, "x");
             // No _testConn injected, no internal _conn, no scope.
             var ex = await Assert.ThrowsAsync<InvalidOperationException>(
-                () => gl.DocInsertAsync("x", "{}"));
+                () => gl.Documents.InsertAsync("x", "{}"));
             Assert.Contains("No connection available", ex.Message);
         }
     }
