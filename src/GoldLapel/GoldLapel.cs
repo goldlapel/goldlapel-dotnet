@@ -221,15 +221,22 @@ namespace GoldLapel
             _invalidationPortExplicit = options.InvalidationPort.HasValue;
             _invalidationPort = options.InvalidationPort ?? _proxyPort + 2;
 
-            // Nested namespaces — see Documents.cs and Streams.cs. These are
-            // the canonical schema-to-core sub-API instances. Each holds a
-            // back-reference to this client for shared state (license,
-            // dashboard token, http session, conn, DDL pattern cache). Other
-            // namespaces (cache, search, queues, counters, hashes, zsets, geo,
-            // …) stay flat for now; they migrate to nested form one-at-a-time
-            // as their own schema-to-core phase fires.
+            // Nested namespaces — canonical schema-to-core sub-API instances.
+            // Each holds a back-reference to this client for shared state
+            // (license, dashboard token, http session, conn, DDL pattern
+            // cache).
+            //
+            // As of Phase 5 the Redis-compat helper families (counter / zset /
+            // hash / queue / geo) are nested too, alongside Streams (Phase 1+2)
+            // and Documents (Phase 4). Search / cache / auth remain flat —
+            // they'll migrate when their own schema-to-core phase fires.
             Documents = new DocumentsApi(this);
             Streams = new StreamsApi(this);
+            Counters = new CountersApi(this);
+            Zsets = new ZsetsApi(this);
+            Hashes = new HashesApi(this);
+            Queues = new QueuesApi(this);
+            Geos = new GeosApi(this);
         }
 
         /// <summary>
@@ -243,6 +250,38 @@ namespace GoldLapel
         /// See <see cref="StreamsApi"/>.
         /// </summary>
         public StreamsApi Streams { get; }
+
+        /// <summary>
+        /// Counter namespace — <c>gl.Counters.&lt;Verb&gt;Async(...)</c>.
+        /// Phase 5 of schema-to-core. See <see cref="CountersApi"/>.
+        /// </summary>
+        public CountersApi Counters { get; }
+
+        /// <summary>
+        /// Sorted-set namespace — <c>gl.Zsets.&lt;Verb&gt;Async(...)</c>.
+        /// Phase 5 of schema-to-core. See <see cref="ZsetsApi"/>.
+        /// </summary>
+        public ZsetsApi Zsets { get; }
+
+        /// <summary>
+        /// Hash namespace — <c>gl.Hashes.&lt;Verb&gt;Async(...)</c>.
+        /// Phase 5 of schema-to-core. See <see cref="HashesApi"/>.
+        /// </summary>
+        public HashesApi Hashes { get; }
+
+        /// <summary>
+        /// Queue namespace — <c>gl.Queues.&lt;Verb&gt;Async(...)</c>.
+        /// Phase 5 of schema-to-core (at-least-once with visibility timeout).
+        /// See <see cref="QueuesApi"/>.
+        /// </summary>
+        public QueuesApi Queues { get; }
+
+        /// <summary>
+        /// Geo namespace — <c>gl.Geos.&lt;Verb&gt;Async(...)</c>.
+        /// Phase 5 of schema-to-core (PostGIS GEOGRAPHY-native).
+        /// See <see cref="GeosApi"/>.
+        /// </summary>
+        public GeosApi Geos { get; }
 
         // Test-only accessors for mesh wiring.
         internal bool IsMesh => _mesh;
@@ -1129,7 +1168,7 @@ namespace GoldLapel
             return Task.CompletedTask;
         }
 
-        // Pub/Sub & Queue
+        // Pub/Sub
         public Task PublishAsync(string channel, string message, NpgsqlConnection connection = null)
         {
             Utils.Publish(ResolveActive(connection), channel, message);
@@ -1143,78 +1182,12 @@ namespace GoldLapel
             return Task.CompletedTask;
         }
 
-        public Task EnqueueAsync(string queueTable, string payloadJson, NpgsqlConnection connection = null)
-        {
-            Utils.Enqueue(ResolveActive(connection), queueTable, payloadJson);
-            return Task.CompletedTask;
-        }
-
-        public Task<string> DequeueAsync(string queueTable, NpgsqlConnection connection = null)
-            => Task.FromResult(Utils.Dequeue(ResolveActive(connection), queueTable));
-
-        public Task<long> IncrAsync(string table, string key, long amount = 1, NpgsqlConnection connection = null)
-            => Task.FromResult(Utils.Incr(ResolveActive(connection), table, key, amount));
-
-        public Task<long> GetCounterAsync(string table, string key, NpgsqlConnection connection = null)
-            => Task.FromResult(Utils.GetCounter(ResolveActive(connection), table, key));
-
-        // Hash
-        public Task HsetAsync(string table, string key, string field, string valueJson, NpgsqlConnection connection = null)
-        {
-            Utils.Hset(ResolveActive(connection), table, key, field, valueJson);
-            return Task.CompletedTask;
-        }
-
-        public Task<string> HgetAsync(string table, string key, string field, NpgsqlConnection connection = null)
-            => Task.FromResult(Utils.Hget(ResolveActive(connection), table, key, field));
-
-        public Task<string> HgetallAsync(string table, string key, NpgsqlConnection connection = null)
-            => Task.FromResult(Utils.Hgetall(ResolveActive(connection), table, key));
-
-        public Task<bool> HdelAsync(string table, string key, string field, NpgsqlConnection connection = null)
-            => Task.FromResult(Utils.Hdel(ResolveActive(connection), table, key, field));
-
-        // Sorted set
-        public Task ZaddAsync(string table, string member, double score, NpgsqlConnection connection = null)
-        {
-            Utils.Zadd(ResolveActive(connection), table, member, score);
-            return Task.CompletedTask;
-        }
-
-        public Task<double> ZincrbyAsync(string table, string member, double amount = 1,
-            NpgsqlConnection connection = null)
-            => Task.FromResult(Utils.Zincrby(ResolveActive(connection), table, member, amount));
-
-        public Task<List<(string Member, double Score)>> ZrangeAsync(string table,
-            int start = 0, int stop = 10, bool desc = true, NpgsqlConnection connection = null)
-            => Task.FromResult(Utils.Zrange(ResolveActive(connection), table, start, stop, desc));
-
-        public Task<long?> ZrankAsync(string table, string member, bool desc = true,
-            NpgsqlConnection connection = null)
-            => Task.FromResult(Utils.Zrank(ResolveActive(connection), table, member, desc));
-
-        public Task<double?> ZscoreAsync(string table, string member, NpgsqlConnection connection = null)
-            => Task.FromResult(Utils.Zscore(ResolveActive(connection), table, member));
-
-        public Task<bool> ZremAsync(string table, string member, NpgsqlConnection connection = null)
-            => Task.FromResult(Utils.Zrem(ResolveActive(connection), table, member));
-
-        // Geo
-        public Task<List<Dictionary<string, object>>> GeoradiusAsync(string table,
-            string geomColumn, double lon, double lat, double radiusMeters, int limit = 50,
-            NpgsqlConnection connection = null)
-            => Task.FromResult(Utils.Georadius(ResolveActive(connection), table, geomColumn, lon, lat, radiusMeters, limit));
-
-        public Task GeoaddAsync(string table, string nameColumn, string geomColumn,
-            string name, double lon, double lat, NpgsqlConnection connection = null)
-        {
-            Utils.Geoadd(ResolveActive(connection), table, nameColumn, geomColumn, name, lon, lat);
-            return Task.CompletedTask;
-        }
-
-        public Task<double?> GeodistAsync(string table, string geomColumn, string nameColumn,
-            string nameA, string nameB, NpgsqlConnection connection = null)
-            => Task.FromResult(Utils.Geodist(ResolveActive(connection), table, geomColumn, nameColumn, nameA, nameB));
+        // Phase 5 of schema-to-core retired the legacy flat redis-compat
+        // methods (EnqueueAsync / DequeueAsync / IncrAsync / GetCounterAsync /
+        // Hset / Hget / Hgetall / Hdel / Zadd / Zincrby / Zrange / Zrank /
+        // Zscore / Zrem / Geoadd / Geoaddius / Geodist). Use the proxy-owned
+        // family namespaces instead: gl.Counters, gl.Zsets, gl.Hashes,
+        // gl.Queues, gl.Geos. Pub/sub stays flat (no DDL family).
 
         // Misc
         public Task<long> CountDistinctAsync(string table, string column, NpgsqlConnection connection = null)

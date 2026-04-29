@@ -45,6 +45,115 @@ namespace GoldLapel.Tests
         }
 
         /// <summary>
+        /// Generic seed for a Phase 5 family DDL cache entry. Each family
+        /// (counter / zset / hash / queue / geo) caches by key
+        /// <c>"&lt;family&gt;:&lt;name&gt;"</c>; the namespace verbs short-circuit
+        /// the HTTP fetch when the cache has an entry, so SQL-shape tests run
+        /// without spawning the proxy.
+        /// </summary>
+        public static void InjectFamilyPatterns(GL gl, string family, string name,
+            string mainTable, Dictionary<string, string> queryPatterns)
+        {
+            var entry = new DdlEntry
+            {
+                Tables = new Dictionary<string, string> { ["main"] = mainTable },
+                QueryPatterns = queryPatterns,
+            };
+            var cacheField = typeof(GL).GetField("_ddlCache", BindingFlags.NonPublic | BindingFlags.Instance);
+            var cache = (System.Collections.Concurrent.ConcurrentDictionary<string, DdlEntry>) cacheField.GetValue(gl);
+            cache[family + ":" + name] = entry;
+        }
+
+        public static void InjectCounterPatterns(GL gl, string name)
+        {
+            var t = "_goldlapel.counter_" + name;
+            InjectFamilyPatterns(gl, "counter", name, t, new Dictionary<string, string>
+            {
+                ["incr"]       = "INSERT INTO " + t + " (key, value, updated_at) VALUES ($1, $2, NOW()) ON CONFLICT (key) DO UPDATE SET value = " + t + ".value + EXCLUDED.value, updated_at = NOW() RETURNING value",
+                ["set"]        = "INSERT INTO " + t + " (key, value, updated_at) VALUES ($1, $2, NOW()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW() RETURNING value",
+                ["get"]        = "SELECT value FROM " + t + " WHERE key = $1",
+                ["delete"]     = "DELETE FROM " + t + " WHERE key = $1",
+                ["delete_all"] = "DELETE FROM " + t,
+                ["count_keys"] = "SELECT COUNT(*) FROM " + t,
+            });
+        }
+
+        public static void InjectZsetPatterns(GL gl, string name)
+        {
+            var t = "_goldlapel.zset_" + name;
+            InjectFamilyPatterns(gl, "zset", name, t, new Dictionary<string, string>
+            {
+                ["zadd"]          = "INSERT INTO " + t + " (zset_key, member, score) VALUES ($1, $2, $3) ON CONFLICT (zset_key, member) DO UPDATE SET score = EXCLUDED.score RETURNING score",
+                ["zincrby"]       = "INSERT INTO " + t + " (zset_key, member, score) VALUES ($1, $2, $3) ON CONFLICT (zset_key, member) DO UPDATE SET score = " + t + ".score + EXCLUDED.score RETURNING score",
+                ["zscore"]        = "SELECT score FROM " + t + " WHERE zset_key = $1 AND member = $2",
+                ["zrem"]          = "DELETE FROM " + t + " WHERE zset_key = $1 AND member = $2",
+                ["zrange_asc"]    = "SELECT member, score FROM " + t + " WHERE zset_key = $1 ORDER BY score ASC, member ASC LIMIT $2 OFFSET $3",
+                ["zrange_desc"]   = "SELECT member, score FROM " + t + " WHERE zset_key = $1 ORDER BY score DESC, member DESC LIMIT $2 OFFSET $3",
+                ["zrangebyscore"] = "SELECT member, score FROM " + t + " WHERE zset_key = $1 AND score >= $2 AND score <= $3 ORDER BY score ASC, member ASC LIMIT $4 OFFSET $5",
+                ["zrank_asc"]     = "SELECT rank FROM ( SELECT member, ROW_NUMBER() OVER (ORDER BY score ASC, member ASC) - 1 AS rank FROM " + t + " WHERE zset_key = $1 ) ranked WHERE member = $2",
+                ["zrank_desc"]    = "SELECT rank FROM ( SELECT member, ROW_NUMBER() OVER (ORDER BY score DESC, member DESC) - 1 AS rank FROM " + t + " WHERE zset_key = $1 ) ranked WHERE member = $2",
+                ["zcard"]         = "SELECT COUNT(*) FROM " + t + " WHERE zset_key = $1",
+                ["delete_key"]    = "DELETE FROM " + t + " WHERE zset_key = $1",
+                ["delete_all"]    = "DELETE FROM " + t,
+            });
+        }
+
+        public static void InjectHashPatterns(GL gl, string name)
+        {
+            var t = "_goldlapel.hash_" + name;
+            InjectFamilyPatterns(gl, "hash", name, t, new Dictionary<string, string>
+            {
+                ["hset"]       = "INSERT INTO " + t + " (hash_key, field, value) VALUES ($1, $2, $3::jsonb) ON CONFLICT (hash_key, field) DO UPDATE SET value = EXCLUDED.value RETURNING value",
+                ["hget"]       = "SELECT value FROM " + t + " WHERE hash_key = $1 AND field = $2",
+                ["hgetall"]    = "SELECT field, value FROM " + t + " WHERE hash_key = $1 ORDER BY field",
+                ["hkeys"]      = "SELECT field FROM " + t + " WHERE hash_key = $1 ORDER BY field",
+                ["hvals"]      = "SELECT value FROM " + t + " WHERE hash_key = $1 ORDER BY field",
+                ["hexists"]    = "SELECT EXISTS (SELECT 1 FROM " + t + " WHERE hash_key = $1 AND field = $2)",
+                ["hdel"]       = "DELETE FROM " + t + " WHERE hash_key = $1 AND field = $2",
+                ["hlen"]       = "SELECT COUNT(*) FROM " + t + " WHERE hash_key = $1",
+                ["delete_key"] = "DELETE FROM " + t + " WHERE hash_key = $1",
+                ["delete_all"] = "DELETE FROM " + t,
+            });
+        }
+
+        public static void InjectQueuePatterns(GL gl, string name)
+        {
+            var t = "_goldlapel.queue_" + name;
+            InjectFamilyPatterns(gl, "queue", name, t, new Dictionary<string, string>
+            {
+                ["enqueue"]       = "INSERT INTO " + t + " (payload) VALUES ($1::jsonb) RETURNING id, created_at",
+                ["claim"]         = "WITH next_msg AS ( SELECT id FROM " + t + " WHERE status = 'ready' AND visible_at <= NOW() ORDER BY visible_at, id FOR UPDATE SKIP LOCKED LIMIT 1 ) UPDATE " + t + " SET status = 'claimed', visible_at = NOW() + INTERVAL '1 millisecond' * $1 FROM next_msg WHERE " + t + ".id = next_msg.id RETURNING " + t + ".id, " + t + ".payload, " + t + ".visible_at, " + t + ".created_at",
+                ["ack"]           = "DELETE FROM " + t + " WHERE id = $1",
+                ["extend"]        = "UPDATE " + t + " SET visible_at = visible_at + INTERVAL '1 millisecond' * $2 WHERE id = $1 AND status = 'claimed' RETURNING visible_at",
+                ["nack"]          = "UPDATE " + t + " SET status = 'ready', visible_at = NOW() WHERE id = $1 AND status = 'claimed' RETURNING id",
+                ["peek"]          = "SELECT id, payload, visible_at, status, created_at FROM " + t + " WHERE status = 'ready' AND visible_at <= NOW() ORDER BY visible_at, id LIMIT 1",
+                ["count_ready"]   = "SELECT COUNT(*) FROM " + t + " WHERE status = 'ready' AND visible_at <= NOW()",
+                ["count_claimed"] = "SELECT COUNT(*) FROM " + t + " WHERE status = 'claimed'",
+                ["delete_all"]    = "DELETE FROM " + t,
+            });
+        }
+
+        public static void InjectGeoPatterns(GL gl, string name)
+        {
+            var t = "_goldlapel.geo_" + name;
+            // Proxy v1 SQL: $N indices match the canonical contract — every $N
+            // appears at most once for georadius (CTE-anchor); geosearch_member
+            // uses $1, $2 (both = anchor member), $3 = radius_m, $4 = limit.
+            InjectFamilyPatterns(gl, "geo", name, t, new Dictionary<string, string>
+            {
+                ["geoadd"]               = "INSERT INTO " + t + " (member, location, updated_at) VALUES ($1, ST_SetSRID(ST_MakePoint($2, $3), 4326)::geography, NOW()) ON CONFLICT (member) DO UPDATE SET location = EXCLUDED.location, updated_at = NOW() RETURNING ST_X(location::geometry) AS lon, ST_Y(location::geometry) AS lat",
+                ["geopos"]               = "SELECT ST_X(location::geometry) AS lon, ST_Y(location::geometry) AS lat FROM " + t + " WHERE member = $1",
+                ["geodist"]              = "SELECT ST_Distance(a.location, b.location) AS distance_m FROM " + t + " a, " + t + " b WHERE a.member = $1 AND b.member = $2",
+                ["georadius"]            = "WITH anchor AS ( SELECT ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography AS geog ) SELECT member, ST_X(location::geometry) AS lon, ST_Y(location::geometry) AS lat FROM " + t + ", anchor WHERE ST_DWithin(location, anchor.geog, $3) ORDER BY ST_Distance(location, anchor.geog) LIMIT $4",
+                ["georadius_with_dist"]  = "WITH anchor AS ( SELECT ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography AS geog ) SELECT member, ST_X(location::geometry) AS lon, ST_Y(location::geometry) AS lat, ST_Distance(location, anchor.geog) AS distance_m FROM " + t + ", anchor WHERE ST_DWithin(location, anchor.geog, $3) ORDER BY distance_m LIMIT $4",
+                ["geosearch_member"]     = "SELECT b.member, ST_X(b.location::geometry) AS lon, ST_Y(b.location::geometry) AS lat, ST_Distance(b.location, a.location) AS distance_m FROM " + t + " a, " + t + " b WHERE a.member = $1 AND ST_DWithin(b.location, a.location, $3) AND b.member <> $2 ORDER BY distance_m LIMIT $4",
+                ["geo_remove"]           = "DELETE FROM " + t + " WHERE member = $1",
+                ["geo_count"]            = "SELECT COUNT(*) FROM " + t,
+                ["delete_all"]           = "DELETE FROM " + t,
+            });
+        }
+
+        /// <summary>
         /// Pre-populate the instance's DDL cache with canonical stream patterns
         /// so stream* methods can run without hitting the dashboard.
         /// </summary>
@@ -304,12 +413,19 @@ namespace GoldLapel.Tests
         }
     }
 
-    public class InstancePubSubQueueMethodsTest
+    /// <summary>
+    /// Pub/sub flat methods stay on the parent client (no DDL family in
+    /// Phase 5). The redis-compat queue / counter / hash / zset / geo flat
+    /// methods were retired in Phase 5 — see the per-family namespace tests
+    /// (CountersNamespaceTests / ZsetsNamespaceTests / HashesNamespaceTests /
+    /// QueuesNamespaceTests / GeosNamespaceTests).
+    /// </summary>
+    public class InstancePubSubMethodsTest
     {
         private readonly GL _gl;
         private readonly SpyConnection _spy;
 
-        public InstancePubSubQueueMethodsTest()
+        public InstancePubSubMethodsTest()
         {
             _gl = TestHelpers.MakeWithSpy(out _spy);
         }
@@ -322,187 +438,8 @@ namespace GoldLapel.Tests
             Assert.Contains("pg_notify(@channel, @message)", _spy.LastCommandText);
             Assert.Equal("events", _spy.LastCommand.ParamValue("@channel"));
         }
-
-        [Fact]
-        public async Task EnqueueAsyncDelegates()
-        {
-            await _gl.EnqueueAsync("jobs", "{\"task\":\"email\"}");
-
-            Assert.Contains("CREATE TABLE IF NOT EXISTS jobs", _spy.Commands[0].CommandText);
-            Assert.Contains("INSERT INTO jobs", _spy.Commands[1].CommandText);
-        }
-
-        [Fact]
-        public async Task DequeueAsyncDelegates()
-        {
-            await _gl.DequeueAsync("jobs");
-
-            Assert.Contains("DELETE FROM jobs", _spy.LastCommandText);
-            Assert.Contains("FOR UPDATE SKIP LOCKED", _spy.LastCommandText);
-        }
-
-        [Fact]
-        public async Task IncrAsyncDelegates()
-        {
-            _spy.NextScalarResult = 5L;
-            var result = await _gl.IncrAsync("counters", "page_views");
-
-            Assert.Equal(5L, result);
-            Assert.Contains("INSERT INTO counters", _spy.LastCommandText);
-        }
-
-        [Fact]
-        public async Task GetCounterAsyncDelegates()
-        {
-            await _gl.GetCounterAsync("counters", "page_views");
-
-            Assert.Contains("SELECT value FROM counters", _spy.LastCommandText);
-        }
     }
 
-    public class InstanceHashMethodsTest
-    {
-        private readonly GL _gl;
-        private readonly SpyConnection _spy;
-
-        public InstanceHashMethodsTest()
-        {
-            _gl = TestHelpers.MakeWithSpy(out _spy);
-        }
-
-        [Fact]
-        public async Task HsetAsyncDelegates()
-        {
-            await _gl.HsetAsync("cache", "session:1", "user", "\"alice\"");
-
-            Assert.Contains("CREATE TABLE IF NOT EXISTS cache", _spy.Commands[0].CommandText);
-            Assert.Contains("jsonb_build_object(@field, @val::jsonb)", _spy.Commands[1].CommandText);
-        }
-
-        [Fact]
-        public async Task HgetAsyncDelegates()
-        {
-            await _gl.HgetAsync("cache", "session:1", "user");
-
-            Assert.Contains("data->>@field", _spy.LastCommandText);
-            Assert.Contains("WHERE key = @key", _spy.LastCommandText);
-        }
-
-        [Fact]
-        public async Task HgetallAsyncDelegates()
-        {
-            await _gl.HgetallAsync("cache", "session:1");
-
-            Assert.Contains("SELECT data FROM cache", _spy.LastCommandText);
-        }
-
-        [Fact]
-        public async Task HdelAsyncDelegates()
-        {
-            await _gl.HdelAsync("cache", "session:1", "user");
-
-            Assert.Contains("data ? @field", _spy.Commands[0].CommandText);
-        }
-    }
-
-    public class InstanceSortedSetMethodsTest
-    {
-        private readonly GL _gl;
-        private readonly SpyConnection _spy;
-
-        public InstanceSortedSetMethodsTest()
-        {
-            _gl = TestHelpers.MakeWithSpy(out _spy);
-        }
-
-        [Fact]
-        public async Task ZaddAsyncDelegates()
-        {
-            await _gl.ZaddAsync("leaderboard", "alice", 100.0);
-
-            Assert.Contains("CREATE TABLE IF NOT EXISTS leaderboard", _spy.Commands[0].CommandText);
-            Assert.Contains("INSERT INTO leaderboard", _spy.Commands[1].CommandText);
-        }
-
-        [Fact]
-        public async Task ZincrbyAsyncDelegates()
-        {
-            _spy.NextScalarResult = 105.0;
-            var result = await _gl.ZincrbyAsync("leaderboard", "alice", 5.0);
-
-            Assert.Equal(105.0, result);
-        }
-
-        [Fact]
-        public async Task ZrangeAsyncDelegates()
-        {
-            await _gl.ZrangeAsync("leaderboard");
-
-            Assert.Contains("SELECT member, score FROM leaderboard", _spy.LastCommandText);
-            Assert.Contains("ORDER BY score DESC", _spy.LastCommandText);
-        }
-
-        [Fact]
-        public async Task ZrankAsyncDelegates()
-        {
-            await _gl.ZrankAsync("leaderboard", "alice");
-
-            Assert.Contains("ROW_NUMBER() OVER", _spy.LastCommandText);
-        }
-
-        [Fact]
-        public async Task ZscoreAsyncDelegates()
-        {
-            await _gl.ZscoreAsync("leaderboard", "alice");
-
-            Assert.Contains("SELECT score FROM leaderboard", _spy.LastCommandText);
-        }
-
-        [Fact]
-        public async Task ZremAsyncDelegates()
-        {
-            await _gl.ZremAsync("leaderboard", "alice");
-
-            Assert.Contains("DELETE FROM leaderboard WHERE member = @member", _spy.LastCommandText);
-        }
-    }
-
-    public class InstanceGeoMethodsTest
-    {
-        private readonly GL _gl;
-        private readonly SpyConnection _spy;
-
-        public InstanceGeoMethodsTest()
-        {
-            _gl = TestHelpers.MakeWithSpy(out _spy);
-        }
-
-        [Fact]
-        public async Task GeoaddAsyncDelegates()
-        {
-            await _gl.GeoaddAsync("places", "name", "geom", "NYC", -74.006, 40.7128);
-
-            Assert.Contains("CREATE EXTENSION IF NOT EXISTS postgis", _spy.Commands[0].CommandText);
-            Assert.Contains("ST_SetSRID(ST_MakePoint(@lon, @lat), 4326)", _spy.Commands[2].CommandText);
-        }
-
-        [Fact]
-        public async Task GeoradiusAsyncDelegates()
-        {
-            await _gl.GeoradiusAsync("places", "geom", -74.006, 40.7128, 5000.0);
-
-            Assert.Contains("ST_DWithin", _spy.LastCommandText);
-            Assert.Contains("FROM places", _spy.LastCommandText);
-        }
-
-        [Fact]
-        public async Task GeodistAsyncDelegates()
-        {
-            await _gl.GeodistAsync("places", "geom", "name", "NYC", "LA");
-
-            Assert.Contains("ST_Distance", _spy.LastCommandText);
-        }
-    }
 
     public class InstanceMiscMethodsTest
     {
