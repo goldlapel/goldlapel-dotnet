@@ -72,7 +72,7 @@ namespace GoldLapel.Tests
                 opts.ProxyPort = NextPort();
                 opts.Silent = true;
             });
-            await gl.StreamAddAsync(name, "{\"type\":\"click\"}");
+            await gl.Streams.AddAsync(name, "{\"type\":\"click\"}");
 
             await using var direct = await DirectAsync();
             using var cmd = direct.CreateCommand();
@@ -102,7 +102,7 @@ namespace GoldLapel.Tests
                 opts.ProxyPort = NextPort();
                 opts.Silent = true;
             });
-            await gl.StreamAddAsync(name, "{\"type\":\"click\"}");
+            await gl.Streams.AddAsync(name, "{\"type\":\"click\"}");
 
             await using var direct = await DirectAsync();
             using var cmd = direct.CreateCommand();
@@ -127,17 +127,17 @@ namespace GoldLapel.Tests
                 opts.ProxyPort = NextPort();
                 opts.Silent = true;
             });
-            await gl.StreamCreateGroupAsync(name, "workers");
-            var id1 = await gl.StreamAddAsync(name, "{\"i\":1}");
-            var id2 = await gl.StreamAddAsync(name, "{\"i\":2}");
+            await gl.Streams.CreateGroupAsync(name, "workers");
+            var id1 = await gl.Streams.AddAsync(name, "{\"i\":1}");
+            var id2 = await gl.Streams.AddAsync(name, "{\"i\":2}");
             Assert.True(id2 > id1);
 
-            var msgs = await gl.StreamReadAsync(name, "workers", "c", 10);
+            var msgs = await gl.Streams.ReadAsync(name, "workers", "c", 10);
             Assert.Equal(2, msgs.Count);
 
-            var first = await gl.StreamAckAsync(name, "workers", id1);
+            var first = await gl.Streams.AckAsync(name, "workers", id1);
             Assert.True(first);
-            var second = await gl.StreamAckAsync(name, "workers", id1);
+            var second = await gl.Streams.AckAsync(name, "workers", id1);
             Assert.False(second);
         }
     }

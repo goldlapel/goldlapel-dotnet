@@ -33,6 +33,7 @@ namespace GoldLapel
         private static readonly Dictionary<string, string> SupportedVersions = new Dictionary<string, string>
         {
             ["stream"] = "v1",
+            ["doc_store"] = "v1",
         };
 
         /// <summary>
@@ -102,11 +103,19 @@ namespace GoldLapel
 
         /// <summary>
         /// Fetch (and cache) the canonical DDL + query patterns for a helper.
+        ///
+        /// <paramref name="options"/> is an optional bag of per-family creation
+        /// options (e.g. doc_store accepts <c>{"unlogged": true}</c>). Only
+        /// honored on the first call for a given (family, name) — once the
+        /// table exists on the proxy, its shape is fixed and subsequent
+        /// options are silently ignored proxy-side (idempotent
+        /// <c>CREATE TABLE IF NOT EXISTS</c>).
         /// </summary>
         public static async Task<DdlEntry> FetchPatternsAsync(
             ConcurrentDictionary<string, DdlEntry> cache,
             string family, string name,
             int dashboardPort, string dashboardToken,
+            IDictionary<string, object> options = null,
             CancellationToken ct = default)
         {
             var key = family + ":" + name;
@@ -122,11 +131,24 @@ namespace GoldLapel
                     + family + ", ...) require the proxy's dashboard to be reachable.");
 
             var url = "http://127.0.0.1:" + dashboardPort + "/api/ddl/" + family + "/create";
-            var reqBody = JsonSerializer.SerializeToUtf8Bytes(new
+            byte[] reqBody;
+            if (options != null && options.Count > 0)
             {
-                name,
-                schema_version = SupportedVersion(family),
-            });
+                reqBody = JsonSerializer.SerializeToUtf8Bytes(new
+                {
+                    name,
+                    schema_version = SupportedVersion(family),
+                    options,
+                });
+            }
+            else
+            {
+                reqBody = JsonSerializer.SerializeToUtf8Bytes(new
+                {
+                    name,
+                    schema_version = SupportedVersion(family),
+                });
+            }
 
             var (status, respBody) = await PostAsync(url, dashboardToken, reqBody, ct).ConfigureAwait(false);
 

@@ -34,7 +34,7 @@ await using var reader = await cmd.ExecuteReaderAsync();
 
 Point Npgsql at `gl.Url`. Gold Lapel sits between your app and your DB, watching query patterns and creating materialized views + indexes automatically. Zero code changes beyond the connection string.
 
-Scoped transactions via `gl.UsingAsync(conn, ...)`, per-call `connection:` overrides, and the full wrapper surface (documents, search, Redis replacement) are in the docs.
+Scoped transactions via `gl.UsingAsync(conn, ...)`, per-call `connection:` overrides, and the full wrapper surface (`gl.Documents.<Verb>Async`, `gl.Streams.<Verb>Async`, search, Redis replacement) are in the docs.
 
 ## Dashboard
 
