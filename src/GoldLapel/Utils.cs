@@ -5,6 +5,7 @@ using System.Globalization;
 using System.Linq;
 using System.Linq.Expressions;
 using System.Reflection;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading;
 
@@ -28,365 +29,11 @@ namespace GoldLapel
             }
         }
 
-        /// <summary>
-        /// Add a job to a queue table. Like redis.lpush().
-        /// Creates the queue table if it doesn't exist. Payload is stored as JSONB.
-        /// </summary>
-        public static void Enqueue(DbConnection conn, string queueTable, string payloadJson)
-        {
-            ValidateIdentifier(queueTable);
-            using (var cmd = conn.CreateCommand())
-            {
-                cmd.CommandText =
-                    "CREATE TABLE IF NOT EXISTS " + queueTable + " (" +
-                    "id BIGSERIAL PRIMARY KEY, " +
-                    "payload JSONB NOT NULL, " +
-                    "created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())";
-                cmd.ExecuteNonQuery();
-            }
-
-            using (var cmd = conn.CreateCommand())
-            {
-                cmd.CommandText = "INSERT INTO " + queueTable + " (payload) VALUES (@payload::jsonb)";
-                AddParameter(cmd, "@payload", payloadJson);
-                cmd.ExecuteNonQuery();
-            }
-        }
-
-        /// <summary>
-        /// Pop the next job from a queue table. Like redis.brpop() (non-blocking).
-        /// Uses FOR UPDATE SKIP LOCKED for safe concurrent access.
-        /// Returns the payload JSON string, or null if the queue is empty.
-        /// </summary>
-        public static string Dequeue(DbConnection conn, string queueTable)
-        {
-            ValidateIdentifier(queueTable);
-            using (var cmd = conn.CreateCommand())
-            {
-                cmd.CommandText =
-                    "DELETE FROM " + queueTable +
-                    " WHERE id = (" +
-                    "SELECT id FROM " + queueTable +
-                    " ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1" +
-                    ") RETURNING payload";
-
-                using (var reader = cmd.ExecuteReader())
-                {
-                    if (reader.Read())
-                        return reader.GetValue(0)?.ToString();
-                    return null;
-                }
-            }
-        }
-
-        /// <summary>
-        /// Increment a counter. Like redis.incr().
-        /// Creates the counter table if it doesn't exist. Returns the new value.
-        /// </summary>
-        public static long Incr(DbConnection conn, string table, string key, long amount = 1)
-        {
-            ValidateIdentifier(table);
-            using (var cmd = conn.CreateCommand())
-            {
-                cmd.CommandText =
-                    "CREATE TABLE IF NOT EXISTS " + table + " (" +
-                    "key TEXT PRIMARY KEY, " +
-                    "value BIGINT NOT NULL DEFAULT 0)";
-                cmd.ExecuteNonQuery();
-            }
-
-            using (var cmd = conn.CreateCommand())
-            {
-                cmd.CommandText =
-                    "INSERT INTO " + table + " (key, value) VALUES (@key, @amount) " +
-                    "ON CONFLICT (key) DO UPDATE SET value = " + table + ".value + @incr " +
-                    "RETURNING value";
-                AddParameter(cmd, "@key", key);
-                AddParameter(cmd, "@amount", amount);
-                AddParameter(cmd, "@incr", amount);
-                return (long)cmd.ExecuteScalar();
-            }
-        }
-
-        /// <summary>
-        /// Add a member with a score to a sorted set. Like redis.zadd().
-        /// Creates the sorted set table if it doesn't exist.
-        /// If the member already exists, updates the score.
-        /// </summary>
-        public static void Zadd(DbConnection conn, string table, string member, double score)
-        {
-            ValidateIdentifier(table);
-            using (var cmd = conn.CreateCommand())
-            {
-                cmd.CommandText =
-                    "CREATE TABLE IF NOT EXISTS " + table + " (" +
-                    "member TEXT PRIMARY KEY, " +
-                    "score DOUBLE PRECISION NOT NULL)";
-                cmd.ExecuteNonQuery();
-            }
-
-            using (var cmd = conn.CreateCommand())
-            {
-                cmd.CommandText =
-                    "INSERT INTO " + table + " (member, score) VALUES (@member, @score) " +
-                    "ON CONFLICT (member) DO UPDATE SET score = EXCLUDED.score";
-                AddParameter(cmd, "@member", member);
-                AddParameter(cmd, "@score", score);
-                cmd.ExecuteNonQuery();
-            }
-        }
-
-        /// <summary>
-        /// Get members by score rank. Like redis.zrange().
-        /// Returns a list of (Member, Score) tuples.
-        /// desc=true returns highest scores first (leaderboard order).
-        /// </summary>
-        public static List<(string Member, double Score)> Zrange(
-            DbConnection conn, string table, int start = 0, int stop = 10, bool desc = true)
-        {
-            ValidateIdentifier(table);
-            var order = desc ? "DESC" : "ASC";
-            var limit = stop - start;
-
-            using (var cmd = conn.CreateCommand())
-            {
-                cmd.CommandText =
-                    "SELECT member, score FROM " + table +
-                    " ORDER BY score " + order +
-                    " LIMIT @limit OFFSET @offset";
-                AddParameter(cmd, "@limit", limit);
-                AddParameter(cmd, "@offset", start);
-
-                var results = new List<(string Member, double Score)>();
-                using (var reader = cmd.ExecuteReader())
-                {
-                    while (reader.Read())
-                    {
-                        results.Add((reader.GetString(0), reader.GetDouble(1)));
-                    }
-                }
-                return results;
-            }
-        }
-
-        /// <summary>
-        /// Set a field in a hash. Like redis.hset().
-        /// Creates the hash table if it doesn't exist. Uses JSONB for storage.
-        /// </summary>
-        public static void Hset(DbConnection conn, string table, string key, string field, string valueJson)
-        {
-            ValidateIdentifier(table);
-            using (var cmd = conn.CreateCommand())
-            {
-                cmd.CommandText =
-                    "CREATE TABLE IF NOT EXISTS " + table + " (" +
-                    "key TEXT PRIMARY KEY, " +
-                    "data JSONB NOT NULL DEFAULT '{}'::jsonb)";
-                cmd.ExecuteNonQuery();
-            }
-
-            using (var cmd = conn.CreateCommand())
-            {
-                cmd.CommandText =
-                    "INSERT INTO " + table + " (key, data) VALUES (@key, jsonb_build_object(@field, @val::jsonb)) " +
-                    "ON CONFLICT (key) DO UPDATE SET data = " + table + ".data || jsonb_build_object(@field2, @val2::jsonb)";
-                AddParameter(cmd, "@key", key);
-                AddParameter(cmd, "@field", field);
-                AddParameter(cmd, "@val", valueJson);
-                AddParameter(cmd, "@field2", field);
-                AddParameter(cmd, "@val2", valueJson);
-                cmd.ExecuteNonQuery();
-            }
-        }
-
-        /// <summary>
-        /// Get a field from a hash. Like redis.hget().
-        /// Returns the value as a JSON string, or null if key or field doesn't exist.
-        /// </summary>
-        public static string Hget(DbConnection conn, string table, string key, string field)
-        {
-            ValidateIdentifier(table);
-            using (var cmd = conn.CreateCommand())
-            {
-                cmd.CommandText = "SELECT data->>@field FROM " + table + " WHERE key = @key";
-                AddParameter(cmd, "@field", field);
-                AddParameter(cmd, "@key", key);
-
-                using (var reader = cmd.ExecuteReader())
-                {
-                    if (reader.Read() && !reader.IsDBNull(0))
-                        return reader.GetString(0);
-                    return null;
-                }
-            }
-        }
-
-        /// <summary>
-        /// Get all fields from a hash. Like redis.hgetall().
-        /// Returns the full JSONB object as a string, or null if key doesn't exist.
-        /// </summary>
-        public static string Hgetall(DbConnection conn, string table, string key)
-        {
-            ValidateIdentifier(table);
-            using (var cmd = conn.CreateCommand())
-            {
-                cmd.CommandText = "SELECT data FROM " + table + " WHERE key = @key";
-                AddParameter(cmd, "@key", key);
-
-                using (var reader = cmd.ExecuteReader())
-                {
-                    if (reader.Read() && !reader.IsDBNull(0))
-                        return reader.GetValue(0)?.ToString();
-                    return null;
-                }
-            }
-        }
-
-        /// <summary>
-        /// Remove a field from a hash. Like redis.hdel().
-        /// Returns true if the field existed, false otherwise.
-        /// </summary>
-        public static bool Hdel(DbConnection conn, string table, string key, string field)
-        {
-            ValidateIdentifier(table);
-            using (var cmd = conn.CreateCommand())
-            {
-                cmd.CommandText = "SELECT data ? @field AS existed FROM " + table + " WHERE key = @key";
-                AddParameter(cmd, "@field", field);
-                AddParameter(cmd, "@key", key);
-
-                using (var reader = cmd.ExecuteReader())
-                {
-                    if (!reader.Read() || !reader.GetBoolean(0))
-                        return false;
-                }
-            }
-
-            using (var cmd = conn.CreateCommand())
-            {
-                cmd.CommandText = "UPDATE " + table + " SET data = data - @field WHERE key = @key";
-                AddParameter(cmd, "@field", field);
-                AddParameter(cmd, "@key", key);
-                cmd.ExecuteNonQuery();
-            }
-            return true;
-        }
-
-        /// <summary>
-        /// Add a location to a geo table. Like redis.geoadd().
-        /// Creates the table with PostGIS geometry column if it doesn't exist.
-        /// Requires PostGIS extension.
-        /// </summary>
-        public static void Geoadd(DbConnection conn, string table, string nameColumn,
-            string geomColumn, string name, double lon, double lat)
-        {
-            ValidateIdentifier(table);
-            ValidateIdentifier(nameColumn);
-            ValidateIdentifier(geomColumn);
-            using (var cmd = conn.CreateCommand())
-            {
-                cmd.CommandText = "CREATE EXTENSION IF NOT EXISTS postgis";
-                cmd.ExecuteNonQuery();
-            }
-
-            using (var cmd = conn.CreateCommand())
-            {
-                cmd.CommandText =
-                    "CREATE TABLE IF NOT EXISTS " + table + " (" +
-                    "id BIGSERIAL PRIMARY KEY, " +
-                    nameColumn + " TEXT NOT NULL, " +
-                    geomColumn + " GEOMETRY(Point, 4326) NOT NULL)";
-                cmd.ExecuteNonQuery();
-            }
-
-            using (var cmd = conn.CreateCommand())
-            {
-                cmd.CommandText =
-                    "INSERT INTO " + table + " (" + nameColumn + ", " + geomColumn + ") " +
-                    "VALUES (@name, ST_SetSRID(ST_MakePoint(@lon, @lat), 4326))";
-                AddParameter(cmd, "@name", name);
-                AddParameter(cmd, "@lon", lon);
-                AddParameter(cmd, "@lat", lat);
-                cmd.ExecuteNonQuery();
-            }
-        }
-
-        /// <summary>
-        /// Find rows within a radius of a point. Like redis.georadius().
-        /// Requires PostGIS extension. Uses ST_DWithin with geography type
-        /// for accurate distance on the Earth's surface.
-        /// Returns a list of dictionaries with all columns plus a "distance_m" field.
-        /// </summary>
-        public static List<Dictionary<string, object>> Georadius(DbConnection conn, string table,
-            string geomColumn, double lon, double lat, double radiusMeters, int limit = 50)
-        {
-            ValidateIdentifier(table);
-            ValidateIdentifier(geomColumn);
-            using (var cmd = conn.CreateCommand())
-            {
-                cmd.CommandText =
-                    "SELECT *, ST_Distance(" +
-                    geomColumn + "::geography, " +
-                    "ST_SetSRID(ST_MakePoint(@lon1, @lat1), 4326)::geography" +
-                    ") AS distance_m " +
-                    "FROM " + table + " " +
-                    "WHERE ST_DWithin(" +
-                    geomColumn + "::geography, " +
-                    "ST_SetSRID(ST_MakePoint(@lon2, @lat2), 4326)::geography, " +
-                    "@radius) " +
-                    "ORDER BY distance_m " +
-                    "LIMIT @limit";
-                AddParameter(cmd, "@lon1", lon);
-                AddParameter(cmd, "@lat1", lat);
-                AddParameter(cmd, "@lon2", lon);
-                AddParameter(cmd, "@lat2", lat);
-                AddParameter(cmd, "@radius", radiusMeters);
-                AddParameter(cmd, "@limit", limit);
-
-                var results = new List<Dictionary<string, object>>();
-                using (var reader = cmd.ExecuteReader())
-                {
-                    while (reader.Read())
-                    {
-                        var row = new Dictionary<string, object>();
-                        for (int i = 0; i < reader.FieldCount; i++)
-                        {
-                            row[reader.GetName(i)] = reader.IsDBNull(i) ? null : reader.GetValue(i);
-                        }
-                        results.Add(row);
-                    }
-                }
-                return results;
-            }
-        }
-
-        /// <summary>
-        /// Get distance between two members in meters. Like redis.geodist().
-        /// Returns the distance in meters, or null if either member doesn't exist.
-        /// </summary>
-        public static double? Geodist(DbConnection conn, string table, string geomColumn,
-            string nameColumn, string nameA, string nameB)
-        {
-            ValidateIdentifier(table);
-            ValidateIdentifier(geomColumn);
-            ValidateIdentifier(nameColumn);
-            using (var cmd = conn.CreateCommand())
-            {
-                cmd.CommandText =
-                    "SELECT ST_Distance(a." + geomColumn + "::geography, b." + geomColumn + "::geography) " +
-                    "FROM " + table + " a, " + table + " b " +
-                    "WHERE a." + nameColumn + " = @nameA AND b." + nameColumn + " = @nameB";
-                AddParameter(cmd, "@nameA", nameA);
-                AddParameter(cmd, "@nameB", nameB);
-
-                using (var reader = cmd.ExecuteReader())
-                {
-                    if (reader.Read() && !reader.IsDBNull(0))
-                        return reader.GetDouble(0);
-                    return null;
-                }
-            }
-        }
+        // Phase 5 of schema-to-core retired the legacy flat redis-compat methods
+        // (Enqueue / Dequeue / Incr / Zadd / Zrange / Hset / Hget / Hgetall / Hdel /
+        // Geoadd / Georadius / Geodist). They are replaced by proxy-owned DDL
+        // families (gl.Counters / gl.Zsets / gl.Hashes / gl.Queues / gl.Geos) —
+        // see the per-family helpers near the end of this file.
 
         public static void Subscribe(DbConnection conn, string channel, Action<string, string> callback, bool blocking = true)
         {
@@ -455,99 +102,6 @@ namespace GoldLapel
             return listenConn;
         }
 
-        public static long GetCounter(DbConnection conn, string table, string key)
-        {
-            ValidateIdentifier(table);
-            using (var cmd = conn.CreateCommand())
-            {
-                cmd.CommandText = "SELECT value FROM " + table + " WHERE key = @key";
-                AddParameter(cmd, "@key", key);
-
-                using (var reader = cmd.ExecuteReader())
-                {
-                    if (reader.Read() && !reader.IsDBNull(0))
-                        return reader.GetInt64(0);
-                    return 0;
-                }
-            }
-        }
-
-        public static double Zincrby(DbConnection conn, string table, string member, double amount = 1)
-        {
-            ValidateIdentifier(table);
-            using (var cmd = conn.CreateCommand())
-            {
-                cmd.CommandText =
-                    "CREATE TABLE IF NOT EXISTS " + table + " (" +
-                    "member TEXT PRIMARY KEY, " +
-                    "score DOUBLE PRECISION NOT NULL)";
-                cmd.ExecuteNonQuery();
-            }
-
-            using (var cmd = conn.CreateCommand())
-            {
-                cmd.CommandText =
-                    "INSERT INTO " + table + " (member, score) VALUES (@member, @amount) " +
-                    "ON CONFLICT (member) DO UPDATE SET score = " + table + ".score + @incr " +
-                    "RETURNING score";
-                AddParameter(cmd, "@member", member);
-                AddParameter(cmd, "@amount", amount);
-                AddParameter(cmd, "@incr", amount);
-                return (double)cmd.ExecuteScalar();
-            }
-        }
-
-        public static long? Zrank(DbConnection conn, string table, string member, bool desc = true)
-        {
-            ValidateIdentifier(table);
-            var order = desc ? "DESC" : "ASC";
-
-            using (var cmd = conn.CreateCommand())
-            {
-                cmd.CommandText =
-                    "SELECT rank FROM (" +
-                    "SELECT member, ROW_NUMBER() OVER (ORDER BY score " + order + ") - 1 AS rank " +
-                    "FROM " + table +
-                    ") ranked WHERE member = @member";
-                AddParameter(cmd, "@member", member);
-
-                using (var reader = cmd.ExecuteReader())
-                {
-                    if (reader.Read() && !reader.IsDBNull(0))
-                        return reader.GetInt64(0);
-                    return null;
-                }
-            }
-        }
-
-        public static double? Zscore(DbConnection conn, string table, string member)
-        {
-            ValidateIdentifier(table);
-            using (var cmd = conn.CreateCommand())
-            {
-                cmd.CommandText = "SELECT score FROM " + table + " WHERE member = @member";
-                AddParameter(cmd, "@member", member);
-
-                using (var reader = cmd.ExecuteReader())
-                {
-                    if (reader.Read() && !reader.IsDBNull(0))
-                        return reader.GetDouble(0);
-                    return null;
-                }
-            }
-        }
-
-        public static bool Zrem(DbConnection conn, string table, string member)
-        {
-            ValidateIdentifier(table);
-            using (var cmd = conn.CreateCommand())
-            {
-                cmd.CommandText = "DELETE FROM " + table + " WHERE member = @member";
-                AddParameter(cmd, "@member", member);
-                return cmd.ExecuteNonQuery() > 0;
-            }
-        }
-
         public static long CountDistinct(DbConnection conn, string table, string column)
         {
             ValidateIdentifier(table);
@@ -590,6 +144,16 @@ namespace GoldLapel
         }
 
         private static string RequireStreamPattern(DdlEntry patterns, string key, string fn)
+            => RequirePattern(patterns, key, fn);
+
+        /// <summary>
+        /// Pull a query pattern from the proxy's DDL response, raising a clear
+        /// error when the wrapper was driven without going through the
+        /// namespaced API (which fetches patterns first). Shared across all
+        /// proxy-owned DDL families: stream / doc_store / counter / zset /
+        /// hash / queue / geo.
+        /// </summary>
+        private static string RequirePattern(DdlEntry patterns, string key, string fn)
         {
             if (patterns == null || patterns.QueryPatterns == null)
                 throw new InvalidOperationException(
@@ -3617,6 +3181,710 @@ namespace GoldLapel
             param.ParameterName = name;
             param.Value = value;
             cmd.Parameters.Add(param);
+        }
+
+        // ── Phase 5 Redis-compat families ─────────────────────────────────
+        // Each family executes the proxy's canonical query pattern verbatim
+        // (after `$N → @pN` translation) and binds positionally. The proxy
+        // owns DDL — these helpers never CREATE TABLE.
+
+        // ── Counter family ────────────────────────────────────────────────
+
+        /// <summary>Increment-or-insert a counter; returns the new value.</summary>
+        public static long CounterIncr(DbConnection conn, string name, string key, long amount, DdlEntry patterns)
+        {
+            ValidateIdentifier(name);
+            var sql = Ddl.ToNpgsqlPlaceholders(RequirePattern(patterns, "incr", "Counter"));
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = sql;
+                BindNumbered(cmd, key, amount);
+                var obj = cmd.ExecuteScalar();
+                return obj == null || obj == DBNull.Value ? 0L : Convert.ToInt64(obj);
+            }
+        }
+
+        /// <summary>Decrement is incr with the negated amount.</summary>
+        public static long CounterDecr(DbConnection conn, string name, string key, long amount, DdlEntry patterns)
+        {
+            return CounterIncr(conn, name, key, -amount, patterns);
+        }
+
+        /// <summary>Idempotent set-key; returns the value just stored.</summary>
+        public static long CounterSet(DbConnection conn, string name, string key, long value, DdlEntry patterns)
+        {
+            ValidateIdentifier(name);
+            var sql = Ddl.ToNpgsqlPlaceholders(RequirePattern(patterns, "set", "Counter"));
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = sql;
+                BindNumbered(cmd, key, value);
+                var obj = cmd.ExecuteScalar();
+                return obj == null || obj == DBNull.Value ? 0L : Convert.ToInt64(obj);
+            }
+        }
+
+        /// <summary>Get a counter value; returns 0 for unknown keys (Redis convention).</summary>
+        public static long CounterGet(DbConnection conn, string name, string key, DdlEntry patterns)
+        {
+            ValidateIdentifier(name);
+            var sql = Ddl.ToNpgsqlPlaceholders(RequirePattern(patterns, "get", "Counter"));
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = sql;
+                BindNumbered(cmd, key);
+                var obj = cmd.ExecuteScalar();
+                return obj == null || obj == DBNull.Value ? 0L : Convert.ToInt64(obj);
+            }
+        }
+
+        /// <summary>Delete a counter row. True on delete, false if key was already absent.</summary>
+        public static bool CounterDelete(DbConnection conn, string name, string key, DdlEntry patterns)
+        {
+            ValidateIdentifier(name);
+            var sql = Ddl.ToNpgsqlPlaceholders(RequirePattern(patterns, "delete", "Counter"));
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = sql;
+                BindNumbered(cmd, key);
+                return cmd.ExecuteNonQuery() > 0;
+            }
+        }
+
+        public static long CounterCountKeys(DbConnection conn, string name, DdlEntry patterns)
+        {
+            ValidateIdentifier(name);
+            var sql = Ddl.ToNpgsqlPlaceholders(RequirePattern(patterns, "count_keys", "Counter"));
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = sql;
+                var obj = cmd.ExecuteScalar();
+                return obj == null || obj == DBNull.Value ? 0L : Convert.ToInt64(obj);
+            }
+        }
+
+        // ── Zset (sorted-set) family ──────────────────────────────────────
+
+        /// <summary>Set-or-update a member's score under <paramref name="zsetKey"/>; returns the new score.</summary>
+        public static double ZsetAdd(DbConnection conn, string name, string zsetKey, string member, double score, DdlEntry patterns)
+        {
+            ValidateIdentifier(name);
+            var sql = Ddl.ToNpgsqlPlaceholders(RequirePattern(patterns, "zadd", "Zset"));
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = sql;
+                BindNumbered(cmd, zsetKey, member, score);
+                var obj = cmd.ExecuteScalar();
+                return obj == null || obj == DBNull.Value ? 0.0 : Convert.ToDouble(obj);
+            }
+        }
+
+        /// <summary>Atomic increment-or-insert; returns the new score.</summary>
+        public static double ZsetIncrBy(DbConnection conn, string name, string zsetKey, string member, double delta, DdlEntry patterns)
+        {
+            ValidateIdentifier(name);
+            var sql = Ddl.ToNpgsqlPlaceholders(RequirePattern(patterns, "zincrby", "Zset"));
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = sql;
+                BindNumbered(cmd, zsetKey, member, delta);
+                var obj = cmd.ExecuteScalar();
+                return obj == null || obj == DBNull.Value ? 0.0 : Convert.ToDouble(obj);
+            }
+        }
+
+        public static double? ZsetScore(DbConnection conn, string name, string zsetKey, string member, DdlEntry patterns)
+        {
+            ValidateIdentifier(name);
+            var sql = Ddl.ToNpgsqlPlaceholders(RequirePattern(patterns, "zscore", "Zset"));
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = sql;
+                BindNumbered(cmd, zsetKey, member);
+                var obj = cmd.ExecuteScalar();
+                return obj == null || obj == DBNull.Value ? (double?)null : Convert.ToDouble(obj);
+            }
+        }
+
+        public static bool ZsetRemove(DbConnection conn, string name, string zsetKey, string member, DdlEntry patterns)
+        {
+            ValidateIdentifier(name);
+            var sql = Ddl.ToNpgsqlPlaceholders(RequirePattern(patterns, "zrem", "Zset"));
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = sql;
+                BindNumbered(cmd, zsetKey, member);
+                return cmd.ExecuteNonQuery() > 0;
+            }
+        }
+
+        public static List<(string Member, double Score)> ZsetRange(
+            DbConnection conn, string name, string zsetKey, int start, int stop, bool desc, DdlEntry patterns)
+        {
+            ValidateIdentifier(name);
+            var key = desc ? "zrange_desc" : "zrange_asc";
+            var sql = Ddl.ToNpgsqlPlaceholders(RequirePattern(patterns, key, "Zset"));
+            // Inclusive Redis-style bounds → LIMIT (stop-start+1) OFFSET start.
+            // `Math.Max(0, …)` so a backwards range yields an empty list cleanly.
+            int limit = Math.Max(0, stop - start + 1);
+            var results = new List<(string, double)>();
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = sql;
+                BindNumbered(cmd, zsetKey, limit, start);
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                        results.Add((reader.GetString(0), reader.GetDouble(1)));
+                }
+            }
+            return results;
+        }
+
+        public static List<(string Member, double Score)> ZsetRangeByScore(
+            DbConnection conn, string name, string zsetKey, double minScore, double maxScore,
+            int limit, int offset, DdlEntry patterns)
+        {
+            ValidateIdentifier(name);
+            var sql = Ddl.ToNpgsqlPlaceholders(RequirePattern(patterns, "zrangebyscore", "Zset"));
+            var results = new List<(string, double)>();
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = sql;
+                BindNumbered(cmd, zsetKey, minScore, maxScore, limit, offset);
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                        results.Add((reader.GetString(0), reader.GetDouble(1)));
+                }
+            }
+            return results;
+        }
+
+        public static long? ZsetRank(DbConnection conn, string name, string zsetKey, string member, bool desc, DdlEntry patterns)
+        {
+            ValidateIdentifier(name);
+            var key = desc ? "zrank_desc" : "zrank_asc";
+            var sql = Ddl.ToNpgsqlPlaceholders(RequirePattern(patterns, key, "Zset"));
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = sql;
+                BindNumbered(cmd, zsetKey, member);
+                var obj = cmd.ExecuteScalar();
+                return obj == null || obj == DBNull.Value ? (long?)null : Convert.ToInt64(obj);
+            }
+        }
+
+        public static long ZsetCard(DbConnection conn, string name, string zsetKey, DdlEntry patterns)
+        {
+            ValidateIdentifier(name);
+            var sql = Ddl.ToNpgsqlPlaceholders(RequirePattern(patterns, "zcard", "Zset"));
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = sql;
+                BindNumbered(cmd, zsetKey);
+                var obj = cmd.ExecuteScalar();
+                return obj == null || obj == DBNull.Value ? 0L : Convert.ToInt64(obj);
+            }
+        }
+
+        // ── Hash family ───────────────────────────────────────────────────
+        // The proxy's v1 hash schema is row-per-(hash_key, field). Values are
+        // JSONB so callers can store arbitrary structured payloads.
+
+        /// <summary>
+        /// Coerce a value coming back from a JSONB column into a JsonElement.
+        /// Npgsql may hand us a JsonElement directly (modern driver default),
+        /// a string of JSON text, or a primitive scalar that wasn't valid JSON.
+        /// We materialize through JsonDocument so callers get a uniform type.
+        /// </summary>
+        private static JsonElement DecodeJsonb(object value)
+        {
+            if (value == null || value == DBNull.Value)
+                return default;
+            if (value is JsonElement je)
+                return je.Clone();
+            string text;
+            if (value is string s) text = s;
+            else if (value is byte[] bytes) text = System.Text.Encoding.UTF8.GetString(bytes);
+            else text = value.ToString();
+            try
+            {
+                using var doc = JsonDocument.Parse(text);
+                return doc.RootElement.Clone();
+            }
+            catch (JsonException)
+            {
+                // The proxy column is JSONB so non-JSON values shouldn't happen
+                // — but matching the Python wrapper's user-friendly behavior,
+                // return the raw text as a JSON string rather than raising.
+                using var doc = JsonDocument.Parse(JsonSerializer.Serialize(text));
+                return doc.RootElement.Clone();
+            }
+        }
+
+        /// <summary>
+        /// Set a hash field. The value is JSON-encoded at the wrapper edge so
+        /// callers can store any object that <see cref="JsonSerializer"/>
+        /// supports. Returns the just-stored value.
+        /// </summary>
+        public static JsonElement? HashSet(DbConnection conn, string name, string hashKey, string field, object value, DdlEntry patterns)
+        {
+            ValidateIdentifier(name);
+            var sql = Ddl.ToNpgsqlPlaceholders(RequirePattern(patterns, "hset", "Hash"));
+            string encoded = JsonSerializer.Serialize(value);
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = sql;
+                BindNumbered(cmd, hashKey, field, encoded);
+                using (var reader = cmd.ExecuteReader())
+                {
+                    if (reader.Read() && !reader.IsDBNull(0))
+                        return DecodeJsonb(reader.GetValue(0));
+                    return null;
+                }
+            }
+        }
+
+        public static JsonElement? HashGet(DbConnection conn, string name, string hashKey, string field, DdlEntry patterns)
+        {
+            ValidateIdentifier(name);
+            var sql = Ddl.ToNpgsqlPlaceholders(RequirePattern(patterns, "hget", "Hash"));
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = sql;
+                BindNumbered(cmd, hashKey, field);
+                using (var reader = cmd.ExecuteReader())
+                {
+                    if (reader.Read() && !reader.IsDBNull(0))
+                        return DecodeJsonb(reader.GetValue(0));
+                    return null;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Reassemble every (field, value) under <paramref name="hashKey"/>
+        /// into a Dictionary. Empty when the key has no fields.
+        /// </summary>
+        public static Dictionary<string, JsonElement> HashGetAll(DbConnection conn, string name, string hashKey, DdlEntry patterns)
+        {
+            ValidateIdentifier(name);
+            var sql = Ddl.ToNpgsqlPlaceholders(RequirePattern(patterns, "hgetall", "Hash"));
+            var result = new Dictionary<string, JsonElement>();
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = sql;
+                BindNumbered(cmd, hashKey);
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        var f = reader.GetString(0);
+                        var v = reader.IsDBNull(1) ? default : DecodeJsonb(reader.GetValue(1));
+                        result[f] = v;
+                    }
+                }
+            }
+            return result;
+        }
+
+        public static List<string> HashKeys(DbConnection conn, string name, string hashKey, DdlEntry patterns)
+        {
+            ValidateIdentifier(name);
+            var sql = Ddl.ToNpgsqlPlaceholders(RequirePattern(patterns, "hkeys", "Hash"));
+            var result = new List<string>();
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = sql;
+                BindNumbered(cmd, hashKey);
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                        result.Add(reader.GetString(0));
+                }
+            }
+            return result;
+        }
+
+        public static List<JsonElement> HashValues(DbConnection conn, string name, string hashKey, DdlEntry patterns)
+        {
+            ValidateIdentifier(name);
+            var sql = Ddl.ToNpgsqlPlaceholders(RequirePattern(patterns, "hvals", "Hash"));
+            var result = new List<JsonElement>();
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = sql;
+                BindNumbered(cmd, hashKey);
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                        result.Add(reader.IsDBNull(0) ? default : DecodeJsonb(reader.GetValue(0)));
+                }
+            }
+            return result;
+        }
+
+        public static bool HashExists(DbConnection conn, string name, string hashKey, string field, DdlEntry patterns)
+        {
+            ValidateIdentifier(name);
+            var sql = Ddl.ToNpgsqlPlaceholders(RequirePattern(patterns, "hexists", "Hash"));
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = sql;
+                BindNumbered(cmd, hashKey, field);
+                var obj = cmd.ExecuteScalar();
+                return obj != null && obj != DBNull.Value && Convert.ToBoolean(obj);
+            }
+        }
+
+        public static bool HashDelete(DbConnection conn, string name, string hashKey, string field, DdlEntry patterns)
+        {
+            ValidateIdentifier(name);
+            var sql = Ddl.ToNpgsqlPlaceholders(RequirePattern(patterns, "hdel", "Hash"));
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = sql;
+                BindNumbered(cmd, hashKey, field);
+                return cmd.ExecuteNonQuery() > 0;
+            }
+        }
+
+        public static long HashLen(DbConnection conn, string name, string hashKey, DdlEntry patterns)
+        {
+            ValidateIdentifier(name);
+            var sql = Ddl.ToNpgsqlPlaceholders(RequirePattern(patterns, "hlen", "Hash"));
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = sql;
+                BindNumbered(cmd, hashKey);
+                var obj = cmd.ExecuteScalar();
+                return obj == null || obj == DBNull.Value ? 0L : Convert.ToInt64(obj);
+            }
+        }
+
+        // ── Queue family (at-least-once with visibility timeout) ─────────
+
+        /// <summary>Add a message; returns its assigned id.</summary>
+        public static long? QueueEnqueue(DbConnection conn, string name, object payload, DdlEntry patterns)
+        {
+            ValidateIdentifier(name);
+            var sql = Ddl.ToNpgsqlPlaceholders(RequirePattern(patterns, "enqueue", "Queue"));
+            string encoded = JsonSerializer.Serialize(payload);
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = sql;
+                BindNumbered(cmd, encoded);
+                using (var reader = cmd.ExecuteReader())
+                {
+                    if (reader.Read() && !reader.IsDBNull(0))
+                        return reader.GetInt64(0);
+                    return null;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Lease the next-ready message. Returns null if the queue is empty.
+        /// Caller MUST <see cref="QueueAck"/> or <see cref="QueueAbandon"/>
+        /// the id, or the message becomes visible again after the timeout.
+        /// </summary>
+        public static ClaimedMessage QueueClaim(DbConnection conn, string name, long visibilityTimeoutMs, DdlEntry patterns)
+        {
+            ValidateIdentifier(name);
+            var sql = Ddl.ToNpgsqlPlaceholders(RequirePattern(patterns, "claim", "Queue"));
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = sql;
+                BindNumbered(cmd, visibilityTimeoutMs);
+                using (var reader = cmd.ExecuteReader())
+                {
+                    if (!reader.Read())
+                        return null;
+                    var msg = new ClaimedMessage
+                    {
+                        Id = reader.GetInt64(0),
+                        Payload = reader.IsDBNull(1) ? default : DecodeJsonb(reader.GetValue(1)),
+                    };
+                    return msg;
+                }
+            }
+        }
+
+        public static bool QueueAck(DbConnection conn, string name, long messageId, DdlEntry patterns)
+        {
+            ValidateIdentifier(name);
+            var sql = Ddl.ToNpgsqlPlaceholders(RequirePattern(patterns, "ack", "Queue"));
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = sql;
+                BindNumbered(cmd, messageId);
+                return cmd.ExecuteNonQuery() > 0;
+            }
+        }
+
+        /// <summary>
+        /// Release a claimed message back to ready immediately. Equivalent
+        /// to a NACK in queue parlance.
+        /// </summary>
+        public static bool QueueAbandon(DbConnection conn, string name, long messageId, DdlEntry patterns)
+        {
+            ValidateIdentifier(name);
+            var sql = Ddl.ToNpgsqlPlaceholders(RequirePattern(patterns, "nack", "Queue"));
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = sql;
+                BindNumbered(cmd, messageId);
+                using (var reader = cmd.ExecuteReader())
+                {
+                    return reader.Read();
+                }
+            }
+        }
+
+        public static DateTime? QueueExtend(DbConnection conn, string name, long messageId, long additionalMs, DdlEntry patterns)
+        {
+            ValidateIdentifier(name);
+            var sql = Ddl.ToNpgsqlPlaceholders(RequirePattern(patterns, "extend", "Queue"));
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = sql;
+                // SQL pattern: WHERE id = $1 AND ... INTERVAL '1 ms' * $2 → bind (messageId, additionalMs).
+                BindNumbered(cmd, messageId, additionalMs);
+                using (var reader = cmd.ExecuteReader())
+                {
+                    if (reader.Read() && !reader.IsDBNull(0))
+                        return reader.GetDateTime(0);
+                    return null;
+                }
+            }
+        }
+
+        public static Dictionary<string, object> QueuePeek(DbConnection conn, string name, DdlEntry patterns)
+        {
+            ValidateIdentifier(name);
+            var sql = Ddl.ToNpgsqlPlaceholders(RequirePattern(patterns, "peek", "Queue"));
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = sql;
+                using (var reader = cmd.ExecuteReader())
+                {
+                    if (!reader.Read())
+                        return null;
+                    var row = new Dictionary<string, object>();
+                    for (int i = 0; i < reader.FieldCount; i++)
+                    {
+                        var col = reader.GetName(i);
+                        if (reader.IsDBNull(i)) row[col] = null;
+                        else if (col == "payload") row[col] = DecodeJsonb(reader.GetValue(i));
+                        else row[col] = reader.GetValue(i);
+                    }
+                    return row;
+                }
+            }
+        }
+
+        public static long QueueCountReady(DbConnection conn, string name, DdlEntry patterns)
+        {
+            ValidateIdentifier(name);
+            var sql = Ddl.ToNpgsqlPlaceholders(RequirePattern(patterns, "count_ready", "Queue"));
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = sql;
+                var obj = cmd.ExecuteScalar();
+                return obj == null || obj == DBNull.Value ? 0L : Convert.ToInt64(obj);
+            }
+        }
+
+        public static long QueueCountClaimed(DbConnection conn, string name, DdlEntry patterns)
+        {
+            ValidateIdentifier(name);
+            var sql = Ddl.ToNpgsqlPlaceholders(RequirePattern(patterns, "count_claimed", "Queue"));
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = sql;
+                var obj = cmd.ExecuteScalar();
+                return obj == null || obj == DBNull.Value ? 0L : Convert.ToInt64(obj);
+            }
+        }
+
+        // ── Geo family (PostGIS GEOGRAPHY-native) ─────────────────────────
+
+        // Distance unit conversion — proxy returns meters always (GEOGRAPHY
+        // default); wrappers translate at the edge so callers can ask in
+        // km / mi / ft.
+        private static readonly Dictionary<string, double> GeoUnits = new Dictionary<string, double>
+        {
+            ["m"] = 1.0,
+            ["km"] = 1000.0,
+            ["mi"] = 1609.344,
+            ["ft"] = 0.3048,
+        };
+
+        private static double ToMeters(double value, string unit)
+        {
+            if (!GeoUnits.TryGetValue(unit, out var factor))
+                throw new ArgumentException("Unknown distance unit: '" + unit + "' (choose m/km/mi/ft)");
+            return value * factor;
+        }
+
+        private static double ConvertDistanceMeters(double meters, string unit)
+        {
+            if (!GeoUnits.TryGetValue(unit, out var factor))
+                throw new ArgumentException("Unknown distance unit: '" + unit + "' (choose m/km/mi/ft)");
+            return meters / factor;
+        }
+
+        /// <summary>
+        /// Set-or-update a member's lon/lat. Idempotent on member (PK).
+        /// Returns the just-stored position.
+        /// </summary>
+        public static GeoPosition GeoAdd(DbConnection conn, string name, string member, double lon, double lat, DdlEntry patterns)
+        {
+            ValidateIdentifier(name);
+            var sql = Ddl.ToNpgsqlPlaceholders(RequirePattern(patterns, "geoadd", "Geo"));
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = sql;
+                BindNumbered(cmd, member, lon, lat);
+                using (var reader = cmd.ExecuteReader())
+                {
+                    if (reader.Read())
+                        return new GeoPosition { Lon = reader.GetDouble(0), Lat = reader.GetDouble(1) };
+                    return null;
+                }
+            }
+        }
+
+        public static GeoPosition GeoPos(DbConnection conn, string name, string member, DdlEntry patterns)
+        {
+            ValidateIdentifier(name);
+            var sql = Ddl.ToNpgsqlPlaceholders(RequirePattern(patterns, "geopos", "Geo"));
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = sql;
+                BindNumbered(cmd, member);
+                using (var reader = cmd.ExecuteReader())
+                {
+                    if (reader.Read() && !reader.IsDBNull(0) && !reader.IsDBNull(1))
+                        return new GeoPosition { Lon = reader.GetDouble(0), Lat = reader.GetDouble(1) };
+                    return null;
+                }
+            }
+        }
+
+        public static double? GeoDist(DbConnection conn, string name, string memberA, string memberB, string unit, DdlEntry patterns)
+        {
+            ValidateIdentifier(name);
+            // Validate the unit before issuing SQL — fail fast.
+            if (!GeoUnits.ContainsKey(unit))
+                throw new ArgumentException("Unknown distance unit: '" + unit + "' (choose m/km/mi/ft)");
+            var sql = Ddl.ToNpgsqlPlaceholders(RequirePattern(patterns, "geodist", "Geo"));
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = sql;
+                BindNumbered(cmd, memberA, memberB);
+                using (var reader = cmd.ExecuteReader())
+                {
+                    if (reader.Read() && !reader.IsDBNull(0))
+                        return ConvertDistanceMeters(reader.GetDouble(0), unit);
+                    return null;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Members within <paramref name="radius"/> of (<paramref name="lon"/>,
+        /// <paramref name="lat"/>). Proxy contract: <c>$1=lon, $2=lat,
+        /// $3=radius_m, $4=limit</c> — the proxy CTE-anchors the geography so
+        /// each <c>$N</c> appears exactly once. Bind 4 args.
+        /// </summary>
+        public static List<GeoMatch> GeoRadius(DbConnection conn, string name, double lon, double lat, double radius,
+            string unit, int limit, DdlEntry patterns)
+        {
+            ValidateIdentifier(name);
+            var sql = Ddl.ToNpgsqlPlaceholders(RequirePattern(patterns, "georadius_with_dist", "Geo"));
+            double radiusMeters = ToMeters(radius, unit);
+            var results = new List<GeoMatch>();
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = sql;
+                BindNumbered(cmd, lon, lat, radiusMeters, limit);
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        results.Add(new GeoMatch
+                        {
+                            Member = reader.GetString(0),
+                            Lon = reader.GetDouble(1),
+                            Lat = reader.GetDouble(2),
+                            DistanceMeters = reader.GetDouble(3),
+                        });
+                    }
+                }
+            }
+            return results;
+        }
+
+        /// <summary>
+        /// Members within <paramref name="radius"/> of <paramref name="member"/>'s
+        /// location. Proxy contract for <c>geosearch_member</c>: <c>$1</c> and
+        /// <c>$2</c> are both the anchor member name (one for the join, one
+        /// for the self-exclusion); <c>$3=radius_m, $4=limit</c>. Npgsql's
+        /// <c>$N → @pN</c> translation binds by named index, so we bind the
+        /// member twice and pass 4 args: <c>(member, member, radius_m, limit)</c>.
+        /// </summary>
+        public static List<GeoMatch> GeoRadiusByMember(DbConnection conn, string name, string member, double radius,
+            string unit, int limit, DdlEntry patterns)
+        {
+            ValidateIdentifier(name);
+            var sql = Ddl.ToNpgsqlPlaceholders(RequirePattern(patterns, "geosearch_member", "Geo"));
+            double radiusMeters = ToMeters(radius, unit);
+            var results = new List<GeoMatch>();
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = sql;
+                BindNumbered(cmd, member, member, radiusMeters, limit);
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        results.Add(new GeoMatch
+                        {
+                            Member = reader.GetString(0),
+                            Lon = reader.GetDouble(1),
+                            Lat = reader.GetDouble(2),
+                            DistanceMeters = reader.GetDouble(3),
+                        });
+                    }
+                }
+            }
+            return results;
+        }
+
+        public static bool GeoRemove(DbConnection conn, string name, string member, DdlEntry patterns)
+        {
+            ValidateIdentifier(name);
+            var sql = Ddl.ToNpgsqlPlaceholders(RequirePattern(patterns, "geo_remove", "Geo"));
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = sql;
+                BindNumbered(cmd, member);
+                return cmd.ExecuteNonQuery() > 0;
+            }
+        }
+
+        public static long GeoCount(DbConnection conn, string name, DdlEntry patterns)
+        {
+            ValidateIdentifier(name);
+            var sql = Ddl.ToNpgsqlPlaceholders(RequirePattern(patterns, "geo_count", "Geo"));
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = sql;
+                var obj = cmd.ExecuteScalar();
+                return obj == null || obj == DBNull.Value ? 0L : Convert.ToInt64(obj);
+            }
         }
     }
 }

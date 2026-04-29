@@ -42,10 +42,54 @@ Migration map:
 | `gl.StreamAckAsync(name, group, id)`      | `gl.Streams.AckAsync(name, group, id)`        |
 | `gl.StreamClaimAsync(name, g, c, ...)`    | `gl.Streams.ClaimAsync(name, g, c, ...)`      |
 
-Other namespaces (`gl.SearchAsync`, `gl.PublishAsync` / `gl.SubscribeAsync`,
-`gl.IncrAsync`, `gl.ZaddAsync`, `gl.HsetAsync`, `gl.GeoaddAsync`, …) remain
-flat and will migrate to nested form in subsequent releases (one namespace
-per schema-to-core phase).
+**Phase 5 of schema-to-core: Redis-compat helper families moved under
+nested namespaces.** The flat `gl.IncrAsync` / `gl.ZaddAsync` /
+`gl.HsetAsync` / `gl.EnqueueAsync` / `gl.GeoaddAsync` (and friends) are
+gone; counter / zset / hash / queue / geo operations now live under
+`gl.Counters` / `gl.Zsets` / `gl.Hashes` / `gl.Queues` / `gl.Geos`. No
+backwards-compat aliases — search and replace once.
+
+Phase 5 contracts (breaking, no aliases):
+
+- **counter**: every UPSERT stamps `updated_at = NOW()` on the proxy side.
+- **zset**: every method takes `zsetKey` as the first arg after the
+  namespace name (one canonical table holds many sorted sets).
+- **hash**: storage flipped from JSONB-blob-per-key to row-per-field.
+  `gl.Hashes.GetAllAsync` rebuilds the dictionary client-side from
+  per-row results.
+- **queue**: at-least-once with visibility timeout. The legacy
+  delete-on-fetch `DequeueAsync` is replaced by
+  `gl.Queues.ClaimAsync` (returns `ClaimedMessage?`) +
+  `gl.Queues.AckAsync(id)`. **There is intentionally no `DequeueAsync`
+  shim** — claim/ack is explicit by design.
+- **geo**: GEOGRAPHY-native (no `::geography` casts on the column
+  reference because the column already IS geography). `gl.Geos.AddAsync`
+  is idempotent on the member name (Redis GEOADD semantics).
+
+Migration map:
+
+| Old (flat)                                | New (nested)                                  |
+| ----------------------------------------- | --------------------------------------------- |
+| `gl.IncrAsync(t, k)`                      | `gl.Counters.IncrAsync(name, k)`              |
+| `gl.GetCounterAsync(t, k)`                | `gl.Counters.GetAsync(name, k)`               |
+| `gl.ZaddAsync(t, m, s)`                   | `gl.Zsets.AddAsync(name, zsetKey, m, s)`      |
+| `gl.ZincrbyAsync(t, m, d)`                | `gl.Zsets.IncrByAsync(name, zsetKey, m, d)`   |
+| `gl.ZrangeAsync(t, …)`                    | `gl.Zsets.RangeAsync(name, zsetKey, …)`       |
+| `gl.ZrankAsync(t, m)`                     | `gl.Zsets.RankAsync(name, zsetKey, m)`        |
+| `gl.ZscoreAsync(t, m)`                    | `gl.Zsets.ScoreAsync(name, zsetKey, m)`       |
+| `gl.ZremAsync(t, m)`                      | `gl.Zsets.RemoveAsync(name, zsetKey, m)`      |
+| `gl.HsetAsync(t, k, f, v)`                | `gl.Hashes.SetAsync(name, hashKey, f, v)`     |
+| `gl.HgetAsync(t, k, f)`                   | `gl.Hashes.GetAsync(name, hashKey, f)`        |
+| `gl.HgetallAsync(t, k)`                   | `gl.Hashes.GetAllAsync(name, hashKey)`        |
+| `gl.HdelAsync(t, k, f)`                   | `gl.Hashes.DeleteAsync(name, hashKey, f)`     |
+| `gl.EnqueueAsync(t, payload)`             | `gl.Queues.EnqueueAsync(name, payload)`       |
+| `gl.DequeueAsync(t)`                      | `gl.Queues.ClaimAsync(name, ms)` + `AckAsync` |
+| `gl.GeoaddAsync(t, n, g, name, lon, lat)` | `gl.Geos.AddAsync(name, member, lon, lat)`    |
+| `gl.GeoradiusAsync(t, g, lon, lat, r)`    | `gl.Geos.RadiusAsync(name, lon, lat, r, …)`   |
+| `gl.GeodistAsync(t, g, n, a, b)`          | `gl.Geos.DistAsync(name, a, b, unit)`         |
+
+Pub/sub stays flat (no DDL family); search / cache / auth remain flat
+and will migrate when their own schema-to-core phase fires.
 
 **Doc-store DDL is now owned by the proxy.** The wrapper no longer emits
 `CREATE TABLE _goldlapel.doc_<name>` SQL when a collection is first used.
