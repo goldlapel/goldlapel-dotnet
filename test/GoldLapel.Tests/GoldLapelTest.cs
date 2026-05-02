@@ -74,14 +74,35 @@ namespace GoldLapel.Tests
     }
 
     // ── MakeProxyUrl ──────────────────────────────────────────
+    //
+    // The wrapper appends `application_name=goldlapel:dotnet:<version>` to
+    // every rewritten URL so the proxy can classify wrapper-vs-raw traffic
+    // and skip L2 result cache for wrappers (they have their own L1).
+    // PGAPPNAME is cleared per test for deterministic URLs.
 
-    public class MakeProxyUrlTest
+    [Collection("EnvVarTests")]
+    public class MakeProxyUrlTest : IDisposable
     {
+        private readonly string? _origPgAppName;
+
+        public MakeProxyUrlTest()
+        {
+            _origPgAppName = Environment.GetEnvironmentVariable("PGAPPNAME");
+            Environment.SetEnvironmentVariable("PGAPPNAME", null);
+        }
+
+        public void Dispose()
+        {
+            Environment.SetEnvironmentVariable("PGAPPNAME", _origPgAppName);
+        }
+
+        private static string AppNameSuffix => "application_name=" + GL.ApplicationNameMarker();
+
         [Fact]
         public void PostgresqlUrl()
         {
             Assert.Equal(
-                "postgresql://user:pass@localhost:7932/mydb",
+                "postgresql://user:pass@localhost:7932/mydb?" + AppNameSuffix,
                 GL.MakeProxyUrl("postgresql://user:pass@dbhost:5432/mydb", 7932)
             );
         }
@@ -90,7 +111,7 @@ namespace GoldLapel.Tests
         public void PostgresUrl()
         {
             Assert.Equal(
-                "postgres://user:pass@localhost:7932/mydb",
+                "postgres://user:pass@localhost:7932/mydb?" + AppNameSuffix,
                 GL.MakeProxyUrl("postgres://user:pass@remote.aws.com:5432/mydb", 7932)
             );
         }
@@ -99,7 +120,7 @@ namespace GoldLapel.Tests
         public void PgUrlWithoutPort()
         {
             Assert.Equal(
-                "postgresql://user:pass@localhost:7932/mydb",
+                "postgresql://user:pass@localhost:7932/mydb?" + AppNameSuffix,
                 GL.MakeProxyUrl("postgresql://user:pass@host.aws.com/mydb", 7932)
             );
         }
@@ -108,7 +129,7 @@ namespace GoldLapel.Tests
         public void PgUrlWithoutPortOrPath()
         {
             Assert.Equal(
-                "postgresql://user:pass@localhost:7932",
+                "postgresql://user:pass@localhost:7932?" + AppNameSuffix,
                 GL.MakeProxyUrl("postgresql://user:pass@host.aws.com", 7932)
             );
         }
@@ -116,6 +137,7 @@ namespace GoldLapel.Tests
         [Fact]
         public void BareHostPort()
         {
+            // Bare-host form skips the marker — atypical caller path.
             Assert.Equal("localhost:7932", GL.MakeProxyUrl("dbhost:5432", 7932));
         }
 
@@ -129,7 +151,7 @@ namespace GoldLapel.Tests
         public void PreservesQueryParams()
         {
             Assert.Equal(
-                "postgresql://user:pass@localhost:7932/mydb?sslmode=require",
+                "postgresql://user:pass@localhost:7932/mydb?sslmode=require&" + AppNameSuffix,
                 GL.MakeProxyUrl("postgresql://user:pass@remote:5432/mydb?sslmode=require", 7932)
             );
         }
@@ -138,7 +160,7 @@ namespace GoldLapel.Tests
         public void PreservesPercentEncodedPassword()
         {
             Assert.Equal(
-                "postgresql://user:p%40ss@localhost:7932/mydb",
+                "postgresql://user:p%40ss@localhost:7932/mydb?" + AppNameSuffix,
                 GL.MakeProxyUrl("postgresql://user:p%40ss@remote:5432/mydb", 7932)
             );
         }
@@ -147,7 +169,7 @@ namespace GoldLapel.Tests
         public void NoUserinfo()
         {
             Assert.Equal(
-                "postgresql://localhost:7932/mydb",
+                "postgresql://localhost:7932/mydb?" + AppNameSuffix,
                 GL.MakeProxyUrl("postgresql://dbhost:5432/mydb", 7932)
             );
         }
@@ -156,7 +178,7 @@ namespace GoldLapel.Tests
         public void NoUserinfoNoPort()
         {
             Assert.Equal(
-                "postgresql://localhost:7932/mydb",
+                "postgresql://localhost:7932/mydb?" + AppNameSuffix,
                 GL.MakeProxyUrl("postgresql://dbhost/mydb", 7932)
             );
         }
@@ -165,7 +187,7 @@ namespace GoldLapel.Tests
         public void LocalhostStaysLocalhost()
         {
             Assert.Equal(
-                "postgresql://user:pass@localhost:7932/mydb",
+                "postgresql://user:pass@localhost:7932/mydb?" + AppNameSuffix,
                 GL.MakeProxyUrl("postgresql://user:pass@localhost:5432/mydb", 7932)
             );
         }
@@ -174,7 +196,7 @@ namespace GoldLapel.Tests
         public void AtSignInPasswordWithPort()
         {
             Assert.Equal(
-                "postgresql://user:p@ss@localhost:7932/mydb",
+                "postgresql://user:p@ss@localhost:7932/mydb?" + AppNameSuffix,
                 GL.MakeProxyUrl("postgresql://user:p@ss@host:5432/mydb", 7932)
             );
         }
@@ -183,7 +205,7 @@ namespace GoldLapel.Tests
         public void AtSignInPasswordWithoutPort()
         {
             Assert.Equal(
-                "postgresql://user:p@ss@localhost:7932/mydb",
+                "postgresql://user:p@ss@localhost:7932/mydb?" + AppNameSuffix,
                 GL.MakeProxyUrl("postgresql://user:p@ss@host/mydb", 7932)
             );
         }
@@ -192,9 +214,78 @@ namespace GoldLapel.Tests
         public void AtSignInPasswordWithQueryParams()
         {
             Assert.Equal(
-                "postgresql://user:p@ss@localhost:7932/mydb?sslmode=require&param=val@ue",
+                "postgresql://user:p@ss@localhost:7932/mydb?sslmode=require&param=val@ue&" + AppNameSuffix,
                 GL.MakeProxyUrl("postgresql://user:p@ss@host:5432/mydb?sslmode=require&param=val@ue", 7932)
             );
+        }
+    }
+
+
+    // ── ApplicationNameMarker ────────────────────────────────
+    //
+    // L2-router architecture: wrappers identify themselves to the proxy via
+    // PG `application_name` so the proxy can gate L2 result cache.
+
+    [Collection("EnvVarTests")]
+    public class ApplicationNameMarkerTest : IDisposable
+    {
+        private readonly string? _origPgAppName;
+
+        public ApplicationNameMarkerTest()
+        {
+            _origPgAppName = Environment.GetEnvironmentVariable("PGAPPNAME");
+            Environment.SetEnvironmentVariable("PGAPPNAME", null);
+        }
+
+        public void Dispose()
+        {
+            Environment.SetEnvironmentVariable("PGAPPNAME", _origPgAppName);
+        }
+
+        [Fact]
+        public void MarkerHasGoldlapelDotnetShape()
+        {
+            var marker = GL.ApplicationNameMarker();
+            Assert.Matches(@"^goldlapel:dotnet:.+$", marker);
+        }
+
+        [Fact]
+        public void AppendsMarkerWhenNoExistingQuery()
+        {
+            var url = GL.MakeProxyUrl("postgresql://localhost:5432/mydb", 7932);
+            Assert.Contains("?application_name=goldlapel:dotnet:", url);
+        }
+
+        [Fact]
+        public void AppendsMarkerWithExistingQuery()
+        {
+            var url = GL.MakeProxyUrl("postgresql://localhost:5432/mydb?sslmode=require", 7932);
+            Assert.Contains("sslmode=require", url);
+            Assert.Contains("&application_name=goldlapel:dotnet:", url);
+        }
+
+        [Fact]
+        public void RespectsUserSetApplicationName()
+        {
+            var url = GL.MakeProxyUrl("postgresql://localhost:5432/mydb?application_name=my-app", 7932);
+            Assert.Contains("application_name=my-app", url);
+            Assert.DoesNotContain("goldlapel:dotnet", url);
+        }
+
+        [Fact]
+        public void RespectsPgAppNameEnv()
+        {
+            Environment.SetEnvironmentVariable("PGAPPNAME", "my-app");
+            try
+            {
+                var url = GL.MakeProxyUrl("postgresql://localhost:5432/mydb", 7932);
+                Assert.DoesNotContain("application_name=", url);
+                Assert.DoesNotContain("goldlapel:dotnet", url);
+            }
+            finally
+            {
+                Environment.SetEnvironmentVariable("PGAPPNAME", null);
+            }
         }
     }
 

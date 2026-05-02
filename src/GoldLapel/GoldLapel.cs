@@ -800,6 +800,58 @@ namespace GoldLapel
         private static readonly Regex NoPort =
             new Regex(@"^(postgres(?:ql)?://(?:.*@)?)([^:/?#]+)(.*)$");
 
+        private static readonly Regex AppNamePresent =
+            new Regex(@"[?&]application_name=", RegexOptions.IgnoreCase);
+
+        /// <summary>
+        /// Wrapper version, used to build the application_name marker on PG
+        /// connections. Read from the assembly's
+        /// <c>AssemblyInformationalVersionAttribute</c> (CI sets this from the
+        /// git tag at publish time); falls back to <c>"0.0.0"</c> for dev
+        /// builds where no version attribute is set.
+        /// </summary>
+        internal static string WrapperVersion()
+        {
+            var asm = typeof(GoldLapel).Assembly;
+            var attr = asm.GetCustomAttributes(typeof(System.Reflection.AssemblyInformationalVersionAttribute), false);
+            if (attr.Length > 0)
+            {
+                var v = ((System.Reflection.AssemblyInformationalVersionAttribute)attr[0]).InformationalVersion;
+                if (!string.IsNullOrEmpty(v))
+                {
+                    // Strip a leading "v" and any "+gitsha" build-metadata suffix.
+                    var plus = v.IndexOf('+');
+                    if (plus >= 0) v = v.Substring(0, plus);
+                    if (v.StartsWith("v", StringComparison.OrdinalIgnoreCase)) v = v.Substring(1);
+                    if (!string.IsNullOrEmpty(v)) return v;
+                }
+            }
+            var ver = asm.GetName().Version;
+            if (ver != null && ver.ToString() != "0.0.0.0") return ver.ToString();
+            return "0.0.0";
+        }
+
+        internal static string ApplicationNameMarker()
+        {
+            return "goldlapel:dotnet:" + WrapperVersion();
+        }
+
+        /// <summary>
+        /// Append <c>application_name=goldlapel:dotnet:&lt;version&gt;</c> to
+        /// the URL unless one is already present (or <c>PGAPPNAME</c> is set
+        /// in the env). Tells the proxy this is wrapper traffic so it can
+        /// skip L2 result cache (the wrapper has its own L1). Idempotent and
+        /// override-respecting.
+        /// </summary>
+        internal static string InjectApplicationName(string url)
+        {
+            if (AppNamePresent.IsMatch(url)) return url;
+            var pgAppName = Environment.GetEnvironmentVariable("PGAPPNAME");
+            if (!string.IsNullOrEmpty(pgAppName)) return url;
+            char sep = url.IndexOf('?') >= 0 ? '&' : '?';
+            return url + sep + "application_name=" + ApplicationNameMarker();
+        }
+
         internal static string FindBinary()
         {
             var envPath = Environment.GetEnvironmentVariable("GOLDLAPEL_BINARY");
@@ -827,12 +879,13 @@ namespace GoldLapel
             // (e.g. %40 for @), which Uri would decode and corrupt the URL.
             var m = WithPort.Match(upstream);
             if (m.Success)
-                return m.Groups[1].Value + "localhost:" + port + m.Groups[4].Value;
+                return InjectApplicationName(m.Groups[1].Value + "localhost:" + port + m.Groups[4].Value);
 
             m = NoPort.Match(upstream);
             if (m.Success)
-                return m.Groups[1].Value + "localhost:" + port + m.Groups[3].Value;
+                return InjectApplicationName(m.Groups[1].Value + "localhost:" + port + m.Groups[3].Value);
 
+            // Bare-host form skips the marker — atypical caller path.
             if (!upstream.Contains("://") && upstream.Contains(":"))
                 return "localhost:" + port;
 
