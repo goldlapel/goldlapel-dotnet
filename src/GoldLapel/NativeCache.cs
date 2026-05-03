@@ -4,6 +4,9 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net.Sockets;
+using System.Reflection;
+using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading;
 
@@ -26,6 +29,24 @@ namespace GoldLapel
     public class NativeCache
     {
         internal const string DdlSentinel = "__ddl__";
+
+        // --- L1 telemetry tuning ---
+        //
+        // Demand-driven model (mirrored from goldlapel-python cache.py): the
+        // wrapper has NO background timer. Cache counters increment on cache
+        // ops (free); state-change events are emitted synchronously when a
+        // relevant counter crosses a threshold; snapshot replies are sent
+        // only when the proxy asks via ?:<request>.
+        //
+        // Eviction-rate sliding window. cache_full fires when ≥ EvictRateHigh
+        // of the last EvictRateWindow cache writes (puts) caused an eviction;
+        // cache_recovered fires when the rate falls back below EvictRateLow.
+        // With a 32k-entry default capacity, a steady-state high eviction
+        // rate means the working set exceeds the cache — actionable signal
+        // for the dashboard.
+        internal const int EvictRateWindow = 200;
+        internal const double EvictRateHigh = 0.5; // 50% of recent puts evicted → cache_full
+        internal const double EvictRateLow = 0.1;  // ≤ 10% → cache_recovered
 
         private static readonly Regex TxStart = new Regex(@"^\s*(BEGIN|START\s+TRANSACTION)\b", RegexOptions.IgnoreCase);
         private static readonly Regex TxEnd = new Regex(@"^\s*(COMMIT|ROLLBACK|END)\b", RegexOptions.IgnoreCase);
@@ -58,6 +79,60 @@ namespace GoldLapel
         internal long StatsHits;
         internal long StatsMisses;
         internal long StatsInvalidations;
+        // L1 telemetry: eviction counter — bumped in EvictOne (matches the
+        // Python `stats_evictions` field). Read in BuildSnapshot under the
+        // put-lock for an internally consistent snapshot.
+        internal long StatsEvictions;
+
+        // --- L1 telemetry: identity + opt-out ---
+        //
+        // Stable wrapper identity for the lifetime of the process. Lets the
+        // proxy aggregate per-wrapper across reconnects.
+        internal readonly string WrapperId = Guid.NewGuid().ToString();
+        internal const string WrapperLang = "dotnet";
+        internal readonly string WrapperVersion;
+        // Set false via GOLDLAPEL_REPORT_STATS=false to suppress all snapshot
+        // replies and state-change emissions. Cache continues to function;
+        // only telemetry output is suppressed.
+        internal readonly bool ReportStats;
+
+        // --- L1 telemetry: send + state ---
+        //
+        // The recv loop owns reads; writes can come from the recv thread (R:
+        // replies) or any caller thread (S: state events). _sendLock
+        // serializes writes so two concurrent sends can't tear each other's
+        // bytes on the wire.
+        private readonly object _sendLock = new object();
+        // Held under _sendLock; null when not connected. Drop here on
+        // teardown so emitters don't write to a closed FD.
+        private NetworkStream _stream;
+
+        // Eviction-rate sliding window. A bounded ring buffer of length
+        // EvictRateWindow; updates are O(1) amortised. Values are 0
+        // (insert without eviction) or 1 (eviction occurred). Held under
+        // _putLock — the same lock that serializes the put+eviction path.
+        private readonly int[] _recentEvictions = new int[EvictRateWindow];
+        private int _recentEvictionsCount;     // number of slots filled (caps at EvictRateWindow)
+        private int _recentEvictionsIdx;       // next overwrite slot once full
+        private long _recentEvictionsSum;      // running sum to avoid O(N) scan in the rate check
+        // Latched state — only emit a state-change event when the state
+        // transitions. Without latching the wrapper would re-emit every
+        // put after the rate stays bad.
+        private bool _stateCacheFull;
+
+        // ProcessExit handler (registered once per AppDomain to fire
+        // wrapper_disconnected on ungraceful shutdown). Stored so we can
+        // unregister on Reset.
+        private EventHandler _processExitHandler;
+        // Latched: only emit wrapper_disconnected once across Dispose +
+        // ProcessExit. Either path is fine; we just must not double-emit.
+        private int _disconnectedEmitted;
+
+        // ---- Pluggable send hook for unit tests ----
+        // Tests swap this for a list.append-style capture. When non-null,
+        // EmitStateChange / EmitResponse route through this instead of the
+        // socket — no socket needed for shape tests.
+        internal Action<string> SendHookForTests;
 
         private static NativeCache _instance;
         private static readonly object InstanceLock = new object();
@@ -68,6 +143,16 @@ namespace GoldLapel
             _maxEntries = !string.IsNullOrEmpty(sizeStr) ? int.Parse(sizeStr) : 32768;
             var enabledStr = Environment.GetEnvironmentVariable("GOLDLAPEL_NATIVE_CACHE");
             _enabled = string.IsNullOrEmpty(enabledStr) || !enabledStr.Equals("false", StringComparison.OrdinalIgnoreCase);
+            var reportStr = Environment.GetEnvironmentVariable("GOLDLAPEL_REPORT_STATS");
+            ReportStats = string.IsNullOrEmpty(reportStr) || !reportStr.Equals("false", StringComparison.OrdinalIgnoreCase);
+            WrapperVersion = ResolveWrapperVersion();
+
+            // Register a ProcessExit hook so a non-graceful shutdown (no
+            // explicit Dispose) still emits wrapper_disconnected best-effort.
+            // Dispose path emits and latches first; ProcessExit becomes a
+            // no-op in that case.
+            _processExitHandler = (s, e) => EmitWrapperDisconnected();
+            try { AppDomain.CurrentDomain.ProcessExit += _processExitHandler; } catch { /* best effort */ }
         }
 
         public static NativeCache GetInstance()
@@ -87,6 +172,11 @@ namespace GoldLapel
                 if (_instance != null)
                 {
                     _instance.StopInvalidation();
+                    if (_instance._processExitHandler != null)
+                    {
+                        try { AppDomain.CurrentDomain.ProcessExit -= _instance._processExitHandler; } catch { }
+                        _instance._processExitHandler = null;
+                    }
                     _instance = null;
                 }
             }
@@ -123,11 +213,13 @@ namespace GoldLapel
 
             // Lock the put+eviction path to prevent two threads from both seeing
             // count < max and both adding, which would exceed _maxEntries.
+            int evicted = 0;
             lock (_putLock)
             {
                 if (!_cache.ContainsKey(key) && _cache.Count >= _maxEntries)
                 {
                     EvictOne();
+                    evicted = 1;
                 }
                 _cache[key] = new CacheEntry(rows, columns, tables);
                 _accessOrder[key] = Interlocked.Increment(ref _counter);
@@ -136,7 +228,11 @@ namespace GoldLapel
                     var keys = _tableIndex.GetOrAdd(table, _ => new ConcurrentDictionary<string, byte>());
                     keys[key] = 0;
                 }
+                RecordEvictionLocked(evicted);
             }
+            // Eviction-rate threshold check happens outside the put-lock —
+            // emit may take _sendLock and we don't want to nest locks.
+            MaybeEmitEvictionRateStateChange();
         }
 
         public void InvalidateTable(string table)
@@ -224,8 +320,14 @@ namespace GoldLapel
 
                     var stream = _invalidationClient.GetStream();
                     stream.ReadTimeout = 30000;
-                    var reader = new StreamReader(stream);
+                    // Stash the stream under _sendLock so EmitStateChange /
+                    // EmitResponse (called from any thread) can write to the
+                    // live FD. Set BEFORE the wrapper_connected emit so the
+                    // very first message goes out cleanly.
+                    lock (_sendLock) { _stream = stream; }
+                    EmitStateChange("wrapper_connected");
 
+                    var reader = new StreamReader(stream);
                     while (!_invalidationStop)
                     {
                         try
@@ -246,6 +348,9 @@ namespace GoldLapel
                 }
                 finally
                 {
+                    // Drop the stream reference under _sendLock so any
+                    // concurrent emitter doesn't write to a closed FD.
+                    lock (_sendLock) { _stream = null; }
                     if (_invalidationConnected)
                     {
                         _invalidationConnected = false;
@@ -267,6 +372,10 @@ namespace GoldLapel
 
         internal void ProcessSignal(string line)
         {
+            // Backwards-compat: unknown prefixes are silently ignored. Older
+            // proxies sent only I:/C:/P:; newer proxies may add request types
+            // (?:) here. Forward-compat: the wrapper accepts any well-formed
+            // prefix and routes by type.
             if (line.StartsWith("I:"))
             {
                 var table = line.Substring(2).Trim();
@@ -275,6 +384,12 @@ namespace GoldLapel
                 else
                     InvalidateTable(table);
             }
+            else if (line.StartsWith("?:"))
+            {
+                // Snapshot request from the proxy. Reply with R:<json>.
+                ProcessRequest(line.Substring(2));
+            }
+            // C: (config), P: (ping), and anything else — ignored.
         }
 
         // --- SQL parsing ---
@@ -426,12 +541,251 @@ namespace GoldLapel
                     }
                 }
             }
+            Interlocked.Increment(ref StatsEvictions);
+        }
+
+        // ---- L1 telemetry: sliding-window bookkeeping ----
+
+        // Caller holds _putLock. Bounded ring; once full, overwrites oldest
+        // in O(1). _recentEvictionsSum tracks the running sum so the rate
+        // check below doesn't scan the array.
+        private void RecordEvictionLocked(int evicted)
+        {
+            if (_recentEvictionsCount < EvictRateWindow)
+            {
+                _recentEvictions[_recentEvictionsCount] = evicted;
+                _recentEvictionsCount++;
+                _recentEvictionsSum += evicted;
+            }
+            else
+            {
+                var oldest = _recentEvictions[_recentEvictionsIdx];
+                _recentEvictions[_recentEvictionsIdx] = evicted;
+                _recentEvictionsSum += (evicted - oldest);
+                _recentEvictionsIdx = (_recentEvictionsIdx + 1) % EvictRateWindow;
+            }
+        }
+
+        // ---- L1 telemetry: snapshot ----
+
+        // Build the L1 snapshot dict the proxy aggregates per-tick. All
+        // counters + cache size read in a single critical section so the
+        // snapshot is internally consistent (no torn reads where, e.g., hits
+        // and misses straddle a concurrent get()). The proxy computes deltas
+        // across ticks; we just expose the raw counters.
+        internal Dictionary<string, object> BuildSnapshot()
+        {
+            lock (_putLock)
+            {
+                return new Dictionary<string, object>
+                {
+                    { "wrapper_id", WrapperId },
+                    { "lang", WrapperLang },
+                    { "version", WrapperVersion },
+                    { "hits", Interlocked.Read(ref StatsHits) },
+                    { "misses", Interlocked.Read(ref StatsMisses) },
+                    { "evictions", Interlocked.Read(ref StatsEvictions) },
+                    { "invalidations", Interlocked.Read(ref StatsInvalidations) },
+                    { "current_size_entries", (long)_cache.Count },
+                    { "capacity_entries", (long)_maxEntries },
+                };
+            }
+        }
+
+        // ---- L1 telemetry: emission ----
+
+        private static long NowMs()
+        {
+            return (long)(DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalMilliseconds;
+        }
+
+        private static string SerializeSnapshot(Dictionary<string, object> snap)
+        {
+            // Hand-build the JSON object preserving the field order the
+            // protocol doc specifies. System.Text.Json's
+            // JsonSerializer.Serialize on Dictionary<string, object>
+            // preserves insertion order in practice; using JsonWriter
+            // explicitly avoids any future regression and lets us emit
+            // long values as numbers (default object boxing would also
+            // do that, but explicit is clearer).
+            using var ms = new MemoryStream();
+            using (var writer = new Utf8JsonWriter(ms))
+            {
+                writer.WriteStartObject();
+                foreach (var kvp in snap)
+                {
+                    switch (kvp.Value)
+                    {
+                        case string s:
+                            writer.WriteString(kvp.Key, s);
+                            break;
+                        case long l:
+                            writer.WriteNumber(kvp.Key, l);
+                            break;
+                        case int i:
+                            writer.WriteNumber(kvp.Key, i);
+                            break;
+                        case bool b:
+                            writer.WriteBoolean(kvp.Key, b);
+                            break;
+                        default:
+                            // Fallback — should not hit on the documented
+                            // snapshot shape. Stringify rather than crash.
+                            writer.WriteString(kvp.Key, kvp.Value?.ToString() ?? "");
+                            break;
+                    }
+                }
+                writer.WriteEndObject();
+            }
+            return Encoding.UTF8.GetString(ms.ToArray());
+        }
+
+        // Best-effort line write under _sendLock. Socket errors are
+        // swallowed (the recv loop will detect the broken connection on
+        // its next iteration and reconnect — don't try to repair from the
+        // send path; we'd race the reconnect logic).
+        internal void SendLine(string line)
+        {
+            if (!ReportStats) return;
+
+            // Test hook short-circuit — let unit tests capture emissions
+            // without a real socket.
+            var hook = SendHookForTests;
+            if (hook != null)
+            {
+                hook(line);
+                return;
+            }
+
+            var data = line.EndsWith("\n") ? line : line + "\n";
+            var bytes = Encoding.UTF8.GetBytes(data);
+            lock (_sendLock)
+            {
+                var s = _stream;
+                if (s == null) return;
+                try
+                {
+                    s.Write(bytes, 0, bytes.Length);
+                    s.Flush();
+                }
+                catch (IOException) { }
+                catch (ObjectDisposedException) { }
+                catch (SocketException) { }
+            }
+        }
+
+        // Emit S:<json> with snapshot + state name + ts_ms.
+        internal void EmitStateChange(string state)
+        {
+            if (!ReportStats) return;
+            var snap = BuildSnapshot();
+            snap["state"] = state;
+            snap["ts_ms"] = NowMs();
+            string json;
+            try { json = SerializeSnapshot(snap); }
+            catch { return; }
+            SendLine("S:" + json);
+        }
+
+        // Emit R:<json> snapshot reply to a ?:<request>.
+        private void EmitResponse(Dictionary<string, object> snapshot = null)
+        {
+            if (!ReportStats) return;
+            if (snapshot == null) snapshot = BuildSnapshot();
+            if (!snapshot.ContainsKey("ts_ms")) snapshot["ts_ms"] = NowMs();
+            string json;
+            try { json = SerializeSnapshot(snapshot); }
+            catch { return; }
+            SendLine("R:" + json);
+        }
+
+        // Check the eviction-rate sliding window and emit a state change if
+        // the latched state should flip. Hysteresis-guarded: crossing HIGH
+        // emits cache_full, falling back below LOW emits cache_recovered,
+        // and rates between LOW and HIGH leave the latched state unchanged
+        // (no flapping).
+        private void MaybeEmitEvictionRateStateChange()
+        {
+            // Read window state + flip latched flag under _putLock so two
+            // concurrent puts that both cross the threshold can't both emit.
+            // Need at least a full window before reporting state — a single
+            // eviction in 3 puts is noise.
+            string emit = null;
+            lock (_putLock)
+            {
+                if (_recentEvictionsCount < EvictRateWindow) return;
+                var rate = (double)_recentEvictionsSum / _recentEvictionsCount;
+                if (!_stateCacheFull && rate >= EvictRateHigh)
+                {
+                    _stateCacheFull = true;
+                    emit = "cache_full";
+                }
+                else if (_stateCacheFull && rate <= EvictRateLow)
+                {
+                    _stateCacheFull = false;
+                    emit = "cache_recovered";
+                }
+            }
+            // Emit outside the lock — EmitStateChange takes _sendLock and
+            // may block on a socket write; we don't want to nest locks or
+            // hold _putLock across I/O.
+            if (emit != null) EmitStateChange(emit);
+        }
+
+        // Handle ?:<request> from the proxy. Today the only request is
+        // `snapshot` — the proxy asks for a current counter snapshot and we
+        // reply with R:<json>. Future requests can extend this without
+        // breaking older proxies (they'd ignore unknown R: lines, but only
+        // the proxy that sent ?:<x> will be expecting a reply, so the
+        // contract is local to the request type).
+        internal void ProcessRequest(string raw)
+        {
+            // `raw` is the body after the `?:` prefix; today we accept any
+            // empty value or `snapshot` literal — the proxy doesn't
+            // differentiate request types yet.
+            var body = raw == null ? "" : raw.Trim();
+            if (body.Length == 0 || body == "snapshot") EmitResponse();
+        }
+
+        // Best-effort final wrapper_disconnected on graceful shutdown
+        // (Dispose) or process exit. Latched: only the first call emits.
+        public void EmitWrapperDisconnected()
+        {
+            if (Interlocked.Exchange(ref _disconnectedEmitted, 1) != 0) return;
+            try { EmitStateChange("wrapper_disconnected"); }
+            catch { /* shutdown — best effort */ }
         }
 
         // For testing: force the connected state
         internal void SetConnected(bool connected)
         {
             _invalidationConnected = connected;
+        }
+
+        // Read the wrapper's package version from the assembly's
+        // AssemblyInformationalVersionAttribute (CI sets this from the git
+        // tag at publish time); fall back to the assembly Version, then
+        // "unknown".
+        private static string ResolveWrapperVersion()
+        {
+            try
+            {
+                var asm = typeof(NativeCache).Assembly;
+                var attr = asm.GetCustomAttribute<AssemblyInformationalVersionAttribute>();
+                if (attr != null && !string.IsNullOrEmpty(attr.InformationalVersion))
+                {
+                    var v = attr.InformationalVersion;
+                    // Strip "+gitsha" build-metadata suffix; keep the
+                    // semver part the package was published as.
+                    var plus = v.IndexOf('+');
+                    if (plus >= 0) v = v.Substring(0, plus);
+                    if (!string.IsNullOrEmpty(v)) return v;
+                }
+                var ver = asm.GetName().Version;
+                if (ver != null && ver.ToString() != "0.0.0.0") return ver.ToString();
+            }
+            catch { }
+            return "unknown";
         }
     }
 }

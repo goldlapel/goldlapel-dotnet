@@ -455,6 +455,15 @@ namespace GoldLapel
             if (_disposed) return;
             _disposed = true;
 
+            // L1 telemetry: emit a final wrapper_disconnected snapshot
+            // BEFORE closing the proxy connection. The invalidation socket
+            // piggybacks on the proxy lifecycle; once the proxy goes away,
+            // the recv thread will tear down its socket and the emit
+            // becomes a no-op. Latched in NativeCache so the
+            // ProcessExit hook (registered for ungraceful shutdowns)
+            // doesn't double-emit.
+            try { NativeCache.GetInstance().EmitWrapperDisconnected(); } catch { }
+
             // Drop cached DDL patterns — they're tied to the proxy we're
             // about to terminate.
             _ddlCache.Clear();
@@ -473,6 +482,9 @@ namespace GoldLapel
         {
             if (_disposed) return;
             _disposed = true;
+
+            // L1 telemetry: see DisposeAsync — same rationale.
+            try { NativeCache.GetInstance().EmitWrapperDisconnected(); } catch { }
 
             _ddlCache.Clear();
             _dashboardToken = null;
