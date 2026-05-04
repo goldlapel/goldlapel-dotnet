@@ -530,9 +530,22 @@ namespace GoldLapel
 
         // ── Process spawn ───────────────────────────────────────────
 
-        private async Task SpawnAsync()
+        /// <summary>
+        /// Build the argv list passed to the spawned <c>goldlapel</c> binary.
+        /// Order: required flags first (<c>--upstream</c>, <c>--proxy-port</c>),
+        /// then top-level options that emit only when the user set them, then
+        /// the tuning-knob structured config map, then any caller-supplied
+        /// <c>ExtraArgs</c>. Internal so unit tests can verify CLI-flag
+        /// emission for top-level options without spawning the binary.
+        /// </summary>
+        /// <remarks>
+        /// The result does NOT include the binary path — that's set separately
+        /// on <see cref="ProcessStartInfo.FileName"/>. This differs from
+        /// Java's <c>buildSpawnCmd(String)</c>, which prepends the binary
+        /// because Java's <c>ProcessBuilder</c> takes a single command list.
+        /// </remarks>
+        internal List<string> BuildSpawnArgs()
         {
-            var binary = FindBinary();
             var args = new List<string> { "--upstream", _upstream, "--proxy-port", _proxyPort.ToString() };
             // Top-level options emit their own CLI flags before the structured
             // config map — keeps the argv order predictable for argv-diffing
@@ -589,6 +602,13 @@ namespace GoldLapel
             }
             args.AddRange(ConfigToArgs(_config));
             args.AddRange(_extraArgs);
+            return args;
+        }
+
+        private async Task SpawnAsync()
+        {
+            var binary = FindBinary();
+            var args = BuildSpawnArgs();
 
             var psi = new ProcessStartInfo
             {

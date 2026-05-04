@@ -906,4 +906,463 @@ namespace GoldLapel.Tests
             Assert.Equal("waiter", options.Mode);
         }
     }
+
+    // ── BuildSpawnArgs ────────────────────────────────────────
+    //
+    // Argv-emission tests: assert the right CLI flag actually reaches the
+    // spawned proxy binary. The field-storage tests (e.g. IsMesh,
+    // IsEnableL2ForWrappers) verify the property model independently — these
+    // assert the wire format. Without these, a refactor that drops a flag
+    // from SpawnAsync would still pass storage tests while silently shipping
+    // a broken proxy invocation.
+    //
+    // BuildSpawnArgs is the package-internal extraction of SpawnAsync's
+    // argv-construction (mirrors Java's buildSpawnCmd). The result excludes
+    // the binary path — that's set separately on ProcessStartInfo.FileName.
+
+    public class BuildSpawnArgsTest
+    {
+        // Helper: index of `flag` in args, -1 if absent.
+        private static int IndexOf(List<string> args, string flag) => args.IndexOf(flag);
+
+        // Helper: the value following `flag` (for two-token --flag value emissions).
+        private static string ValueAfter(List<string> args, string flag)
+        {
+            var i = args.IndexOf(flag);
+            return (i >= 0 && i + 1 < args.Count) ? args[i + 1] : null;
+        }
+
+        [Fact]
+        public void RequiredFlagsAlwaysEmitted()
+        {
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb");
+            var args = gl.BuildSpawnArgs();
+            // --upstream and --proxy-port are unconditional and lead the argv.
+            Assert.Equal("--upstream", args[0]);
+            Assert.Equal("postgresql://localhost:5432/mydb", args[1]);
+            Assert.Equal("--proxy-port", args[2]);
+            Assert.Equal("7932", args[3]);
+        }
+
+        [Fact]
+        public void UpstreamPropagatesToFlag()
+        {
+            var gl = GL.CreateForTest("postgresql://user:pass@host:5432/db?sslmode=require");
+            var args = gl.BuildSpawnArgs();
+            Assert.Equal("postgresql://user:pass@host:5432/db?sslmode=require", ValueAfter(args, "--upstream"));
+        }
+
+        [Fact]
+        public void ProxyPortPropagatesToFlag()
+        {
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
+                new GoldLapelOptions { ProxyPort = 9000 });
+            var args = gl.BuildSpawnArgs();
+            Assert.Equal("9000", ValueAfter(args, "--proxy-port"));
+        }
+
+        // ─── Defaults: nothing optional emits when unset ────────────────
+
+        [Fact]
+        public void DefaultOptionsEmitOnlyRequiredFlags()
+        {
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb");
+            var args = gl.BuildSpawnArgs();
+            // With no top-level options set and no Config/ExtraArgs, the only
+            // emission should be the four required tokens.
+            Assert.Equal(4, args.Count);
+            // Defensive — none of the optional flags should appear.
+            Assert.DoesNotContain("--dashboard-port", args);
+            Assert.DoesNotContain("--invalidation-port", args);
+            Assert.DoesNotContain("--mode", args);
+            Assert.DoesNotContain("--license", args);
+            Assert.DoesNotContain("--client", args);
+            Assert.DoesNotContain("--config", args);
+            Assert.DoesNotContain("--mesh", args);
+            Assert.DoesNotContain("--mesh-tag", args);
+            Assert.DoesNotContain("--enable-l2-for-wrappers", args);
+            Assert.DoesNotContain("-v", args);
+            Assert.DoesNotContain("-vv", args);
+            Assert.DoesNotContain("-vvv", args);
+            // Silent intentionally never emits a flag (see SilentDoesNotEmitFlag).
+            Assert.DoesNotContain("--silent", args);
+        }
+
+        // ─── DashboardPort ──────────────────────────────────────────────
+
+        [Fact]
+        public void DashboardPortNotEmittedByDefault()
+        {
+            // Default DashboardPort=null ⇒ derived to proxy+1 by the wrapper,
+            // but the flag is suppressed so the Rust binary applies its own
+            // identical derivation. Keeps argv minimal in the common case.
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb");
+            Assert.DoesNotContain("--dashboard-port", gl.BuildSpawnArgs());
+        }
+
+        [Fact]
+        public void DashboardPortEmittedWhenExplicit()
+        {
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
+                new GoldLapelOptions { DashboardPort = 9090 });
+            Assert.Equal("9090", ValueAfter(gl.BuildSpawnArgs(), "--dashboard-port"));
+        }
+
+        [Fact]
+        public void DashboardPortZeroEmittedExplicitly()
+        {
+            // DashboardPort=0 means "disable dashboard" — the binary needs
+            // the explicit 0 to suppress its default derivation.
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
+                new GoldLapelOptions { DashboardPort = 0 });
+            Assert.Equal("0", ValueAfter(gl.BuildSpawnArgs(), "--dashboard-port"));
+        }
+
+        // ─── InvalidationPort ───────────────────────────────────────────
+
+        [Fact]
+        public void InvalidationPortNotEmittedByDefault()
+        {
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb");
+            Assert.DoesNotContain("--invalidation-port", gl.BuildSpawnArgs());
+        }
+
+        [Fact]
+        public void InvalidationPortEmittedWhenExplicit()
+        {
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
+                new GoldLapelOptions { InvalidationPort = 9091 });
+            Assert.Equal("9091", ValueAfter(gl.BuildSpawnArgs(), "--invalidation-port"));
+        }
+
+        // ─── LogLevel ───────────────────────────────────────────────────
+        //
+        // The proxy binary uses count-based -v/-vv/-vvv; the wrapper translates
+        // the ergonomic LogLevel string. warn/error map to "no flag" (binary
+        // default). The translator is unit-tested in OptionsTest; these tests
+        // confirm the translated flag actually lands in argv.
+
+        [Fact]
+        public void LogLevelTraceEmitsTripleVerbose()
+        {
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
+                new GoldLapelOptions { LogLevel = "trace" });
+            Assert.Contains("-vvv", gl.BuildSpawnArgs());
+        }
+
+        [Fact]
+        public void LogLevelDebugEmitsDoubleVerbose()
+        {
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
+                new GoldLapelOptions { LogLevel = "debug" });
+            Assert.Contains("-vv", gl.BuildSpawnArgs());
+        }
+
+        [Fact]
+        public void LogLevelInfoEmitsSingleVerbose()
+        {
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
+                new GoldLapelOptions { LogLevel = "info" });
+            Assert.Contains("-v", gl.BuildSpawnArgs());
+        }
+
+        [Theory]
+        [InlineData("warn")]
+        [InlineData("warning")]
+        [InlineData("error")]
+        public void LogLevelWarnOrErrorEmitsNoVerboseFlag(string level)
+        {
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
+                new GoldLapelOptions { LogLevel = level });
+            var args = gl.BuildSpawnArgs();
+            Assert.DoesNotContain("-v", args);
+            Assert.DoesNotContain("-vv", args);
+            Assert.DoesNotContain("-vvv", args);
+        }
+
+        [Fact]
+        public void LogLevelNullEmitsNoVerboseFlag()
+        {
+            // Belt-and-braces: null LogLevel must not produce a stray flag
+            // (the IsNullOrEmpty guard in BuildSpawnArgs covers this).
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
+                new GoldLapelOptions { LogLevel = null });
+            var args = gl.BuildSpawnArgs();
+            Assert.DoesNotContain("-v", args);
+            Assert.DoesNotContain("-vv", args);
+            Assert.DoesNotContain("-vvv", args);
+        }
+
+        // ─── Mode ───────────────────────────────────────────────────────
+
+        [Fact]
+        public void ModeNotEmittedByDefault()
+        {
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb");
+            Assert.DoesNotContain("--mode", gl.BuildSpawnArgs());
+        }
+
+        [Fact]
+        public void ModeEmittedWhenSet()
+        {
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
+                new GoldLapelOptions { Mode = "waiter" });
+            Assert.Equal("waiter", ValueAfter(gl.BuildSpawnArgs(), "--mode"));
+        }
+
+        [Fact]
+        public void ModeConsiderationEmitted()
+        {
+            // "consideration" is the renamed bellhop mode; verify it survives
+            // round-trip into argv unchanged.
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
+                new GoldLapelOptions { Mode = "consideration" });
+            Assert.Equal("consideration", ValueAfter(gl.BuildSpawnArgs(), "--mode"));
+        }
+
+        // ─── License ────────────────────────────────────────────────────
+
+        [Fact]
+        public void LicenseNotEmittedByDefault()
+        {
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb");
+            Assert.DoesNotContain("--license", gl.BuildSpawnArgs());
+        }
+
+        [Fact]
+        public void LicenseEmittedWhenSet()
+        {
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
+                new GoldLapelOptions { License = "/etc/goldlapel/license.json" });
+            Assert.Equal("/etc/goldlapel/license.json",
+                ValueAfter(gl.BuildSpawnArgs(), "--license"));
+        }
+
+        // ─── Client ─────────────────────────────────────────────────────
+
+        [Fact]
+        public void ClientNotEmittedByDefault()
+        {
+            // When Client is unset the wrapper sets GOLDLAPEL_CLIENT=dotnet
+            // via env var (in SpawnAsync) — NOT via --client. So argv stays
+            // clean by default.
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb");
+            Assert.DoesNotContain("--client", gl.BuildSpawnArgs());
+        }
+
+        [Fact]
+        public void ClientEmittedWhenSet()
+        {
+            // Explicit Client overrides the dotnet env-var default and emits
+            // --client so the proxy can tag telemetry with the user's value.
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
+                new GoldLapelOptions { Client = "fleet-prod" });
+            Assert.Equal("fleet-prod", ValueAfter(gl.BuildSpawnArgs(), "--client"));
+        }
+
+        // ─── ConfigFile ─────────────────────────────────────────────────
+
+        [Fact]
+        public void ConfigFileNotEmittedByDefault()
+        {
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb");
+            Assert.DoesNotContain("--config", gl.BuildSpawnArgs());
+        }
+
+        [Fact]
+        public void ConfigFileEmittedWhenSet()
+        {
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
+                new GoldLapelOptions { ConfigFile = "/etc/goldlapel/config.toml" });
+            Assert.Equal("/etc/goldlapel/config.toml",
+                ValueAfter(gl.BuildSpawnArgs(), "--config"));
+        }
+
+        // ─── Mesh ───────────────────────────────────────────────────────
+
+        [Fact]
+        public void MeshNotEmittedByDefault()
+        {
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb");
+            Assert.DoesNotContain("--mesh", gl.BuildSpawnArgs());
+        }
+
+        [Fact]
+        public void MeshEmittedWhenTrue()
+        {
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
+                new GoldLapelOptions { Mesh = true });
+            Assert.Contains("--mesh", gl.BuildSpawnArgs());
+        }
+
+        [Fact]
+        public void MeshTagNotEmittedByDefault()
+        {
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb");
+            Assert.DoesNotContain("--mesh-tag", gl.BuildSpawnArgs());
+        }
+
+        [Fact]
+        public void MeshTagEmittedWhenSet()
+        {
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
+                new GoldLapelOptions { Mesh = true, MeshTag = "prod-east" });
+            var args = gl.BuildSpawnArgs();
+            Assert.Equal("prod-east", ValueAfter(args, "--mesh-tag"));
+            // --mesh and --mesh-tag are independent flags; both should appear.
+            Assert.Contains("--mesh", args);
+        }
+
+        [Fact]
+        public void MeshTagEmittedWithoutMeshFlag()
+        {
+            // MeshTag is independent of Mesh — setting only the tag still
+            // emits --mesh-tag (the proxy may interpret this as "join the
+            // tagged mesh"). Matches the existing string.IsNullOrEmpty guard
+            // logic in BuildSpawnArgs (no coupling to _mesh).
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
+                new GoldLapelOptions { MeshTag = "prod-east" });
+            var args = gl.BuildSpawnArgs();
+            Assert.Equal("prod-east", ValueAfter(args, "--mesh-tag"));
+            Assert.DoesNotContain("--mesh", args);
+        }
+
+        [Fact]
+        public void MeshTagEmptyStringNotEmitted()
+        {
+            // Empty tag is normalized to null in the constructor; ensure no
+            // stray --mesh-tag emission.
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
+                new GoldLapelOptions { Mesh = true, MeshTag = "" });
+            Assert.DoesNotContain("--mesh-tag", gl.BuildSpawnArgs());
+        }
+
+        // ─── EnableL2ForWrappers ────────────────────────────────────────
+
+        [Fact]
+        public void EnableL2ForWrappersNotEmittedByDefault()
+        {
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb");
+            Assert.DoesNotContain("--enable-l2-for-wrappers", gl.BuildSpawnArgs());
+        }
+
+        [Fact]
+        public void EnableL2ForWrappersEmittedWhenTrue()
+        {
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
+                new GoldLapelOptions { EnableL2ForWrappers = true });
+            Assert.Contains("--enable-l2-for-wrappers", gl.BuildSpawnArgs());
+        }
+
+        // ─── Silent ─────────────────────────────────────────────────────
+        //
+        // Audit finding: GoldLapelOptions.Silent is a wrapper-banner-only
+        // option. It does NOT emit --silent to the binary. This matches the
+        // Python and Java wrappers (verified in goldlapel-python proxy.py
+        // and goldlapel-java GoldLapel.java). The binary's --silent flag
+        // suppresses the first-run welcome prompt — a separate concern
+        // owned by the binary, set via env var (GOLDLAPEL_SILENT) or
+        // ExtraArgs by callers who actually need it.
+
+        [Fact]
+        public void SilentDoesNotEmitFlag()
+        {
+            // Regression guard: even when Silent=true, --silent must not
+            // appear in argv. The wrapper uses _silent only to suppress its
+            // own startup banner (see SpawnAsync's banner block).
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
+                new GoldLapelOptions { Silent = true });
+            Assert.DoesNotContain("--silent", gl.BuildSpawnArgs());
+        }
+
+        // ─── ExtraArgs / Config integration ─────────────────────────────
+
+        [Fact]
+        public void ExtraArgsAppendedAtEnd()
+        {
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
+                new GoldLapelOptions { ExtraArgs = new[] { "--silent", "--foo" } });
+            var args = gl.BuildSpawnArgs();
+            // ExtraArgs are the trailing tokens (config map is empty here).
+            Assert.Equal("--silent", args[args.Count - 2]);
+            Assert.Equal("--foo", args[args.Count - 1]);
+        }
+
+        [Fact]
+        public void ConfigMapFlagsAppearBeforeExtraArgs()
+        {
+            // The argv-construction contract: required flags → top-level
+            // options → structured config map → extra args. Order matters
+            // because earlier flags can be overridden by later ones (last
+            // write wins in clap), and ExtraArgs is the user's escape hatch.
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
+                new GoldLapelOptions
+                {
+                    Config = new Dictionary<string, object> { { "poolSize", 50 } },
+                    ExtraArgs = new[] { "--custom" }
+                });
+            var args = gl.BuildSpawnArgs();
+            var poolIdx = IndexOf(args, "--pool-size");
+            var customIdx = IndexOf(args, "--custom");
+            Assert.True(poolIdx >= 0 && customIdx >= 0);
+            Assert.True(poolIdx < customIdx,
+                $"--pool-size (index {poolIdx}) should precede --custom (index {customIdx})");
+        }
+
+        [Fact]
+        public void TopLevelFlagsPrecedeConfigMap()
+        {
+            // Argv ordering contract: top-level (--mode) emits before the
+            // structured config map (--pool-size). Tests exercising flag
+            // overrides via ExtraArgs rely on this stable ordering.
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
+                new GoldLapelOptions
+                {
+                    Mode = "waiter",
+                    Config = new Dictionary<string, object> { { "poolSize", 10 } }
+                });
+            var args = gl.BuildSpawnArgs();
+            var modeIdx = IndexOf(args, "--mode");
+            var poolIdx = IndexOf(args, "--pool-size");
+            Assert.True(modeIdx >= 0 && poolIdx >= 0);
+            Assert.True(modeIdx < poolIdx,
+                $"--mode (index {modeIdx}) should precede --pool-size (index {poolIdx})");
+        }
+
+        // ─── Mixed: every top-level flag wired together ─────────────────
+
+        [Fact]
+        public void AllTopLevelFlagsCoexist()
+        {
+            // Smoke test that no two top-level flag emissions interfere with
+            // each other — every option set, every flag observable in argv.
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
+                new GoldLapelOptions
+                {
+                    ProxyPort = 17932,
+                    DashboardPort = 9090,
+                    InvalidationPort = 9091,
+                    LogLevel = "debug",
+                    Mode = "waiter",
+                    License = "/tmp/lic",
+                    Client = "fleet",
+                    ConfigFile = "/tmp/cfg.toml",
+                    Mesh = true,
+                    MeshTag = "east",
+                    EnableL2ForWrappers = true,
+                });
+            var args = gl.BuildSpawnArgs();
+            Assert.Equal("17932", ValueAfter(args, "--proxy-port"));
+            Assert.Equal("9090", ValueAfter(args, "--dashboard-port"));
+            Assert.Equal("9091", ValueAfter(args, "--invalidation-port"));
+            Assert.Contains("-vv", args);
+            Assert.Equal("waiter", ValueAfter(args, "--mode"));
+            Assert.Equal("/tmp/lic", ValueAfter(args, "--license"));
+            Assert.Equal("fleet", ValueAfter(args, "--client"));
+            Assert.Equal("/tmp/cfg.toml", ValueAfter(args, "--config"));
+            Assert.Contains("--mesh", args);
+            Assert.Equal("east", ValueAfter(args, "--mesh-tag"));
+            Assert.Contains("--enable-l2-for-wrappers", args);
+        }
+    }
 }
