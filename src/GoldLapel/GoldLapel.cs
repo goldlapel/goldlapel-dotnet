@@ -92,6 +92,16 @@ namespace GoldLapel
         /// Equivalent CLI flag: <c>--mesh-tag</c>. Env: <c>GOLDLAPEL_MESH_TAG</c>.
         /// </summary>
         public string MeshTag { get; set; }
+
+        /// <summary>
+        /// When <c>true</c>, the proxy keeps its L2 result cache active for
+        /// wrapper traffic instead of skipping it (the wrapper-skip is the
+        /// default since per-connection L2 wrapper-skip shipped). For fleet
+        /// deployments — multi-pod, frequent restarts, mesh — L2 still adds
+        /// value as a shared cache across wrapper processes. Equivalent CLI
+        /// flag: <c>--enable-l2-for-wrappers</c>.
+        /// </summary>
+        public bool EnableL2ForWrappers { get; set; }
     }
 
     /// <summary>
@@ -171,6 +181,7 @@ namespace GoldLapel
         private readonly bool _silent;
         private readonly bool _mesh;
         private readonly string _meshTag;
+        private readonly bool _enableL2ForWrappers;
         private Process _process;
         private string _proxyUrl;
         private bool _disposed;
@@ -212,6 +223,12 @@ namespace GoldLapel
             // Mesh membership — startup intent (HQ enforces license).
             _mesh = options.Mesh;
             _meshTag = string.IsNullOrEmpty(options.MeshTag) ? null : options.MeshTag;
+            // L2 (proxy result cache) is skipped for wrapper traffic by default
+            // (per-connection skip via the application_name marker). Setting
+            // this to true forces the proxy to keep L2 on for wrappers — the
+            // shared-cache wins for fleet customers (multi-pod, frequent
+            // restarts, mesh) outweigh the per-process L1 redundancy.
+            _enableL2ForWrappers = options.EnableL2ForWrappers;
             // Dashboard defaults to proxy port + 1 (matches what the Rust binary
             // binds when no --dashboard-port is passed). A user-supplied value
             // on the top-level DashboardPort option overrides the derivation.
@@ -286,6 +303,7 @@ namespace GoldLapel
         // Test-only accessors for mesh wiring.
         internal bool IsMesh => _mesh;
         internal string MeshTag => _meshTag;
+        internal bool IsEnableL2ForWrappers => _enableL2ForWrappers;
 
         // ── Factory ─────────────────────────────────────────────────
 
@@ -564,6 +582,10 @@ namespace GoldLapel
             {
                 args.Add("--mesh-tag");
                 args.Add(_meshTag);
+            }
+            if (_enableL2ForWrappers)
+            {
+                args.Add("--enable-l2-for-wrappers");
             }
             args.AddRange(ConfigToArgs(_config));
             args.AddRange(_extraArgs);

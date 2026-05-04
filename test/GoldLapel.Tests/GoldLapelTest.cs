@@ -520,6 +520,37 @@ namespace GoldLapel.Tests
             var tagCfg = new Dictionary<string, object> { { "meshTag", "prod" } };
             Assert.Throws<ArgumentException>(() => GL.ConfigToArgs(tagCfg));
         }
+
+        // ─── EnableL2ForWrappers startup option ────────────────────────
+
+        [Fact]
+        public void EnableL2ForWrappersDefaultsToFalse()
+        {
+            // Per-connection L2 wrapper-skip is the default; opt-in is required
+            // for fleet customers (multi-pod, frequent restarts, mesh).
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb");
+            Assert.False(gl.IsEnableL2ForWrappers);
+        }
+
+        [Fact]
+        public void EnableL2ForWrappersOptionStored()
+        {
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
+                new GoldLapelOptions { EnableL2ForWrappers = true });
+            // When set, SpawnAsync emits `--enable-l2-for-wrappers` so the
+            // proxy keeps the L2 result cache active for wrapper traffic.
+            Assert.True(gl.IsEnableL2ForWrappers);
+        }
+
+        [Fact]
+        public void EnableL2ForWrappersInConfigMapIsRejected()
+        {
+            // Regression guard: EnableL2ForWrappers is a top-level
+            // canonical-surface option, never valid inside the structured
+            // config map.
+            var cfg = new Dictionary<string, object> { { "enableL2ForWrappers", true } };
+            Assert.Throws<ArgumentException>(() => GL.ConfigToArgs(cfg));
+        }
     }
 
     // ── DashboardUrl ───────────────────────────────────────
