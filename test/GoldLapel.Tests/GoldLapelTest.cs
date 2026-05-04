@@ -551,6 +551,32 @@ namespace GoldLapel.Tests
             var cfg = new Dictionary<string, object> { { "enableL2ForWrappers", true } };
             Assert.Throws<ArgumentException>(() => GL.ConfigToArgs(cfg));
         }
+
+        // ─── DisableL1 startup option ──────────────────────────────────
+
+        [Fact]
+        public void DisableL1DefaultsToFalse()
+        {
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb");
+            Assert.False(gl.IsDisableL1);
+        }
+
+        [Fact]
+        public void DisableL1OptionStored()
+        {
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
+                new GoldLapelOptions { DisableL1 = true });
+            Assert.True(gl.IsDisableL1);
+        }
+
+        [Fact]
+        public void DisableL1InConfigMapIsRejected()
+        {
+            // Regression guard: DisableL1 is a top-level canonical-surface
+            // option, never valid inside the structured config map.
+            var cfg = new Dictionary<string, object> { { "disableL1", true } };
+            Assert.Throws<ArgumentException>(() => GL.ConfigToArgs(cfg));
+        }
     }
 
     // ── DashboardUrl ───────────────────────────────────────
@@ -986,6 +1012,8 @@ namespace GoldLapel.Tests
             Assert.DoesNotContain("-vvv", args);
             // Silent intentionally never emits a flag (see SilentDoesNotEmitFlag).
             Assert.DoesNotContain("--silent", args);
+            // DisableL1 is wrapper-only — no CLI translation (see DisableL1DoesNotEmitFlag).
+            Assert.DoesNotContain("--disable-l1", args);
         }
 
         // ─── DashboardPort ──────────────────────────────────────────────
@@ -1254,6 +1282,33 @@ namespace GoldLapel.Tests
             Assert.Contains("--enable-l2-for-wrappers", gl.BuildSpawnArgs());
         }
 
+        // ─── DisableL1 ──────────────────────────────────────────────────
+        //
+        // DisableL1 is a wrapper-only knob — there is no --disable-l1 flag
+        // on the proxy binary. The flag toggles L1 (the wrapper's
+        // in-process NativeCache) only; the proxy stays oblivious. Argv
+        // must not gain any new tokens regardless of the option's value.
+
+        [Fact]
+        public void DisableL1DoesNotEmitFlag()
+        {
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
+                new GoldLapelOptions { DisableL1 = true });
+            var args = gl.BuildSpawnArgs();
+            Assert.DoesNotContain("--disable-l1", args);
+            // Belt-and-suspenders: with no other options set, argv stays at
+            // the four required tokens (--upstream <url> --proxy-port <n>).
+            Assert.Equal(4, args.Count);
+        }
+
+        [Fact]
+        public void DisableL1FalseDoesNotEmitFlag()
+        {
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
+                new GoldLapelOptions { DisableL1 = false });
+            Assert.DoesNotContain("--disable-l1", gl.BuildSpawnArgs());
+        }
+
         // ─── Silent ─────────────────────────────────────────────────────
         //
         // Audit finding: GoldLapelOptions.Silent is a wrapper-banner-only
@@ -1350,6 +1405,7 @@ namespace GoldLapel.Tests
                     Mesh = true,
                     MeshTag = "east",
                     EnableL2ForWrappers = true,
+                    DisableL1 = true,
                 });
             var args = gl.BuildSpawnArgs();
             Assert.Equal("17932", ValueAfter(args, "--proxy-port"));
@@ -1363,6 +1419,9 @@ namespace GoldLapel.Tests
             Assert.Contains("--mesh", args);
             Assert.Equal("east", ValueAfter(args, "--mesh-tag"));
             Assert.Contains("--enable-l2-for-wrappers", args);
+            // DisableL1 is wrapper-only — must not leak into argv even when
+            // every other option is set.
+            Assert.DoesNotContain("--disable-l1", args);
         }
     }
 }

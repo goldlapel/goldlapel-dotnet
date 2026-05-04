@@ -102,6 +102,18 @@ namespace GoldLapel
         /// flag: <c>--enable-l2-for-wrappers</c>.
         /// </summary>
         public bool EnableL2ForWrappers { get; set; }
+
+        /// <summary>
+        /// When <c>true</c>, the wrapper's in-process L1 cache is bypassed
+        /// — <see cref="NativeCache.Get"/> returns null (ticking misses)
+        /// and <see cref="NativeCache.Put"/> is a silent no-op. The
+        /// invalidation socket still runs so telemetry continues to flow
+        /// (Manor/HQ see the wrapper's L1 state via the
+        /// <c>l1_disabled</c> snapshot field). Orthogonal to cache size:
+        /// keeps a tuned <c>resultCacheSize</c> intact while toggling the
+        /// layer off. Wrapper-only — no equivalent CLI flag on the proxy.
+        /// </summary>
+        public bool DisableL1 { get; set; }
     }
 
     /// <summary>
@@ -182,6 +194,7 @@ namespace GoldLapel
         private readonly bool _mesh;
         private readonly string _meshTag;
         private readonly bool _enableL2ForWrappers;
+        private readonly bool _disableL1;
         private Process _process;
         private string _proxyUrl;
         private bool _disposed;
@@ -229,6 +242,12 @@ namespace GoldLapel
             // shared-cache wins for fleet customers (multi-pod, frequent
             // restarts, mesh) outweigh the per-process L1 redundancy.
             _enableL2ForWrappers = options.EnableL2ForWrappers;
+            // L1 (wrapper-side cache) explicit disable. Unlike --enable-l2-for-wrappers,
+            // this is a wrapper-only knob — the proxy has no --disable-l1 flag.
+            // The flag is pushed onto the NativeCache singleton in SpawnAsync so
+            // it's set before the invalidation socket connects (the very first
+            // wrapper_connected snapshot then carries the correct l1_disabled field).
+            _disableL1 = options.DisableL1;
             // Dashboard defaults to proxy port + 1 (matches what the Rust binary
             // binds when no --dashboard-port is passed). A user-supplied value
             // on the top-level DashboardPort option overrides the derivation.
@@ -304,6 +323,7 @@ namespace GoldLapel
         internal bool IsMesh => _mesh;
         internal string MeshTag => _meshTag;
         internal bool IsEnableL2ForWrappers => _enableL2ForWrappers;
+        internal bool IsDisableL1 => _disableL1;
 
         // ── Factory ─────────────────────────────────────────────────
 
@@ -609,6 +629,13 @@ namespace GoldLapel
         {
             var binary = FindBinary();
             var args = BuildSpawnArgs();
+
+            // Push DisableL1 onto the NativeCache singleton BEFORE the
+            // invalidation socket connects so the very first
+            // wrapper_connected snapshot carries the correct l1_disabled
+            // field. The flag is wrapper-only (no CLI translation); see
+            // BuildSpawnArgs and the DisableL1 doc on GoldLapelOptions.
+            try { NativeCache.GetInstance().DisableL1 = _disableL1; } catch { }
 
             var psi = new ProcessStartInfo
             {

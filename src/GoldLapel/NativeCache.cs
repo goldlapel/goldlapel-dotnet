@@ -68,6 +68,19 @@ namespace GoldLapel
         private long _counter;
         private readonly int _maxEntries;
         private readonly bool _enabled;
+        // Explicit L1 disable — orthogonal to _enabled (the
+        // GOLDLAPEL_NATIVE_CACHE env-var kill-switch) and orthogonal to
+        // _maxEntries (the cache size). When set, Get always returns null
+        // (incrementing misses) and Put is a silent no-op. The
+        // invalidation thread continues running so telemetry signal flow
+        // (wrapper_connected / snapshot replies) keeps working — Manor
+        // and the dashboard need to see the wrapper even when L1 is off.
+        // Set via the DisableL1 option on GoldLapelOptions; pushed onto
+        // the singleton in SpawnAsync before the invalidation socket
+        // connects so the very first wrapper_connected snapshot carries
+        // the correct l1_disabled field. volatile so writes from the
+        // SpawnAsync thread are visible to the recv loop without a lock.
+        private volatile bool _disableL1;
 
         private volatile bool _invalidationConnected;
         private volatile bool _invalidationStop;
@@ -186,11 +199,33 @@ namespace GoldLapel
         public bool IsEnabled => _enabled;
         public int Size => _cache.Count;
 
+        /// <summary>
+        /// When <c>true</c>, <see cref="Get"/> always returns null (miss)
+        /// and <see cref="Put"/> is a silent no-op. The invalidation
+        /// thread keeps running and telemetry emissions still fire — only
+        /// the local hit path is suppressed. Surfaced via the
+        /// <c>l1_disabled</c> field on the L1 telemetry snapshot when
+        /// set. Set via the <c>DisableL1</c> option on
+        /// <see cref="GoldLapelOptions"/>.
+        /// </summary>
+        public bool DisableL1
+        {
+            get => _disableL1;
+            set => _disableL1 = value;
+        }
+
         // --- Cache operations ---
 
         public CacheEntry Get(string sql, object[] parameters)
         {
             if (!_enabled || !_invalidationConnected) return null;
+            // DisableL1: tick misses (callers measure miss rate), never
+            // hit. Skip the key build + cache lookup entirely — no point.
+            if (_disableL1)
+            {
+                Interlocked.Increment(ref StatsMisses);
+                return null;
+            }
             var key = MakeKey(sql, parameters);
             if (key == null) return null;
             CacheEntry entry;
@@ -207,6 +242,9 @@ namespace GoldLapel
         public void Put(string sql, object[] parameters, object[][] rows, string[] columns)
         {
             if (!_enabled || !_invalidationConnected) return;
+            // DisableL1: silent no-op. Don't touch cache state, the
+            // eviction-rate window, or counters — the layer is off.
+            if (_disableL1) return;
             var key = MakeKey(sql, parameters);
             if (key == null) return;
             var tables = ExtractTables(sql);
@@ -577,7 +615,7 @@ namespace GoldLapel
         {
             lock (_putLock)
             {
-                return new Dictionary<string, object>
+                var snap = new Dictionary<string, object>
                 {
                     { "wrapper_id", WrapperId },
                     { "lang", WrapperLang },
@@ -589,6 +627,12 @@ namespace GoldLapel
                     { "current_size_entries", (long)_cache.Count },
                     { "capacity_entries", (long)_maxEntries },
                 };
+                // Forward-compat: surface the disable flag so HQ/Manor can
+                // render the wrapper's L1 state correctly. Only emitted
+                // when set; older consumers that don't know the field
+                // will simply ignore it.
+                if (_disableL1) snap["l1_disabled"] = true;
+                return snap;
             }
         }
 

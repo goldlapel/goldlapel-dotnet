@@ -672,6 +672,146 @@ namespace GoldLapel.Tests
         }
     }
 
+    // ── DisableL1: explicit L1 disable, orthogonal to size ────
+
+    [Collection("L1Telemetry")]
+    public class DisableL1Test : IDisposable
+    {
+        public DisableL1Test() { NativeCache.Reset(); }
+        public void Dispose() { NativeCache.Reset(); }
+
+        private NativeCache MakeCache(bool disableL1)
+        {
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            cache.DisableL1 = disableL1;
+            return cache;
+        }
+
+        [Fact]
+        public void DefaultsToFalse()
+        {
+            var cache = new NativeCache();
+            Assert.False(cache.DisableL1);
+        }
+
+        [Fact]
+        public void GetReturnsNullWhenDisabled()
+        {
+            var cache = MakeCache(disableL1: true);
+            // Even after a Put (which is also a no-op when disabled), Get must miss.
+            cache.Put("SELECT * FROM users", null,
+                new[] { new object[] { "1", "alice" } },
+                new[] { "id", "name" });
+            Assert.Null(cache.Get("SELECT * FROM users", null));
+        }
+
+        [Fact]
+        public void PutIsNoOpWhenDisabled()
+        {
+            var cache = MakeCache(disableL1: true);
+            cache.Put("SELECT * FROM users", null,
+                new[] { new object[] { "1", "alice" } },
+                new[] { "id", "name" });
+            // Cache stays empty — no entry, no LRU bookkeeping.
+            Assert.Equal(0, cache.Size);
+        }
+
+        [Fact]
+        public void MissesTickHitsAndEvictionsStayZero()
+        {
+            var cache = MakeCache(disableL1: true);
+            // Put first (no-op). Then three Gets — each must tick a miss.
+            cache.Put("SELECT * FROM users", null,
+                new[] { new object[] { "1" } }, new[] { "id" });
+            cache.Get("SELECT * FROM users", null);
+            cache.Get("SELECT * FROM users", null);
+            cache.Get("SELECT 2", null);
+            Assert.Equal(0, Interlocked.Read(ref cache.StatsHits));
+            Assert.Equal(3, Interlocked.Read(ref cache.StatsMisses));
+            Assert.Equal(0, Interlocked.Read(ref cache.StatsEvictions));
+        }
+
+        [Fact]
+        public void PutDoesNotEvictWhenDisabled()
+        {
+            // With a tiny cache size, normally a flood of puts would evict.
+            // With DisableL1 set, no entries are inserted so no evictions occur.
+            var origSize = Environment.GetEnvironmentVariable("GOLDLAPEL_NATIVE_CACHE_SIZE");
+            try
+            {
+                Environment.SetEnvironmentVariable("GOLDLAPEL_NATIVE_CACHE_SIZE", "2");
+                var cache = new NativeCache();
+                cache.SetConnected(true);
+                cache.DisableL1 = true;
+                for (int i = 0; i < 50; i++)
+                    cache.Put($"SELECT {i}", null, new[] { new object[] { i } }, new[] { "id" });
+                Assert.Equal(0L, Interlocked.Read(ref cache.StatsEvictions));
+                Assert.Equal(0, cache.Size);
+            }
+            finally
+            {
+                Environment.SetEnvironmentVariable("GOLDLAPEL_NATIVE_CACHE_SIZE", origSize);
+            }
+        }
+
+        [Fact]
+        public void SnapshotCarriesL1DisabledWhenSet()
+        {
+            var cache = MakeCache(disableL1: true);
+            cache.Get("SELECT 1", null);  // tick a miss for realism
+            var snap = cache.BuildSnapshot();
+            Assert.True(snap.ContainsKey("l1_disabled"));
+            Assert.Equal(true, snap["l1_disabled"]);
+            // Other counters must still surface — telemetry pipeline stays intact.
+            Assert.Equal(1L, snap["misses"]);
+            Assert.Equal(0L, snap["hits"]);
+        }
+
+        [Fact]
+        public void SnapshotOmitsL1DisabledWhenUnset()
+        {
+            // Default (DisableL1=false) snapshot must not carry the flag at
+            // all — keeps the wire format minimal for the common case.
+            var cache = MakeCache(disableL1: false);
+            var snap = cache.BuildSnapshot();
+            Assert.False(snap.ContainsKey("l1_disabled"));
+        }
+
+        [Fact]
+        public void DefaultPathStillCachesWhenNotDisabled()
+        {
+            // Regression guard: the disable path must not leak into the
+            // default flow.
+            var cache = MakeCache(disableL1: false);
+            cache.Put("SELECT * FROM users", null,
+                new[] { new object[] { "1", "alice" } },
+                new[] { "id", "name" });
+            var entry = cache.Get("SELECT * FROM users", null);
+            Assert.NotNull(entry);
+            Assert.Equal(1L, Interlocked.Read(ref cache.StatsHits));
+        }
+
+        [Fact]
+        public void TogglingDisableL1MidLifeFlipsBehavior()
+        {
+            // Set/get pattern: cache normally, then disable mid-flight —
+            // subsequent gets miss even though the entry is still in the
+            // dict. This matches the Ruby behavior: the layer is off, the
+            // dict is irrelevant.
+            var cache = MakeCache(disableL1: false);
+            cache.Put("SELECT 1", null, new[] { new object[] { "1" } }, new[] { "id" });
+            Assert.NotNull(cache.Get("SELECT 1", null));
+
+            cache.DisableL1 = true;
+            Assert.Null(cache.Get("SELECT 1", null));
+
+            cache.DisableL1 = false;
+            // Entry is still present from earlier Put.
+            Assert.NotNull(cache.Get("SELECT 1", null));
+        }
+    }
+
     // ── L1 telemetry: real-socket integration ────────────────
 
     [Collection("L1Telemetry")]
