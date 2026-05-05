@@ -192,7 +192,7 @@ namespace GoldLapel
             if (_conn.InTransaction)
                 return _inner.ExecuteReader(behavior);
 
-            // Check L1 cache
+            // Check native cache
             var parameters = GetParameterArray();
             var entry = cache.Get(sql, parameters);
             if (entry != null)

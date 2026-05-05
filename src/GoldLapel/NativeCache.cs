@@ -30,7 +30,7 @@ namespace GoldLapel
     {
         internal const string DdlSentinel = "__ddl__";
 
-        // --- L1 telemetry tuning ---
+        // --- Native-cache telemetry tuning ---
         //
         // Demand-driven model (mirrored from goldlapel-python cache.py): the
         // wrapper has NO background timer. Cache counters increment on cache
@@ -68,19 +68,20 @@ namespace GoldLapel
         private long _counter;
         private readonly int _maxEntries;
         private readonly bool _enabled;
-        // Explicit L1 disable — orthogonal to _enabled (the
+        // Explicit native-cache disable — orthogonal to _enabled (the
         // GOLDLAPEL_NATIVE_CACHE env-var kill-switch) and orthogonal to
         // _maxEntries (the cache size). When set, Get always returns null
         // (incrementing misses) and Put is a silent no-op. The
         // invalidation thread continues running so telemetry signal flow
         // (wrapper_connected / snapshot replies) keeps working — Manor
-        // and the dashboard need to see the wrapper even when L1 is off.
-        // Set via the DisableL1 option on GoldLapelOptions; pushed onto
-        // the singleton in SpawnAsync before the invalidation socket
-        // connects so the very first wrapper_connected snapshot carries
-        // the correct l1_disabled field. volatile so writes from the
-        // SpawnAsync thread are visible to the recv loop without a lock.
-        private volatile bool _disableL1;
+        // and the dashboard need to see the wrapper even when the native
+        // cache is off. Set via the DisableNativeCache option on
+        // GoldLapelOptions; pushed onto the singleton in SpawnAsync
+        // before the invalidation socket connects so the very first
+        // wrapper_connected snapshot carries the correct `disabled`
+        // field. volatile so writes from the SpawnAsync thread are
+        // visible to the recv loop without a lock.
+        private volatile bool _disableNativeCache;
 
         private volatile bool _invalidationConnected;
         private volatile bool _invalidationStop;
@@ -92,12 +93,13 @@ namespace GoldLapel
         internal long StatsHits;
         internal long StatsMisses;
         internal long StatsInvalidations;
-        // L1 telemetry: eviction counter — bumped in EvictOne (matches the
-        // Python `stats_evictions` field). Read in BuildSnapshot under the
-        // put-lock for an internally consistent snapshot.
+        // Native-cache telemetry: eviction counter — bumped in EvictOne
+        // (matches the Python `stats_evictions` field). Read in
+        // BuildSnapshot under the put-lock for an internally consistent
+        // snapshot.
         internal long StatsEvictions;
 
-        // --- L1 telemetry: identity + opt-out ---
+        // --- Native-cache telemetry: identity + opt-out ---
         //
         // Stable wrapper identity for the lifetime of the process. Lets the
         // proxy aggregate per-wrapper across reconnects.
@@ -109,7 +111,7 @@ namespace GoldLapel
         // only telemetry output is suppressed.
         internal readonly bool ReportStats;
 
-        // --- L1 telemetry: send + state ---
+        // --- Native-cache telemetry: send + state ---
         //
         // The recv loop owns reads; writes can come from the recv thread (R:
         // replies) or any caller thread (S: state events). _sendLock
@@ -204,14 +206,14 @@ namespace GoldLapel
         /// and <see cref="Put"/> is a silent no-op. The invalidation
         /// thread keeps running and telemetry emissions still fire — only
         /// the local hit path is suppressed. Surfaced via the
-        /// <c>l1_disabled</c> field on the L1 telemetry snapshot when
-        /// set. Set via the <c>DisableL1</c> option on
+        /// <c>disabled</c> field on the native-cache telemetry snapshot
+        /// when set. Set via the <c>DisableNativeCache</c> option on
         /// <see cref="GoldLapelOptions"/>.
         /// </summary>
-        public bool DisableL1
+        public bool DisableNativeCache
         {
-            get => _disableL1;
-            set => _disableL1 = value;
+            get => _disableNativeCache;
+            set => _disableNativeCache = value;
         }
 
         // --- Cache operations ---
@@ -219,9 +221,10 @@ namespace GoldLapel
         public CacheEntry Get(string sql, object[] parameters)
         {
             if (!_enabled || !_invalidationConnected) return null;
-            // DisableL1: tick misses (callers measure miss rate), never
-            // hit. Skip the key build + cache lookup entirely — no point.
-            if (_disableL1)
+            // DisableNativeCache: tick misses (callers measure miss rate),
+            // never hit. Skip the key build + cache lookup entirely — no
+            // point.
+            if (_disableNativeCache)
             {
                 Interlocked.Increment(ref StatsMisses);
                 return null;
@@ -242,9 +245,9 @@ namespace GoldLapel
         public void Put(string sql, object[] parameters, object[][] rows, string[] columns)
         {
             if (!_enabled || !_invalidationConnected) return;
-            // DisableL1: silent no-op. Don't touch cache state, the
-            // eviction-rate window, or counters — the layer is off.
-            if (_disableL1) return;
+            // DisableNativeCache: silent no-op. Don't touch cache state,
+            // the eviction-rate window, or counters — the layer is off.
+            if (_disableNativeCache) return;
             var key = MakeKey(sql, parameters);
             if (key == null) return;
             var tables = ExtractTables(sql);
@@ -582,7 +585,7 @@ namespace GoldLapel
             Interlocked.Increment(ref StatsEvictions);
         }
 
-        // ---- L1 telemetry: sliding-window bookkeeping ----
+        // ---- Native-cache telemetry: sliding-window bookkeeping ----
 
         // Caller holds _putLock. Bounded ring; once full, overwrites oldest
         // in O(1). _recentEvictionsSum tracks the running sum so the rate
@@ -604,13 +607,14 @@ namespace GoldLapel
             }
         }
 
-        // ---- L1 telemetry: snapshot ----
+        // ---- Native-cache telemetry: snapshot ----
 
-        // Build the L1 snapshot dict the proxy aggregates per-tick. All
-        // counters + cache size read in a single critical section so the
-        // snapshot is internally consistent (no torn reads where, e.g., hits
-        // and misses straddle a concurrent get()). The proxy computes deltas
-        // across ticks; we just expose the raw counters.
+        // Build the native-cache snapshot dict the proxy aggregates
+        // per-tick. All counters + cache size read in a single critical
+        // section so the snapshot is internally consistent (no torn reads
+        // where, e.g., hits and misses straddle a concurrent get()). The
+        // proxy computes deltas across ticks; we just expose the raw
+        // counters.
         internal Dictionary<string, object> BuildSnapshot()
         {
             lock (_putLock)
@@ -628,15 +632,15 @@ namespace GoldLapel
                     { "capacity_entries", (long)_maxEntries },
                 };
                 // Forward-compat: surface the disable flag so HQ/Manor can
-                // render the wrapper's L1 state correctly. Only emitted
-                // when set; older consumers that don't know the field
-                // will simply ignore it.
-                if (_disableL1) snap["l1_disabled"] = true;
+                // render the wrapper's native-cache state correctly. Only
+                // emitted when set; older consumers that don't know the
+                // field will simply ignore it.
+                if (_disableNativeCache) snap["disabled"] = true;
                 return snap;
             }
         }
 
-        // ---- L1 telemetry: emission ----
+        // ---- Native-cache telemetry: emission ----
 
         private static long NowMs()
         {

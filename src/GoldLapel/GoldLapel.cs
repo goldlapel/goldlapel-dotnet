@@ -94,26 +94,27 @@ namespace GoldLapel
         public string MeshTag { get; set; }
 
         /// <summary>
-        /// When <c>true</c>, the proxy keeps its L2 result cache active for
+        /// When <c>true</c>, the proxy keeps its proxy-cache active for
         /// wrapper traffic instead of skipping it (the wrapper-skip is the
-        /// default since per-connection L2 wrapper-skip shipped). For fleet
-        /// deployments — multi-pod, frequent restarts, mesh — L2 still adds
-        /// value as a shared cache across wrapper processes. Equivalent CLI
-        /// flag: <c>--enable-l2-for-wrappers</c>.
+        /// default since per-connection wrapper-skip shipped). For fleet
+        /// deployments — multi-pod, frequent restarts, mesh — the proxy
+        /// cache still adds value as a shared cache across wrapper
+        /// processes. Equivalent CLI flag:
+        /// <c>--enable-proxy-cache-for-wrappers</c>.
         /// </summary>
-        public bool EnableL2ForWrappers { get; set; }
+        public bool EnableProxyCacheForWrappers { get; set; }
 
         /// <summary>
-        /// When <c>true</c>, the wrapper's in-process L1 cache is bypassed
-        /// — <see cref="NativeCache.Get"/> returns null (ticking misses)
-        /// and <see cref="NativeCache.Put"/> is a silent no-op. The
-        /// invalidation socket still runs so telemetry continues to flow
-        /// (Manor/HQ see the wrapper's L1 state via the
-        /// <c>l1_disabled</c> snapshot field). Orthogonal to cache size:
-        /// keeps a tuned <c>resultCacheSize</c> intact while toggling the
+        /// When <c>true</c>, the wrapper's in-process native cache is
+        /// bypassed — <see cref="NativeCache.Get"/> returns null (ticking
+        /// misses) and <see cref="NativeCache.Put"/> is a silent no-op.
+        /// The invalidation socket still runs so telemetry continues to
+        /// flow (Manor/HQ see the wrapper's native-cache state via the
+        /// <c>disabled</c> snapshot field). Orthogonal to cache size:
+        /// keeps a tuned <c>proxyCacheSize</c> intact while toggling the
         /// layer off. Wrapper-only — no equivalent CLI flag on the proxy.
         /// </summary>
-        public bool DisableL1 { get; set; }
+        public bool DisableNativeCache { get; set; }
     }
 
     /// <summary>
@@ -137,15 +138,15 @@ namespace GoldLapel
         {
             "minPatternCount", "refreshIntervalSecs", "patternTtlSecs",
             "maxTablesPerView", "maxColumnsPerView", "deepPaginationThreshold",
-            "reportIntervalSecs", "resultCacheSize", "batchCacheSize",
+            "reportIntervalSecs", "proxyCacheSize", "batchCacheSize",
             "batchCacheTtlSecs", "poolSize", "poolTimeoutSecs",
             "poolMode", "mgmtIdleTimeout", "fallback", "readAfterWriteSecs",
             "n1Threshold", "n1WindowMs", "n1CrossThreshold",
             "tlsCert", "tlsKey", "tlsClientCa",
             "disableMatviews", "disableConsolidation", "disableBtreeIndexes",
             "disableTrigramIndexes", "disableExpressionIndexes",
-            "disablePartialIndexes", "disableRewrite", "disablePreparedCache",
-            "disableResultCache", "disablePool",
+            "disablePartialIndexes", "disableRewrite", "disableRewritePreparedCache",
+            "disableProxyCache", "disablePool",
             "disableN1", "disableN1CrossConnection", "disableShadowMode",
             "enableCoalescing", "replica", "excludeTables"
         });
@@ -154,8 +155,8 @@ namespace GoldLapel
         {
             "disableMatviews", "disableConsolidation", "disableBtreeIndexes",
             "disableTrigramIndexes", "disableExpressionIndexes",
-            "disablePartialIndexes", "disableRewrite", "disablePreparedCache",
-            "disableResultCache", "disablePool",
+            "disablePartialIndexes", "disableRewrite", "disableRewritePreparedCache",
+            "disableProxyCache", "disablePool",
             "disableN1", "disableN1CrossConnection", "disableShadowMode",
             "enableCoalescing"
         });
@@ -193,8 +194,8 @@ namespace GoldLapel
         private readonly bool _silent;
         private readonly bool _mesh;
         private readonly string _meshTag;
-        private readonly bool _enableL2ForWrappers;
-        private readonly bool _disableL1;
+        private readonly bool _enableProxyCacheForWrappers;
+        private readonly bool _disableNativeCache;
         private Process _process;
         private string _proxyUrl;
         private bool _disposed;
@@ -236,18 +237,20 @@ namespace GoldLapel
             // Mesh membership — startup intent (HQ enforces license).
             _mesh = options.Mesh;
             _meshTag = string.IsNullOrEmpty(options.MeshTag) ? null : options.MeshTag;
-            // L2 (proxy result cache) is skipped for wrapper traffic by default
+            // The proxy-cache is skipped for wrapper traffic by default
             // (per-connection skip via the application_name marker). Setting
-            // this to true forces the proxy to keep L2 on for wrappers — the
-            // shared-cache wins for fleet customers (multi-pod, frequent
-            // restarts, mesh) outweigh the per-process L1 redundancy.
-            _enableL2ForWrappers = options.EnableL2ForWrappers;
-            // L1 (wrapper-side cache) explicit disable. Unlike --enable-l2-for-wrappers,
-            // this is a wrapper-only knob — the proxy has no --disable-l1 flag.
-            // The flag is pushed onto the NativeCache singleton in SpawnAsync so
-            // it's set before the invalidation socket connects (the very first
-            // wrapper_connected snapshot then carries the correct l1_disabled field).
-            _disableL1 = options.DisableL1;
+            // this to true forces the proxy to keep its proxy-cache on for
+            // wrappers — the shared-cache wins for fleet customers
+            // (multi-pod, frequent restarts, mesh) outweigh the per-process
+            // native-cache redundancy.
+            _enableProxyCacheForWrappers = options.EnableProxyCacheForWrappers;
+            // Native-cache (wrapper-side) explicit disable. Unlike
+            // --enable-proxy-cache-for-wrappers, this is a wrapper-only knob —
+            // the proxy has no equivalent CLI flag. The flag is pushed onto
+            // the NativeCache singleton in SpawnAsync so it's set before the
+            // invalidation socket connects (the very first wrapper_connected
+            // snapshot then carries the correct `disabled` field).
+            _disableNativeCache = options.DisableNativeCache;
             // Dashboard defaults to proxy port + 1 (matches what the Rust binary
             // binds when no --dashboard-port is passed). A user-supplied value
             // on the top-level DashboardPort option overrides the derivation.
@@ -322,8 +325,8 @@ namespace GoldLapel
         // Test-only accessors for mesh wiring.
         internal bool IsMesh => _mesh;
         internal string MeshTag => _meshTag;
-        internal bool IsEnableL2ForWrappers => _enableL2ForWrappers;
-        internal bool IsDisableL1 => _disableL1;
+        internal bool IsEnableProxyCacheForWrappers => _enableProxyCacheForWrappers;
+        internal bool IsDisableNativeCache => _disableNativeCache;
 
         // ── Factory ─────────────────────────────────────────────────
 
@@ -493,13 +496,13 @@ namespace GoldLapel
             if (_disposed) return;
             _disposed = true;
 
-            // L1 telemetry: emit a final wrapper_disconnected snapshot
-            // BEFORE closing the proxy connection. The invalidation socket
-            // piggybacks on the proxy lifecycle; once the proxy goes away,
-            // the recv thread will tear down its socket and the emit
-            // becomes a no-op. Latched in NativeCache so the
-            // ProcessExit hook (registered for ungraceful shutdowns)
-            // doesn't double-emit.
+            // Native-cache telemetry: emit a final wrapper_disconnected
+            // snapshot BEFORE closing the proxy connection. The
+            // invalidation socket piggybacks on the proxy lifecycle; once
+            // the proxy goes away, the recv thread will tear down its
+            // socket and the emit becomes a no-op. Latched in NativeCache
+            // so the ProcessExit hook (registered for ungraceful
+            // shutdowns) doesn't double-emit.
             try { NativeCache.GetInstance().EmitWrapperDisconnected(); } catch { }
 
             // Drop cached DDL patterns — they're tied to the proxy we're
@@ -521,7 +524,7 @@ namespace GoldLapel
             if (_disposed) return;
             _disposed = true;
 
-            // L1 telemetry: see DisposeAsync — same rationale.
+            // Native-cache telemetry: see DisposeAsync — same rationale.
             try { NativeCache.GetInstance().EmitWrapperDisconnected(); } catch { }
 
             _ddlCache.Clear();
@@ -616,9 +619,9 @@ namespace GoldLapel
                 args.Add("--mesh-tag");
                 args.Add(_meshTag);
             }
-            if (_enableL2ForWrappers)
+            if (_enableProxyCacheForWrappers)
             {
-                args.Add("--enable-l2-for-wrappers");
+                args.Add("--enable-proxy-cache-for-wrappers");
             }
             args.AddRange(ConfigToArgs(_config));
             args.AddRange(_extraArgs);
@@ -630,12 +633,13 @@ namespace GoldLapel
             var binary = FindBinary();
             var args = BuildSpawnArgs();
 
-            // Push DisableL1 onto the NativeCache singleton BEFORE the
-            // invalidation socket connects so the very first
-            // wrapper_connected snapshot carries the correct l1_disabled
+            // Push DisableNativeCache onto the NativeCache singleton BEFORE
+            // the invalidation socket connects so the very first
+            // wrapper_connected snapshot carries the correct `disabled`
             // field. The flag is wrapper-only (no CLI translation); see
-            // BuildSpawnArgs and the DisableL1 doc on GoldLapelOptions.
-            try { NativeCache.GetInstance().DisableL1 = _disableL1; } catch { }
+            // BuildSpawnArgs and the DisableNativeCache doc on
+            // GoldLapelOptions.
+            try { NativeCache.GetInstance().DisableNativeCache = _disableNativeCache; } catch { }
 
             var psi = new ProcessStartInfo
             {
@@ -921,7 +925,7 @@ namespace GoldLapel
         /// Append <c>application_name=goldlapel:dotnet:&lt;version&gt;</c> to
         /// the URL unless one is already present (or <c>PGAPPNAME</c> is set
         /// in the env). Tells the proxy this is wrapper traffic so it can
-        /// skip L2 result cache (the wrapper has its own L1). Idempotent and
+        /// skip the proxy-cache (the wrapper has its own native-cache). Idempotent and
         /// override-respecting.
         /// </summary>
         internal static string InjectApplicationName(string url)

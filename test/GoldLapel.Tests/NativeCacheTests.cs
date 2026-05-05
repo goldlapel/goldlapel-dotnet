@@ -326,7 +326,7 @@ namespace GoldLapel.Tests
 
     // ── Cache capacity (TOCTOU regression) ────────────────────
 
-    [Collection("L1Telemetry")]
+    [Collection("NativeCacheTelemetry")]
     public class CacheCapacityTest : IDisposable
     {
         public CacheCapacityTest() { NativeCache.Reset(); }
@@ -406,17 +406,17 @@ namespace GoldLapel.Tests
         }
     }
 
-    // ── L1 telemetry: counters + snapshot ────────────────────
+    // ── Native-cache telemetry: counters + snapshot ──────────
     //
     // The telemetry tests below read GOLDLAPEL_NATIVE_CACHE_SIZE and
     // GOLDLAPEL_REPORT_STATS during construction. Process-global env vars
     // race when test classes run in parallel, so we put them all in one
     // collection to serialize them. See xUnit collection-fixture docs.
 
-    [CollectionDefinition("L1Telemetry", DisableParallelization = true)]
-    public class L1TelemetryCollection { }
+    [CollectionDefinition("NativeCacheTelemetry", DisableParallelization = true)]
+    public class NativeCacheTelemetryCollection { }
 
-    [Collection("L1Telemetry")]
+    [Collection("NativeCacheTelemetry")]
     public class EvictionsCounterTest : IDisposable
     {
         public EvictionsCounterTest() { NativeCache.Reset(); }
@@ -464,7 +464,7 @@ namespace GoldLapel.Tests
         }
     }
 
-    [Collection("L1Telemetry")]
+    [Collection("NativeCacheTelemetry")]
     public class SnapshotShapeTest : IDisposable
     {
         public SnapshotShapeTest() { NativeCache.Reset(); }
@@ -526,9 +526,9 @@ namespace GoldLapel.Tests
         }
     }
 
-    // ── L1 telemetry: state-change emission via test hook ────
+    // ── Native-cache telemetry: state-change emission via test hook ────
 
-    [Collection("L1Telemetry")]
+    [Collection("NativeCacheTelemetry")]
     public class StateChangeUnitTest : IDisposable
     {
         public StateChangeUnitTest() { NativeCache.Reset(); }
@@ -643,7 +643,7 @@ namespace GoldLapel.Tests
         }
     }
 
-    [Collection("L1Telemetry")]
+    [Collection("NativeCacheTelemetry")]
     public class ReportStatsOptOutTest : IDisposable
     {
         public ReportStatsOptOutTest() { NativeCache.Reset(); }
@@ -672,19 +672,19 @@ namespace GoldLapel.Tests
         }
     }
 
-    // ── DisableL1: explicit L1 disable, orthogonal to size ────
+    // ── DisableNativeCache: explicit native-cache disable, orthogonal to size ────
 
-    [Collection("L1Telemetry")]
-    public class DisableL1Test : IDisposable
+    [Collection("NativeCacheTelemetry")]
+    public class DisableNativeCacheTest : IDisposable
     {
-        public DisableL1Test() { NativeCache.Reset(); }
+        public DisableNativeCacheTest() { NativeCache.Reset(); }
         public void Dispose() { NativeCache.Reset(); }
 
-        private NativeCache MakeCache(bool disableL1)
+        private NativeCache MakeCache(bool disableNativeCache)
         {
             var cache = new NativeCache();
             cache.SetConnected(true);
-            cache.DisableL1 = disableL1;
+            cache.DisableNativeCache = disableNativeCache;
             return cache;
         }
 
@@ -692,13 +692,13 @@ namespace GoldLapel.Tests
         public void DefaultsToFalse()
         {
             var cache = new NativeCache();
-            Assert.False(cache.DisableL1);
+            Assert.False(cache.DisableNativeCache);
         }
 
         [Fact]
         public void GetReturnsNullWhenDisabled()
         {
-            var cache = MakeCache(disableL1: true);
+            var cache = MakeCache(disableNativeCache: true);
             // Even after a Put (which is also a no-op when disabled), Get must miss.
             cache.Put("SELECT * FROM users", null,
                 new[] { new object[] { "1", "alice" } },
@@ -709,7 +709,7 @@ namespace GoldLapel.Tests
         [Fact]
         public void PutIsNoOpWhenDisabled()
         {
-            var cache = MakeCache(disableL1: true);
+            var cache = MakeCache(disableNativeCache: true);
             cache.Put("SELECT * FROM users", null,
                 new[] { new object[] { "1", "alice" } },
                 new[] { "id", "name" });
@@ -720,7 +720,7 @@ namespace GoldLapel.Tests
         [Fact]
         public void MissesTickHitsAndEvictionsStayZero()
         {
-            var cache = MakeCache(disableL1: true);
+            var cache = MakeCache(disableNativeCache: true);
             // Put first (no-op). Then three Gets — each must tick a miss.
             cache.Put("SELECT * FROM users", null,
                 new[] { new object[] { "1" } }, new[] { "id" });
@@ -736,14 +736,15 @@ namespace GoldLapel.Tests
         public void PutDoesNotEvictWhenDisabled()
         {
             // With a tiny cache size, normally a flood of puts would evict.
-            // With DisableL1 set, no entries are inserted so no evictions occur.
+            // With DisableNativeCache set, no entries are inserted so no
+            // evictions occur.
             var origSize = Environment.GetEnvironmentVariable("GOLDLAPEL_NATIVE_CACHE_SIZE");
             try
             {
                 Environment.SetEnvironmentVariable("GOLDLAPEL_NATIVE_CACHE_SIZE", "2");
                 var cache = new NativeCache();
                 cache.SetConnected(true);
-                cache.DisableL1 = true;
+                cache.DisableNativeCache = true;
                 for (int i = 0; i < 50; i++)
                     cache.Put($"SELECT {i}", null, new[] { new object[] { i } }, new[] { "id" });
                 Assert.Equal(0L, Interlocked.Read(ref cache.StatsEvictions));
@@ -756,26 +757,27 @@ namespace GoldLapel.Tests
         }
 
         [Fact]
-        public void SnapshotCarriesL1DisabledWhenSet()
+        public void SnapshotCarriesDisabledWhenSet()
         {
-            var cache = MakeCache(disableL1: true);
+            var cache = MakeCache(disableNativeCache: true);
             cache.Get("SELECT 1", null);  // tick a miss for realism
             var snap = cache.BuildSnapshot();
-            Assert.True(snap.ContainsKey("l1_disabled"));
-            Assert.Equal(true, snap["l1_disabled"]);
+            Assert.True(snap.ContainsKey("disabled"));
+            Assert.Equal(true, snap["disabled"]);
             // Other counters must still surface — telemetry pipeline stays intact.
             Assert.Equal(1L, snap["misses"]);
             Assert.Equal(0L, snap["hits"]);
         }
 
         [Fact]
-        public void SnapshotOmitsL1DisabledWhenUnset()
+        public void SnapshotOmitsDisabledWhenUnset()
         {
-            // Default (DisableL1=false) snapshot must not carry the flag at
-            // all — keeps the wire format minimal for the common case.
-            var cache = MakeCache(disableL1: false);
+            // Default (DisableNativeCache=false) snapshot must not carry
+            // the flag at all — keeps the wire format minimal for the
+            // common case.
+            var cache = MakeCache(disableNativeCache: false);
             var snap = cache.BuildSnapshot();
-            Assert.False(snap.ContainsKey("l1_disabled"));
+            Assert.False(snap.ContainsKey("disabled"));
         }
 
         [Fact]
@@ -783,7 +785,7 @@ namespace GoldLapel.Tests
         {
             // Regression guard: the disable path must not leak into the
             // default flow.
-            var cache = MakeCache(disableL1: false);
+            var cache = MakeCache(disableNativeCache: false);
             cache.Put("SELECT * FROM users", null,
                 new[] { new object[] { "1", "alice" } },
                 new[] { "id", "name" });
@@ -793,28 +795,28 @@ namespace GoldLapel.Tests
         }
 
         [Fact]
-        public void TogglingDisableL1MidLifeFlipsBehavior()
+        public void TogglingDisableNativeCacheMidLifeFlipsBehavior()
         {
             // Set/get pattern: cache normally, then disable mid-flight —
             // subsequent gets miss even though the entry is still in the
             // dict. This matches the Ruby behavior: the layer is off, the
             // dict is irrelevant.
-            var cache = MakeCache(disableL1: false);
+            var cache = MakeCache(disableNativeCache: false);
             cache.Put("SELECT 1", null, new[] { new object[] { "1" } }, new[] { "id" });
             Assert.NotNull(cache.Get("SELECT 1", null));
 
-            cache.DisableL1 = true;
+            cache.DisableNativeCache = true;
             Assert.Null(cache.Get("SELECT 1", null));
 
-            cache.DisableL1 = false;
+            cache.DisableNativeCache = false;
             // Entry is still present from earlier Put.
             Assert.NotNull(cache.Get("SELECT 1", null));
         }
     }
 
-    // ── L1 telemetry: real-socket integration ────────────────
+    // ── Native-cache telemetry: real-socket integration ────────────────
 
-    [Collection("L1Telemetry")]
+    [Collection("NativeCacheTelemetry")]
     public class StateChangeIntegrationTest : IDisposable
     {
         public StateChangeIntegrationTest() { NativeCache.Reset(); }

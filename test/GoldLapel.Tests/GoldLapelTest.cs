@@ -77,8 +77,8 @@ namespace GoldLapel.Tests
     //
     // The wrapper appends `application_name=goldlapel:dotnet:<version>` to
     // every rewritten URL so the proxy can classify wrapper-vs-raw traffic
-    // and skip L2 result cache for wrappers (they have their own L1).
-    // PGAPPNAME is cleared per test for deterministic URLs.
+    // and skip the proxy-cache for wrappers (they have their own native
+    // cache). PGAPPNAME is cleared per test for deterministic URLs.
 
     [Collection("EnvVarTests")]
     public class MakeProxyUrlTest : IDisposable
@@ -223,8 +223,8 @@ namespace GoldLapel.Tests
 
     // ── ApplicationNameMarker ────────────────────────────────
     //
-    // L2-router architecture: wrappers identify themselves to the proxy via
-    // PG `application_name` so the proxy can gate L2 result cache.
+    // Proxy-cache router: wrappers identify themselves to the proxy via
+    // PG `application_name` so the proxy can gate the proxy-cache.
 
     [Collection("EnvVarTests")]
     public class ApplicationNameMarkerTest : IDisposable
@@ -521,60 +521,62 @@ namespace GoldLapel.Tests
             Assert.Throws<ArgumentException>(() => GL.ConfigToArgs(tagCfg));
         }
 
-        // ─── EnableL2ForWrappers startup option ────────────────────────
+        // ─── EnableProxyCacheForWrappers startup option ────────────────
 
         [Fact]
-        public void EnableL2ForWrappersDefaultsToFalse()
+        public void EnableProxyCacheForWrappersDefaultsToFalse()
         {
-            // Per-connection L2 wrapper-skip is the default; opt-in is required
-            // for fleet customers (multi-pod, frequent restarts, mesh).
+            // Per-connection proxy-cache wrapper-skip is the default;
+            // opt-in is required for fleet customers (multi-pod, frequent
+            // restarts, mesh).
             var gl = GL.CreateForTest("postgresql://localhost:5432/mydb");
-            Assert.False(gl.IsEnableL2ForWrappers);
+            Assert.False(gl.IsEnableProxyCacheForWrappers);
         }
 
         [Fact]
-        public void EnableL2ForWrappersOptionStored()
+        public void EnableProxyCacheForWrappersOptionStored()
         {
             var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
-                new GoldLapelOptions { EnableL2ForWrappers = true });
-            // When set, SpawnAsync emits `--enable-l2-for-wrappers` so the
-            // proxy keeps the L2 result cache active for wrapper traffic.
-            Assert.True(gl.IsEnableL2ForWrappers);
+                new GoldLapelOptions { EnableProxyCacheForWrappers = true });
+            // When set, SpawnAsync emits `--enable-proxy-cache-for-wrappers`
+            // so the proxy keeps the proxy-cache active for wrapper traffic.
+            Assert.True(gl.IsEnableProxyCacheForWrappers);
         }
 
         [Fact]
-        public void EnableL2ForWrappersInConfigMapIsRejected()
+        public void EnableProxyCacheForWrappersInConfigMapIsRejected()
         {
-            // Regression guard: EnableL2ForWrappers is a top-level
+            // Regression guard: EnableProxyCacheForWrappers is a top-level
             // canonical-surface option, never valid inside the structured
             // config map.
-            var cfg = new Dictionary<string, object> { { "enableL2ForWrappers", true } };
+            var cfg = new Dictionary<string, object> { { "enableProxyCacheForWrappers", true } };
             Assert.Throws<ArgumentException>(() => GL.ConfigToArgs(cfg));
         }
 
-        // ─── DisableL1 startup option ──────────────────────────────────
+        // ─── DisableNativeCache startup option ─────────────────────────
 
         [Fact]
-        public void DisableL1DefaultsToFalse()
+        public void DisableNativeCacheDefaultsToFalse()
         {
             var gl = GL.CreateForTest("postgresql://localhost:5432/mydb");
-            Assert.False(gl.IsDisableL1);
+            Assert.False(gl.IsDisableNativeCache);
         }
 
         [Fact]
-        public void DisableL1OptionStored()
+        public void DisableNativeCacheOptionStored()
         {
             var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
-                new GoldLapelOptions { DisableL1 = true });
-            Assert.True(gl.IsDisableL1);
+                new GoldLapelOptions { DisableNativeCache = true });
+            Assert.True(gl.IsDisableNativeCache);
         }
 
         [Fact]
-        public void DisableL1InConfigMapIsRejected()
+        public void DisableNativeCacheInConfigMapIsRejected()
         {
-            // Regression guard: DisableL1 is a top-level canonical-surface
-            // option, never valid inside the structured config map.
-            var cfg = new Dictionary<string, object> { { "disableL1", true } };
+            // Regression guard: DisableNativeCache is a top-level
+            // canonical-surface option, never valid inside the structured
+            // config map.
+            var cfg = new Dictionary<string, object> { { "disableNativeCache", true } };
             Assert.Throws<ArgumentException>(() => GL.ConfigToArgs(cfg));
         }
     }
@@ -937,10 +939,10 @@ namespace GoldLapel.Tests
     //
     // Argv-emission tests: assert the right CLI flag actually reaches the
     // spawned proxy binary. The field-storage tests (e.g. IsMesh,
-    // IsEnableL2ForWrappers) verify the property model independently — these
-    // assert the wire format. Without these, a refactor that drops a flag
-    // from SpawnAsync would still pass storage tests while silently shipping
-    // a broken proxy invocation.
+    // IsEnableProxyCacheForWrappers) verify the property model independently
+    // — these assert the wire format. Without these, a refactor that drops
+    // a flag from SpawnAsync would still pass storage tests while silently
+    // shipping a broken proxy invocation.
     //
     // BuildSpawnArgs is the package-internal extraction of SpawnAsync's
     // argv-construction (mirrors Java's buildSpawnCmd). The result excludes
@@ -1006,14 +1008,15 @@ namespace GoldLapel.Tests
             Assert.DoesNotContain("--config", args);
             Assert.DoesNotContain("--mesh", args);
             Assert.DoesNotContain("--mesh-tag", args);
-            Assert.DoesNotContain("--enable-l2-for-wrappers", args);
+            Assert.DoesNotContain("--enable-proxy-cache-for-wrappers", args);
             Assert.DoesNotContain("-v", args);
             Assert.DoesNotContain("-vv", args);
             Assert.DoesNotContain("-vvv", args);
             // Silent intentionally never emits a flag (see SilentDoesNotEmitFlag).
             Assert.DoesNotContain("--silent", args);
-            // DisableL1 is wrapper-only — no CLI translation (see DisableL1DoesNotEmitFlag).
-            Assert.DoesNotContain("--disable-l1", args);
+            // DisableNativeCache is wrapper-only — no CLI translation
+            // (see DisableNativeCacheDoesNotEmitFlag).
+            Assert.DoesNotContain("--disable-native-cache", args);
         }
 
         // ─── DashboardPort ──────────────────────────────────────────────
@@ -1265,48 +1268,49 @@ namespace GoldLapel.Tests
             Assert.DoesNotContain("--mesh-tag", gl.BuildSpawnArgs());
         }
 
-        // ─── EnableL2ForWrappers ────────────────────────────────────────
+        // ─── EnableProxyCacheForWrappers ────────────────────────────────
 
         [Fact]
-        public void EnableL2ForWrappersNotEmittedByDefault()
+        public void EnableProxyCacheForWrappersNotEmittedByDefault()
         {
             var gl = GL.CreateForTest("postgresql://localhost:5432/mydb");
-            Assert.DoesNotContain("--enable-l2-for-wrappers", gl.BuildSpawnArgs());
+            Assert.DoesNotContain("--enable-proxy-cache-for-wrappers", gl.BuildSpawnArgs());
         }
 
         [Fact]
-        public void EnableL2ForWrappersEmittedWhenTrue()
+        public void EnableProxyCacheForWrappersEmittedWhenTrue()
         {
             var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
-                new GoldLapelOptions { EnableL2ForWrappers = true });
-            Assert.Contains("--enable-l2-for-wrappers", gl.BuildSpawnArgs());
+                new GoldLapelOptions { EnableProxyCacheForWrappers = true });
+            Assert.Contains("--enable-proxy-cache-for-wrappers", gl.BuildSpawnArgs());
         }
 
-        // ─── DisableL1 ──────────────────────────────────────────────────
+        // ─── DisableNativeCache ─────────────────────────────────────────
         //
-        // DisableL1 is a wrapper-only knob — there is no --disable-l1 flag
-        // on the proxy binary. The flag toggles L1 (the wrapper's
-        // in-process NativeCache) only; the proxy stays oblivious. Argv
-        // must not gain any new tokens regardless of the option's value.
+        // DisableNativeCache is a wrapper-only knob — there is no
+        // --disable-native-cache flag on the proxy binary. The flag toggles
+        // the wrapper's in-process NativeCache only; the proxy stays
+        // oblivious. Argv must not gain any new tokens regardless of the
+        // option's value.
 
         [Fact]
-        public void DisableL1DoesNotEmitFlag()
+        public void DisableNativeCacheDoesNotEmitFlag()
         {
             var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
-                new GoldLapelOptions { DisableL1 = true });
+                new GoldLapelOptions { DisableNativeCache = true });
             var args = gl.BuildSpawnArgs();
-            Assert.DoesNotContain("--disable-l1", args);
+            Assert.DoesNotContain("--disable-native-cache", args);
             // Belt-and-suspenders: with no other options set, argv stays at
             // the four required tokens (--upstream <url> --proxy-port <n>).
             Assert.Equal(4, args.Count);
         }
 
         [Fact]
-        public void DisableL1FalseDoesNotEmitFlag()
+        public void DisableNativeCacheFalseDoesNotEmitFlag()
         {
             var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
-                new GoldLapelOptions { DisableL1 = false });
-            Assert.DoesNotContain("--disable-l1", gl.BuildSpawnArgs());
+                new GoldLapelOptions { DisableNativeCache = false });
+            Assert.DoesNotContain("--disable-native-cache", gl.BuildSpawnArgs());
         }
 
         // ─── Silent ─────────────────────────────────────────────────────
@@ -1404,8 +1408,8 @@ namespace GoldLapel.Tests
                     ConfigFile = "/tmp/cfg.toml",
                     Mesh = true,
                     MeshTag = "east",
-                    EnableL2ForWrappers = true,
-                    DisableL1 = true,
+                    EnableProxyCacheForWrappers = true,
+                    DisableNativeCache = true,
                 });
             var args = gl.BuildSpawnArgs();
             Assert.Equal("17932", ValueAfter(args, "--proxy-port"));
@@ -1418,10 +1422,10 @@ namespace GoldLapel.Tests
             Assert.Equal("/tmp/cfg.toml", ValueAfter(args, "--config"));
             Assert.Contains("--mesh", args);
             Assert.Equal("east", ValueAfter(args, "--mesh-tag"));
-            Assert.Contains("--enable-l2-for-wrappers", args);
-            // DisableL1 is wrapper-only — must not leak into argv even when
-            // every other option is set.
-            Assert.DoesNotContain("--disable-l1", args);
+            Assert.Contains("--enable-proxy-cache-for-wrappers", args);
+            // DisableNativeCache is wrapper-only — must not leak into argv
+            // even when every other option is set.
+            Assert.DoesNotContain("--disable-native-cache", args);
         }
     }
 }
