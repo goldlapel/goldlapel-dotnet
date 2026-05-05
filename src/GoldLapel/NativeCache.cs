@@ -279,8 +279,6 @@ namespace GoldLapel
         internal const double EvictRateHigh = 0.5; // 50% of recent puts evicted → cache_full
         internal const double EvictRateLow = 0.1;  // ≤ 10% → cache_recovered
 
-        private static readonly Regex TxStart = new Regex(@"^\s*(BEGIN|START\s+TRANSACTION)\b", RegexOptions.IgnoreCase);
-        private static readonly Regex TxEnd = new Regex(@"^\s*(COMMIT|ROLLBACK|END)\b", RegexOptions.IgnoreCase);
         private static readonly Regex TablePattern = new Regex(@"\b(?:FROM|JOIN)\s+(?:ONLY\s+)?(?:(\w+)\.)?(\w+)", RegexOptions.IgnoreCase);
 
         private static readonly HashSet<string> SqlKeywords = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
@@ -871,33 +869,96 @@ namespace GoldLapel
             return tables;
         }
 
-        internal static bool IsTxStart(string sql) { return TxStart.IsMatch(sql); }
-        internal static bool IsTxEnd(string sql) { return TxEnd.IsMatch(sql); }
+        // Tokens that flip the wrapper's per-connection InTransaction
+        // flag. Lowercased for case-insensitive matching against the
+        // first non-whitespace token of each segment.
+        private static readonly HashSet<string> TxStartTokens =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            { "BEGIN", "START", "SAVEPOINT" };
+        private static readonly HashSet<string> TxEndTokens =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            { "COMMIT", "ROLLBACK", "RELEASE", "END" };
+
+        /// <summary>
+        /// Walk every statement segment in <paramref name="sql"/> and
+        /// return the final wrapper-side <c>InTransaction</c> state change.
+        /// Returns <c>true</c> if the last tx-relevant segment is a tx
+        /// start (<c>BEGIN</c> / <c>START TRANSACTION</c> / <c>SAVEPOINT</c>),
+        /// <c>false</c> if it's a tx end (<c>COMMIT</c> / <c>ROLLBACK</c> /
+        /// <c>RELEASE</c> / <c>END</c>), or <c>null</c> if no segment
+        /// matches (no flag change). Last-segment-wins so a multi-statement
+        /// body like <c>BEGIN; INSERT...; COMMIT</c> correctly settles to
+        /// out-of-transaction at the end — the pre-fix single-token check
+        /// only saw <c>BEGIN</c> and left the wrapper stuck in
+        /// <c>InTransaction = true</c> forever, bypassing cache reads
+        /// permanently. <c>SAVEPOINT</c> and <c>RELEASE</c> are treated as
+        /// start/end markers respectively per the cross-wrapper spec; this
+        /// is conservative for the common <c>BEGIN; SAVEPOINT a; ...; RELEASE
+        /// a; COMMIT</c> pattern and contrived <c>RELEASE</c>-without-final-
+        /// <c>COMMIT</c> bodies are out-of-scope (rare and would already be
+        /// cache-unsafe under the pre-fix flow too).
+        /// </summary>
+        internal static bool? DetectTxTransition(string sql)
+        {
+            if (string.IsNullOrEmpty(sql)) return null;
+
+            // Single-statement fast path: avoid SplitStatements when there's
+            // no `;` at all. The splitter handles quoted `;` correctly but
+            // the overwhelming majority of SQL is single-statement.
+            var hasSemi = sql.IndexOf(';') >= 0;
+            var segments = hasSemi ? SplitStatements(sql) : new List<string> { sql };
+
+            bool? final = null;
+            foreach (var seg in segments)
+            {
+                var first = FirstToken(seg);
+                if (first == null) continue;
+                if (TxStartTokens.Contains(first)) final = true;
+                else if (TxEndTokens.Contains(first)) final = false;
+            }
+            return final;
+        }
+
+        // Return the first whitespace-delimited token of <paramref name="sql"/>
+        // (uppercase-preserved — caller does case-insensitive compare),
+        // or <c>null</c> for empty/whitespace input. Used by
+        // DetectTxTransition to inspect the head of each segment without
+        // allocating a full token array.
+        private static string FirstToken(string sql)
+        {
+            if (string.IsNullOrEmpty(sql)) return null;
+            int i = 0;
+            while (i < sql.Length && char.IsWhiteSpace(sql[i])) i++;
+            int start = i;
+            while (i < sql.Length && !char.IsWhiteSpace(sql[i]) && sql[i] != ';') i++;
+            return i > start ? sql.Substring(start, i - start) : null;
+        }
 
         // Session-state commands whose responses are not cacheable. SET /
         // RESET / LISTEN / UNLISTEN / NOTIFY return empty rowsets but
         // would otherwise satisfy the "rows + columns are non-null" gate
         // in CacheAndReturn — caching them bloats the cache with no-row
         // entries that never serve real data and costs needless eviction
-        // pressure on chatty sessions. BEGIN/COMMIT/ROLLBACK/SAVEPOINT are
-        // listed for parity with the cross-wrapper spec; the existing TX
-        // short-circuit already handles BEGIN/COMMIT/ROLLBACK before any
-        // cache path runs, but listing them here keeps the helper
-        // self-contained. Mirrors the cross-wrapper fix
-        // (docs/todos/wrapper-cache-set-responses.md).
+        // pressure on chatty sessions. BEGIN/COMMIT/ROLLBACK/SAVEPOINT
+        // are also listed: after the multi-segment tx-flag fix removed
+        // the early-return short-circuit, bare BEGIN/COMMIT/ROLLBACK now
+        // flow through to CacheAndReturn, and this filter is what keeps
+        // their empty rowsets out of the cache. Mirrors the cross-wrapper
+        // fix (docs/todos/wrapper-cache-set-responses.md).
         private static readonly HashSet<string> SessionStateCommands =
             new HashSet<string>(StringComparer.OrdinalIgnoreCase)
             {
                 "SET", "RESET", "LISTEN", "UNLISTEN", "NOTIFY",
-                "BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT",
+                "BEGIN", "START", "COMMIT", "ROLLBACK", "END",
+                "SAVEPOINT", "RELEASE",
             };
 
         /// <summary>
         /// Return true when the SQL's first token is a session-state
         /// command (SET / RESET / LISTEN / UNLISTEN / NOTIFY / BEGIN /
-        /// COMMIT / ROLLBACK / SAVEPOINT). Used to skip cache-put on
-        /// commands whose responses are empty rowsets and have no value
-        /// as cached entries.
+        /// START / COMMIT / ROLLBACK / END / SAVEPOINT / RELEASE). Used
+        /// to skip cache-put on commands whose responses are empty
+        /// rowsets and have no value as cached entries.
         /// </summary>
         internal static bool IsSessionStateCommand(string sql)
         {

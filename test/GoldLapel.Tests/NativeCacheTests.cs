@@ -94,17 +94,124 @@ namespace GoldLapel.Tests
         }
     }
 
-    // ── Transaction detection ────────────────────────────────
+    // ── DetectTxTransition ───────────────────────────────────
+    //
+    // Multi-segment tx-flag bookkeeping. The legacy IsTxStart/IsTxEnd
+    // checks only the first token, so a multi-statement body like
+    // `BEGIN; INSERT...; COMMIT` flips the wrapper-side InTransaction
+    // flag based on `BEGIN` alone — server ends out-of-tx, wrapper
+    // thinks still in tx, cache is bypassed forever. DetectTxTransition
+    // walks every segment and returns the final state change so the
+    // wrapper settles to the correct InTransaction value.
 
-    public class TxDetectionTest
+    public class DetectTxTransitionTest
     {
-        [Fact] public void Begin() => Assert.True(NativeCache.IsTxStart("BEGIN"));
-        [Fact] public void StartTransaction() => Assert.True(NativeCache.IsTxStart("START TRANSACTION"));
-        [Fact] public void Commit() => Assert.True(NativeCache.IsTxEnd("COMMIT"));
-        [Fact] public void Rollback() => Assert.True(NativeCache.IsTxEnd("ROLLBACK"));
-        [Fact] public void End() => Assert.True(NativeCache.IsTxEnd("END"));
-        [Fact] public void SavepointNotStart() => Assert.False(NativeCache.IsTxStart("SAVEPOINT x"));
-        [Fact] public void SelectNotStart() => Assert.False(NativeCache.IsTxStart("SELECT 1"));
+        [Fact] public void EmptyReturnsNull()
+            => Assert.Null(NativeCache.DetectTxTransition(""));
+
+        [Fact] public void NullReturnsNull()
+            => Assert.Null(NativeCache.DetectTxTransition(null));
+
+        [Fact] public void WhitespaceReturnsNull()
+            => Assert.Null(NativeCache.DetectTxTransition("   "));
+
+        [Fact] public void PlainSelectReturnsNull()
+            => Assert.Null(NativeCache.DetectTxTransition("SELECT * FROM orders"));
+
+        [Fact] public void SingleBeginIsStart()
+            => Assert.True(NativeCache.DetectTxTransition("BEGIN"));
+
+        [Fact] public void SingleStartTransactionIsStart()
+            => Assert.True(NativeCache.DetectTxTransition("START TRANSACTION"));
+
+        [Fact] public void SingleCommitIsEnd()
+            => Assert.False(NativeCache.DetectTxTransition("COMMIT"));
+
+        [Fact] public void SingleRollbackIsEnd()
+            => Assert.False(NativeCache.DetectTxTransition("ROLLBACK"));
+
+        [Fact] public void SingleEndIsEnd()
+            => Assert.False(NativeCache.DetectTxTransition("END"));
+
+        [Fact] public void SingleSavepointIsStart()
+            => Assert.True(NativeCache.DetectTxTransition("SAVEPOINT s1"));
+
+        [Fact] public void SingleReleaseIsEnd()
+            => Assert.False(NativeCache.DetectTxTransition("RELEASE SAVEPOINT s1"));
+
+        [Fact] public void CaseInsensitive()
+        {
+            Assert.True(NativeCache.DetectTxTransition("begin"));
+            Assert.False(NativeCache.DetectTxTransition("commit"));
+        }
+
+        // ── The headline regression: multi-statement BEGIN/COMMIT ──
+        //
+        // Pre-fix bug: only the first token (BEGIN) was inspected, so
+        // the wrapper got stuck in InTransaction=true after the body
+        // completed. Fix: last-segment-wins yields the correct final
+        // out-of-tx state.
+
+        [Fact] public void BeginInsertCommitSettlesEnd()
+        {
+            var t = NativeCache.DetectTxTransition("BEGIN; INSERT INTO orders VALUES (1); COMMIT");
+            Assert.False(t);
+        }
+
+        [Fact] public void BeginInsertRollbackSettlesEnd()
+        {
+            var t = NativeCache.DetectTxTransition("BEGIN; INSERT INTO orders VALUES (1); ROLLBACK");
+            Assert.False(t);
+        }
+
+        [Fact] public void BeginWithoutCommitStaysStart()
+        {
+            // `BEGIN; SELECT 1` — only BEGIN is tx-relevant; SELECT
+            // doesn't flip the flag. Final state should be true.
+            var t = NativeCache.DetectTxTransition("BEGIN; SELECT 1");
+            Assert.True(t);
+        }
+
+        [Fact] public void CommitWithoutBeginStaysEnd()
+        {
+            // `SELECT 1; COMMIT` — final segment is COMMIT, transition false.
+            var t = NativeCache.DetectTxTransition("SELECT 1; COMMIT");
+            Assert.False(t);
+        }
+
+        [Fact] public void NestedSavepointReleaseCommit()
+        {
+            // `BEGIN; SAVEPOINT a; INSERT...; RELEASE a; COMMIT` — last
+            // tx-relevant segment is COMMIT (false). Settles correctly.
+            var t = NativeCache.DetectTxTransition(
+                "BEGIN; SAVEPOINT a; INSERT INTO orders VALUES (1); RELEASE SAVEPOINT a; COMMIT");
+            Assert.False(t);
+        }
+
+        [Fact] public void SetThenSelectNoTxChange()
+        {
+            // `SET app.user_id = '42'; SELECT 1` — no tx-relevant tokens.
+            var t = NativeCache.DetectTxTransition("SET app.user_id = '42'; SELECT 1");
+            Assert.Null(t);
+        }
+
+        [Fact] public void SemicolonInsideStringLiteralNotSplit()
+        {
+            // The splitter respects `'...'` literals — a `;` inside a
+            // literal must not be treated as a segment boundary.
+            // `SELECT 'BEGIN; COMMIT'` has no real tx token outside the
+            // literal.
+            var t = NativeCache.DetectTxTransition("SELECT 'BEGIN; COMMIT' FROM logs");
+            Assert.Null(t);
+        }
+
+        [Fact] public void TrailingSemicolonHarmless()
+        {
+            // Trailing `;` produces an empty final segment that the
+            // splitter drops; should not interfere with the prior tx
+            // segment's classification.
+            Assert.False(NativeCache.DetectTxTransition("BEGIN; INSERT INTO t VALUES (1); COMMIT;"));
+        }
     }
 
     // ── Cache operations ─────────────────────────────────────
@@ -1360,6 +1467,12 @@ namespace GoldLapel.Tests
         [Fact] public void Commit() => Assert.True(NativeCache.IsSessionStateCommand("COMMIT"));
         [Fact] public void Rollback() => Assert.True(NativeCache.IsSessionStateCommand("ROLLBACK"));
         [Fact] public void Savepoint() => Assert.True(NativeCache.IsSessionStateCommand("SAVEPOINT sp1"));
+        // After the multi-segment tx-flag fix removed the early-return
+        // short-circuit, START/END/RELEASE also flow through the cache
+        // path and must be filtered to keep their empty rowsets out.
+        [Fact] public void StartTransaction() => Assert.True(NativeCache.IsSessionStateCommand("START TRANSACTION"));
+        [Fact] public void End() => Assert.True(NativeCache.IsSessionStateCommand("END"));
+        [Fact] public void Release() => Assert.True(NativeCache.IsSessionStateCommand("RELEASE SAVEPOINT sp1"));
         [Fact] public void CaseInsensitive() => Assert.True(NativeCache.IsSessionStateCommand("set app.user_id = '42'"));
         [Fact] public void LeadingWhitespace() => Assert.True(NativeCache.IsSessionStateCommand("   SET foo = 'bar'"));
         [Fact] public void Select() => Assert.False(NativeCache.IsSessionStateCommand("SELECT * FROM orders"));

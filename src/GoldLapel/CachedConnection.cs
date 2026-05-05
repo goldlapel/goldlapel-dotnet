@@ -172,17 +172,15 @@ namespace GoldLapel
             var sql = CommandText ?? "";
             var cache = _conn.Cache;
 
-            // Transaction tracking via SQL
-            if (NativeCache.IsTxStart(sql))
-            {
-                _conn.InTransaction = true;
-                return _inner.ExecuteReader(behavior);
-            }
-            if (NativeCache.IsTxEnd(sql))
-            {
-                _conn.InTransaction = false;
-                return _inner.ExecuteReader(behavior);
-            }
+            // Transaction tracking via SQL — walk all segments so a
+            // multi-statement body like `BEGIN; INSERT...; COMMIT`
+            // settles to the correct final InTransaction state. The
+            // pre-fix single-token check only saw the first token (BEGIN)
+            // and left the wrapper stuck in InTransaction=true forever,
+            // bypassing cache reads permanently after the body completed.
+            // See NativeCache.DetectTxTransition.
+            var txFinal = NativeCache.DetectTxTransition(sql);
+            if (txFinal.HasValue) _conn.InTransaction = txFinal.Value;
 
             // GUC-RLS cache safety: observe every SQL for SET / RESET so
             // the per-connection state hash is up to date before the
@@ -229,10 +227,9 @@ namespace GoldLapel
             var sql = CommandText ?? "";
             var cache = _conn.Cache;
 
-            if (NativeCache.IsTxStart(sql))
-                _conn.InTransaction = true;
-            else if (NativeCache.IsTxEnd(sql))
-                _conn.InTransaction = false;
+            // Multi-segment tx transition: see ExecuteDbDataReader.
+            var txFinal = NativeCache.DetectTxTransition(sql);
+            if (txFinal.HasValue) _conn.InTransaction = txFinal.Value;
 
             // GUC-RLS cache safety: see ExecuteDbDataReader.
             _conn.GucState.ObserveSql(sql);
@@ -254,10 +251,9 @@ namespace GoldLapel
             var sql = CommandText ?? "";
             var cache = _conn.Cache;
 
-            if (NativeCache.IsTxStart(sql))
-                _conn.InTransaction = true;
-            else if (NativeCache.IsTxEnd(sql))
-                _conn.InTransaction = false;
+            // Multi-segment tx transition: see ExecuteDbDataReader.
+            var txFinal = NativeCache.DetectTxTransition(sql);
+            if (txFinal.HasValue) _conn.InTransaction = txFinal.Value;
 
             // GUC-RLS cache safety: see ExecuteDbDataReader.
             _conn.GucState.ObserveSql(sql);
