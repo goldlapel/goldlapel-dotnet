@@ -1239,6 +1239,87 @@ namespace GoldLapel.Tests
         }
     }
 
+    // ── DetectWritesMulti ────────────────────────────────────
+    //
+    // Multi-statement Q-message write detection. The single-statement
+    // DetectWrite() looks at the first token only, so a body like
+    // `SET foo = '42'; INSERT INTO orders ...` would slip past write
+    // detection and let stale `orders` cache entries survive the
+    // INSERT. DetectWritesMulti unions across segments.
+
+    public class DetectWritesMultiTest
+    {
+        [Fact] public void SingleSelectReturnsEmpty()
+            => Assert.Empty(NativeCache.DetectWritesMulti("SELECT * FROM orders"));
+
+        [Fact] public void SingleInsertReturnsTable()
+        {
+            var w = NativeCache.DetectWritesMulti("INSERT INTO orders VALUES (1)");
+            Assert.Single(w);
+            Assert.Contains("orders", w);
+        }
+
+        [Fact] public void SetThenInsertCatchesInsert()
+        {
+            var w = NativeCache.DetectWritesMulti("SET app.user_id = '42'; INSERT INTO orders VALUES (1)");
+            Assert.Single(w);
+            Assert.Contains("orders", w);
+        }
+
+        [Fact] public void TwoInsertsUnionsTables()
+        {
+            var w = NativeCache.DetectWritesMulti("INSERT INTO orders VALUES (1); INSERT INTO line_items VALUES (1)");
+            Assert.Equal(2, w.Count);
+            Assert.Contains("orders", w);
+            Assert.Contains("line_items", w);
+        }
+
+        [Fact] public void DdlAnywhereShortCircuits()
+        {
+            var w = NativeCache.DetectWritesMulti("INSERT INTO orders VALUES (1); CREATE TABLE foo (id int)");
+            Assert.Single(w);
+            Assert.Contains(NativeCache.DdlSentinel, w);
+        }
+
+        [Fact] public void DdlFirstShortCircuits()
+        {
+            var w = NativeCache.DetectWritesMulti("DROP TABLE foo; INSERT INTO orders VALUES (1)");
+            Assert.Single(w);
+            Assert.Contains(NativeCache.DdlSentinel, w);
+        }
+
+        [Fact] public void TxBracketedInsertStillDetected()
+        {
+            var w = NativeCache.DetectWritesMulti("BEGIN; INSERT INTO orders VALUES (1); COMMIT");
+            Assert.Single(w);
+            Assert.Contains("orders", w);
+        }
+
+        [Fact] public void AllReadsReturnsEmpty()
+        {
+            var w = NativeCache.DetectWritesMulti("SELECT 1; SELECT * FROM orders; SELECT 2");
+            Assert.Empty(w);
+        }
+
+        [Fact] public void EmptyInputReturnsEmpty()
+        {
+            Assert.Empty(NativeCache.DetectWritesMulti(""));
+            Assert.Empty(NativeCache.DetectWritesMulti("   "));
+        }
+
+        [Fact] public void SemicolonInsideStringLiteralNotSplit()
+        {
+            // `INSERT INTO orders VALUES ('a;b')` is a single statement;
+            // the `;` inside the literal must not be treated as a split.
+            var w = NativeCache.DetectWritesMulti("INSERT INTO orders VALUES ('a;b')");
+            Assert.Single(w);
+            Assert.Contains("orders", w);
+        }
+
+        [Fact] public void NullInputReturnsEmpty()
+            => Assert.Empty(NativeCache.DetectWritesMulti(null));
+    }
+
     public class ConnectionGucStateTest
     {
         [Fact] public void EmptyStateHashIsZero()

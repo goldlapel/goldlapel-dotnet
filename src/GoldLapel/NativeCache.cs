@@ -813,6 +813,43 @@ namespace GoldLapel
         internal static bool IsTxStart(string sql) { return TxStart.IsMatch(sql); }
         internal static bool IsTxEnd(string sql) { return TxEnd.IsMatch(sql); }
 
+        /// <summary>
+        /// Run <see cref="DetectWrite"/> over each statement in a
+        /// possibly-multi-statement SQL body and return the union of
+        /// affected tables. Returns a set containing
+        /// <see cref="DdlSentinel"/> as soon as any segment is DDL, so
+        /// callers can short-circuit to <c>InvalidateAll()</c>. Returns
+        /// an empty set for read-only or non-write SQL. Mirrors the
+        /// cross-wrapper fix
+        /// (docs/todos/wrapper-multistatement-write-detection.md).
+        /// </summary>
+        internal static HashSet<string> DetectWritesMulti(string sql)
+        {
+            var result = new HashSet<string>();
+            if (string.IsNullOrEmpty(sql)) return result;
+
+            // Single-statement fast path: avoid the splitter overhead when
+            // there's no `;` at all. The splitter handles quoted `;`
+            // correctly, but the overwhelming majority of queries are
+            // single-statement and we want to keep the hot path tight.
+            var hasSemi = sql.IndexOf(';') >= 0;
+            var segments = hasSemi ? SplitStatements(sql) : new List<string> { sql };
+
+            foreach (var seg in segments)
+            {
+                var t = DetectWrite(seg);
+                if (t == null) continue;
+                if (t == DdlSentinel)
+                {
+                    result.Clear();
+                    result.Add(DdlSentinel);
+                    return result;
+                }
+                result.Add(t);
+            }
+            return result;
+        }
+
         // ── Unsafe-GUC classification + SET parsing ───────────────
         //
         // Mirrors the proxy's guc_state.rs. See ConnectionGucState class

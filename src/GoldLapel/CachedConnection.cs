@@ -192,14 +192,17 @@ namespace GoldLapel
             // new state hash.
             _conn.GucState.ObserveSql(sql);
 
-            // Write detection
-            var writeTable = NativeCache.DetectWrite(sql);
-            if (writeTable != null)
+            // Write detection — run per-segment so multi-statement bodies
+            // like `SET app.user_id = '42'; INSERT INTO orders VALUES (1)`
+            // still trigger invalidation for the INSERT segment. See
+            // NativeCache.DetectWritesMulti.
+            var writes = NativeCache.DetectWritesMulti(sql);
+            if (writes.Count > 0)
             {
-                if (writeTable == NativeCache.DdlSentinel)
+                if (writes.Contains(NativeCache.DdlSentinel))
                     cache.InvalidateAll();
                 else
-                    cache.InvalidateTable(writeTable);
+                    foreach (var t in writes) cache.InvalidateTable(t);
                 return _inner.ExecuteReader(behavior);
             }
 
@@ -234,13 +237,14 @@ namespace GoldLapel
             // GUC-RLS cache safety: see ExecuteDbDataReader.
             _conn.GucState.ObserveSql(sql);
 
-            var writeTable = NativeCache.DetectWrite(sql);
-            if (writeTable != null)
+            // Multi-segment write detection: see ExecuteDbDataReader.
+            var writes = NativeCache.DetectWritesMulti(sql);
+            if (writes.Count > 0)
             {
-                if (writeTable == NativeCache.DdlSentinel)
+                if (writes.Contains(NativeCache.DdlSentinel))
                     cache.InvalidateAll();
                 else
-                    cache.InvalidateTable(writeTable);
+                    foreach (var t in writes) cache.InvalidateTable(t);
             }
             return _inner.ExecuteNonQuery();
         }
@@ -258,13 +262,14 @@ namespace GoldLapel
             // GUC-RLS cache safety: see ExecuteDbDataReader.
             _conn.GucState.ObserveSql(sql);
 
-            var writeTable = NativeCache.DetectWrite(sql);
-            if (writeTable != null)
+            // Multi-segment write detection: see ExecuteDbDataReader.
+            var writes = NativeCache.DetectWritesMulti(sql);
+            if (writes.Count > 0)
             {
-                if (writeTable == NativeCache.DdlSentinel)
+                if (writes.Contains(NativeCache.DdlSentinel))
                     cache.InvalidateAll();
                 else
-                    cache.InvalidateTable(writeTable);
+                    foreach (var t in writes) cache.InvalidateTable(t);
             }
             return _inner.ExecuteScalar();
         }

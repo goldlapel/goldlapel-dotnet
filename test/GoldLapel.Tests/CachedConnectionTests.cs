@@ -434,6 +434,94 @@ namespace GoldLapel.Tests
 
             Assert.NotEqual(0L, conn.GucState.StateHash);
         }
+
+        // ── Multi-statement write detection (cross-wrapper bug fix) ──
+        //
+        // The old single-token DetectWrite() looks at the first token of
+        // the SQL only. A body like
+        // `SET app.user_id = '42'; INSERT INTO orders VALUES (1)` would
+        // see SET and slip past write detection, leaving stale `orders`
+        // cache entries alive across the INSERT. Each path
+        // (ExecuteReader, ExecuteNonQuery, ExecuteScalar) now runs
+        // DetectWritesMulti and unions invalidations across segments.
+
+        [Fact]
+        public void MultiStatementInsertInvalidatesViaExecuteNonQuery()
+        {
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            cache.Put("SELECT * FROM orders", null,
+                new[] { new object[] { 1 } }, new[] { "id" });
+            Assert.Equal(1, cache.Size);
+
+            var inner = new FakeConnection();
+            var conn = new CachedConnection(inner, cache);
+            var cmd = conn.CreateCommand();
+            cmd.CommandText = "SET app.user_id = '42'; INSERT INTO orders VALUES (1)";
+            inner.NextNonQueryResult = 1;
+            cmd.ExecuteNonQuery();
+
+            // The INSERT segment must trigger orders invalidation.
+            Assert.Equal(0, cache.Size);
+        }
+
+        [Fact]
+        public void MultiStatementInsertInvalidatesViaExecuteReader()
+        {
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            cache.Put("SELECT * FROM orders", null,
+                new[] { new object[] { 1 } }, new[] { "id" });
+            Assert.Equal(1, cache.Size);
+
+            var inner = new FakeConnection();
+            inner.NextReader = new FakeDataReader(new object[0][], new string[0]);
+            var conn = new CachedConnection(inner, cache);
+            var cmd = conn.CreateCommand();
+            cmd.CommandText = "SET app.user_id = '42'; INSERT INTO orders VALUES (1)";
+            cmd.ExecuteReader();
+
+            Assert.Equal(0, cache.Size);
+        }
+
+        [Fact]
+        public void MultiStatementInsertInvalidatesViaExecuteScalar()
+        {
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            cache.Put("SELECT * FROM orders", null,
+                new[] { new object[] { 1 } }, new[] { "id" });
+
+            var inner = new FakeConnection();
+            var conn = new CachedConnection(inner, cache);
+            var cmd = conn.CreateCommand();
+            cmd.CommandText = "SET app.user_id = '42'; INSERT INTO orders VALUES (1)";
+            cmd.ExecuteScalar();
+
+            Assert.Equal(0, cache.Size);
+        }
+
+        [Fact]
+        public void MultiStatementDdlInvalidatesAll()
+        {
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            cache.Put("SELECT * FROM users", null,
+                new[] { new object[] { 1 } }, new[] { "id" });
+            cache.Put("SELECT * FROM orders", null,
+                new[] { new object[] { 1 } }, new[] { "id" });
+            Assert.Equal(2, cache.Size);
+
+            var inner = new FakeConnection();
+            var conn = new CachedConnection(inner, cache);
+            var cmd = conn.CreateCommand();
+            cmd.CommandText = "INSERT INTO orders VALUES (1); CREATE TABLE foo (id int)";
+            inner.NextNonQueryResult = 0;
+            cmd.ExecuteNonQuery();
+
+            // DDL anywhere → invalidate all.
+            Assert.Equal(0, cache.Size);
+        }
     }
 
     // ── CachedCommand.DbConnection setter ─────────────────────
