@@ -94,17 +94,6 @@ namespace GoldLapel
         public string MeshTag { get; set; }
 
         /// <summary>
-        /// When <c>true</c>, the proxy keeps its proxy-cache active for
-        /// wrapper traffic instead of skipping it (the wrapper-skip is the
-        /// default since per-connection wrapper-skip shipped). For fleet
-        /// deployments — multi-pod, frequent restarts, mesh — the proxy
-        /// cache still adds value as a shared cache across wrapper
-        /// processes. Equivalent CLI flag:
-        /// <c>--enable-proxy-cache-for-wrappers</c>.
-        /// </summary>
-        public bool EnableProxyCacheForWrappers { get; set; }
-
-        /// <summary>
         /// When <c>true</c>, the wrapper's in-process native cache is
         /// bypassed — <see cref="NativeCache.Get"/> returns null (ticking
         /// misses) and <see cref="NativeCache.Put"/> is a silent no-op.
@@ -115,6 +104,36 @@ namespace GoldLapel
         /// layer off. Wrapper-only — no equivalent CLI flag on the proxy.
         /// </summary>
         public bool DisableNativeCache { get; set; }
+
+        /// <summary>
+        /// When <c>true</c>, disable the proxy's result cache (the
+        /// origin-side L2 cache). Maps 1:1 to the proxy's
+        /// <c>--disable-proxy-cache</c> CLI flag. Promoted to a top-level
+        /// option (Model B): the caller flips a single boolean instead of
+        /// reaching into the structured <c>Config</c> map.
+        /// </summary>
+        public bool DisableProxyCache { get; set; }
+
+        /// <summary>
+        /// When <c>true</c>, disable the proxy's materialized-view layer
+        /// (no auto-discovery, no MV-rewrite). Maps 1:1 to
+        /// <c>--disable-matviews</c>.
+        /// </summary>
+        public bool DisableMatviews { get; set; }
+
+        /// <summary>
+        /// When <c>true</c>, disable the proxy's SQL-optimization master
+        /// switch (rewrite, shadow-mode, coalescing). Maps 1:1 to
+        /// <c>--disable-sqloptimize</c>.
+        /// </summary>
+        public bool DisableSqloptimize { get; set; }
+
+        /// <summary>
+        /// When <c>true</c>, disable the proxy's auto-index discovery
+        /// (btree / trigram / expression / partial). Maps 1:1 to
+        /// <c>--disable-auto-indexes</c>.
+        /// </summary>
+        public bool DisableAutoIndexes { get; set; }
     }
 
     /// <summary>
@@ -143,20 +162,20 @@ namespace GoldLapel
             "poolMode", "mgmtIdleTimeout", "fallback", "readAfterWriteSecs",
             "n1Threshold", "n1WindowMs", "n1CrossThreshold",
             "tlsCert", "tlsKey", "tlsClientCa",
-            "disableMatviews", "disableConsolidation", "disableBtreeIndexes",
+            "disableConsolidation", "disableBtreeIndexes",
             "disableTrigramIndexes", "disableExpressionIndexes",
             "disablePartialIndexes", "disableRewrite", "disableRewritePreparedCache",
-            "disableProxyCache", "disablePool",
+            "disablePool",
             "disableN1", "disableN1CrossConnection", "disableShadowMode",
             "enableCoalescing", "replica", "excludeTables"
         });
 
         private static readonly HashSet<string> BooleanKeys = new HashSet<string>(new[]
         {
-            "disableMatviews", "disableConsolidation", "disableBtreeIndexes",
+            "disableConsolidation", "disableBtreeIndexes",
             "disableTrigramIndexes", "disableExpressionIndexes",
             "disablePartialIndexes", "disableRewrite", "disableRewritePreparedCache",
-            "disableProxyCache", "disablePool",
+            "disablePool",
             "disableN1", "disableN1CrossConnection", "disableShadowMode",
             "enableCoalescing"
         });
@@ -194,8 +213,11 @@ namespace GoldLapel
         private readonly bool _silent;
         private readonly bool _mesh;
         private readonly string _meshTag;
-        private readonly bool _enableProxyCacheForWrappers;
         private readonly bool _disableNativeCache;
+        private readonly bool _disableProxyCache;
+        private readonly bool _disableMatviews;
+        private readonly bool _disableSqloptimize;
+        private readonly bool _disableAutoIndexes;
         private Process _process;
         private string _proxyUrl;
         private bool _disposed;
@@ -237,20 +259,21 @@ namespace GoldLapel
             // Mesh membership — startup intent (HQ enforces license).
             _mesh = options.Mesh;
             _meshTag = string.IsNullOrEmpty(options.MeshTag) ? null : options.MeshTag;
-            // The proxy-cache is skipped for wrapper traffic by default
-            // (per-connection skip via the application_name marker). Setting
-            // this to true forces the proxy to keep its proxy-cache on for
-            // wrappers — the shared-cache wins for fleet customers
-            // (multi-pod, frequent restarts, mesh) outweigh the per-process
-            // native-cache redundancy.
-            _enableProxyCacheForWrappers = options.EnableProxyCacheForWrappers;
-            // Native-cache (wrapper-side) explicit disable. Unlike
-            // --enable-proxy-cache-for-wrappers, this is a wrapper-only knob —
+            // Native-cache (wrapper-side) explicit disable. Wrapper-only knob —
             // the proxy has no equivalent CLI flag. The flag is pushed onto
             // the NativeCache singleton in SpawnAsync so it's set before the
             // invalidation socket connects (the very first wrapper_connected
             // snapshot then carries the correct `disabled` field).
             _disableNativeCache = options.DisableNativeCache;
+            // Promoted disable flags (Model B). Each maps 1:1 to a proxy
+            // CLI flag. Top-level so the canonical-surface caller flips a
+            // single boolean instead of stuffing a boolean into the
+            // structured `Config` map. Removed from ValidConfigKeys/BooleanKeys
+            // simultaneously — atomic break, no aliases.
+            _disableProxyCache = options.DisableProxyCache;
+            _disableMatviews = options.DisableMatviews;
+            _disableSqloptimize = options.DisableSqloptimize;
+            _disableAutoIndexes = options.DisableAutoIndexes;
             // Dashboard defaults to proxy port + 1 (matches what the Rust binary
             // binds when no --dashboard-port is passed). A user-supplied value
             // on the top-level DashboardPort option overrides the derivation.
@@ -325,8 +348,11 @@ namespace GoldLapel
         // Test-only accessors for mesh wiring.
         internal bool IsMesh => _mesh;
         internal string MeshTag => _meshTag;
-        internal bool IsEnableProxyCacheForWrappers => _enableProxyCacheForWrappers;
         internal bool IsDisableNativeCache => _disableNativeCache;
+        internal bool IsDisableProxyCache => _disableProxyCache;
+        internal bool IsDisableMatviews => _disableMatviews;
+        internal bool IsDisableSqloptimize => _disableSqloptimize;
+        internal bool IsDisableAutoIndexes => _disableAutoIndexes;
 
         // ── Factory ─────────────────────────────────────────────────
 
@@ -619,9 +645,24 @@ namespace GoldLapel
                 args.Add("--mesh-tag");
                 args.Add(_meshTag);
             }
-            if (_enableProxyCacheForWrappers)
+            // Promoted disable flags. Each emits its proxy CLI flag 1:1
+            // when set. Order is alphabetical (matches the proxy's
+            // declaration order in main.rs) for predictable argv-diffs.
+            if (_disableAutoIndexes)
             {
-                args.Add("--enable-proxy-cache-for-wrappers");
+                args.Add("--disable-auto-indexes");
+            }
+            if (_disableMatviews)
+            {
+                args.Add("--disable-matviews");
+            }
+            if (_disableProxyCache)
+            {
+                args.Add("--disable-proxy-cache");
+            }
+            if (_disableSqloptimize)
+            {
+                args.Add("--disable-sqloptimize");
             }
             args.AddRange(ConfigToArgs(_config));
             args.AddRange(_extraArgs);

@@ -318,6 +318,122 @@ namespace GoldLapel.Tests
 
             Assert.Equal(0, cache.Size);
         }
+
+        // ── GUC-RLS cache safety integration ─────────────────────────
+        //
+        // End-to-end through CachedConnection: a SET on an unsafe GUC
+        // updates the per-connection state hash, and subsequent SELECTs
+        // key against the new state — so two queries with the same SQL
+        // but different `app.user_id` don't share a cache slot.
+
+        [Fact]
+        public void UnsafeSetTracksOnGucState()
+        {
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var inner = new FakeConnection();
+            var conn = new CachedConnection(inner, cache);
+
+            Assert.Equal(0L, conn.GucState.StateHash);
+
+            // SET app.user_id = '42' goes through ExecuteNonQuery (no
+            // resultset); the inner FakeConnection ignores the SQL.
+            var setCmd = conn.CreateCommand();
+            setCmd.CommandText = "SET app.user_id = '42'";
+            inner.NextNonQueryResult = 0;
+            setCmd.ExecuteNonQuery();
+
+            Assert.NotEqual(0L, conn.GucState.StateHash);
+        }
+
+        [Fact]
+        public void SafeSetDoesNotPerturbGucState()
+        {
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var inner = new FakeConnection();
+            var conn = new CachedConnection(inner, cache);
+
+            var setCmd = conn.CreateCommand();
+            setCmd.CommandText = "SET timezone = 'UTC'";
+            inner.NextNonQueryResult = 0;
+            setCmd.ExecuteNonQuery();
+
+            Assert.Equal(0L, conn.GucState.StateHash);
+        }
+
+        [Fact]
+        public void SelectAfterSetUsesNewStateHashKey()
+        {
+            // Pre-populate the cache for state_hash=0 with a value the
+            // post-SET SELECT must NOT return — proves the SELECT misses
+            // and re-fetches under the new state hash.
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            cache.Put("SELECT * FROM accounts", null,
+                new[] { new object[] { "leak-row" } }, new[] { "name" }, 0);
+
+            var inner = new FakeConnection();
+            var conn = new CachedConnection(inner, cache);
+
+            // SET app.user_id moves the state hash off 0.
+            var setCmd = conn.CreateCommand();
+            setCmd.CommandText = "SET app.user_id = '42'";
+            inner.NextNonQueryResult = 0;
+            setCmd.ExecuteNonQuery();
+            Assert.NotEqual(0L, conn.GucState.StateHash);
+
+            // SELECT now misses (state hash differs), re-fetches from
+            // the inner connection. If the leak existed, "leak-row"
+            // would appear instead of "fresh-row".
+            inner.NextReader = new FakeDataReader(
+                new[] { new object[] { "fresh-row" } },
+                new[] { "name" });
+            var selCmd = conn.CreateCommand();
+            selCmd.CommandText = "SELECT * FROM accounts";
+            var reader = selCmd.ExecuteReader();
+            Assert.True(reader.Read());
+            Assert.Equal("fresh-row", reader.GetValue(0));
+        }
+
+        [Fact]
+        public void DistinctConnectionsHaveIndependentGucState()
+        {
+            // Per-connection state: SET on connection A must not affect
+            // connection B's state hash.
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var connA = new CachedConnection(new FakeConnection(), cache);
+            var connB = new CachedConnection(new FakeConnection(), cache);
+
+            var setA = connA.CreateCommand();
+            setA.CommandText = "SET app.user_id = '42'";
+            setA.ExecuteNonQuery();
+
+            Assert.NotEqual(0L, connA.GucState.StateHash);
+            Assert.Equal(0L, connB.GucState.StateHash);
+        }
+
+        [Fact]
+        public void MultiStatementSetThroughExecuteReader()
+        {
+            // `SET app.user_id = '42'; SELECT 1` arriving as one
+            // ExecuteReader: the SET segment must update state, and
+            // since the SELECT segment has no FROM, write detection
+            // doesn't trip — the inner reader is invoked.
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var inner = new FakeConnection();
+            inner.NextReader = new FakeDataReader(
+                new[] { new object[] { 1 } }, new[] { "v" });
+            var conn = new CachedConnection(inner, cache);
+
+            var cmd = conn.CreateCommand();
+            cmd.CommandText = "SET app.user_id = '42'; SELECT 1";
+            cmd.ExecuteReader();
+
+            Assert.NotEqual(0L, conn.GucState.StateHash);
+        }
     }
 
     // ── CachedCommand.DbConnection setter ─────────────────────

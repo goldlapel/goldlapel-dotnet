@@ -26,6 +26,237 @@ namespace GoldLapel
         }
     }
 
+    // ── Per-connection unsafe-GUC state tracking ────────────────────────
+    //
+    // Mirrors the proxy's `guc_state.rs` (commit `3e02359`). Custom-GUC-driven
+    // RLS (e.g. `SET app.user_id = '42'; SELECT * FROM accounts;` where the
+    // policy reads `current_setting('app.user_id')`) is a real cache leak: the
+    // wrapper's L1 cache today keys by SQL+params, so user A's cached rows
+    // could be served to user B over the same connection after a SET.
+    //
+    // We fingerprint the subset of GUC values that can change query results
+    // and fold the fingerprint into the cache key. A GUC is **unsafe** if it
+    // is in a short hardcoded list (search_path, role, isolation, etc.) OR
+    // contains a `.` (namespaced — `app.*`, `myapp.*`).
+    //
+    // SET LOCAL is intentionally ignored: cached entries only originate from
+    // outside-of-transaction reads (CachedConnection.InTransaction gates
+    // ExecuteDbDataReader caching), and SET LOCAL effects are scoped to the
+    // current transaction — they never influence a cacheable response.
+
+    /// <summary>
+    /// Parsed <c>SET</c> / <c>RESET</c> command extracted from a SQL
+    /// statement. Used by <see cref="NativeCache.ParseSetCommand"/> and the
+    /// per-connection <see cref="ConnectionGucState"/> tracker.
+    /// </summary>
+    public class SetCommand
+    {
+        public enum CommandKind { Set, SetLocal, Reset, ResetAll }
+
+        public CommandKind Kind { get; }
+        /// <summary>Lowercased GUC name. Null for <c>RESET ALL</c>.</summary>
+        public string Name { get; }
+        /// <summary>Raw value string with surrounding quotes stripped. Null for RESET / RESET ALL.</summary>
+        public string Value { get; }
+
+        private SetCommand(CommandKind kind, string name, string value)
+        {
+            Kind = kind;
+            Name = name;
+            Value = value;
+        }
+
+        internal static SetCommand Set(string name, string value) =>
+            new SetCommand(CommandKind.Set, name, value);
+        internal static SetCommand Local(string name, string value) =>
+            new SetCommand(CommandKind.SetLocal, name, value);
+        internal static SetCommand Reset(string name) =>
+            new SetCommand(CommandKind.Reset, name, null);
+        internal static SetCommand ResetAll() =>
+            new SetCommand(CommandKind.ResetAll, null, null);
+    }
+
+    /// <summary>
+    /// Per-connection unsafe-GUC state. Each <see cref="CachedConnection"/>
+    /// owns one. The cached <see cref="StateHash"/> is folded into the
+    /// L1 cache key so two connections with different unsafe-GUC values
+    /// (different <c>app.user_id</c>, different <c>role</c>, etc.) never
+    /// share a cache slot.
+    /// </summary>
+    /// <remarks>
+    /// .NET concurrency: a single <c>DbCommand</c> is not generally safe
+    /// for concurrent use, so per-connection state is effectively
+    /// single-writer. A plain <see cref="Dictionary{TKey, TValue}"/> guarded
+    /// by a private lock is the right-sized primitive — <see cref="ConcurrentDictionary{TKey, TValue}"/>
+    /// would be overkill and the recompute step needs an atomic
+    /// snapshot of the map anyway. <see cref="StateHash"/> is published
+    /// via <see cref="Interlocked.Exchange(ref long, long)"/> so a reader on
+    /// another thread (e.g. the recv loop snapshotting state) sees a
+    /// torn-free 64-bit value on 32-bit hosts.
+    /// </remarks>
+    public class ConnectionGucState
+    {
+        // BTreeMap-equivalent: ordered iteration so the hash is invariant
+        // under insertion order. SortedDictionary keys ordered by ordinal
+        // string compare (matches the Rust BTreeMap<String, String> default).
+        private readonly SortedDictionary<string, string> _values =
+            new SortedDictionary<string, string>(StringComparer.Ordinal);
+        private readonly object _lock = new object();
+        // Cached state hash. 0 for empty (baseline) state — matches the
+        // proxy's `0` for fresh connections, so a fresh wrapper connection
+        // hits the same cache slot as another connection with no unsafe
+        // GUCs set. Read via Interlocked.Read for torn-free access on
+        // 32-bit hosts; written via Interlocked.Exchange.
+        private long _stateHash;
+
+        /// <summary>
+        /// Current unsafe-GUC state hash. <c>0</c> for the empty baseline
+        /// (fresh connection or after <c>RESET ALL</c> on an empty state).
+        /// </summary>
+        public long StateHash => Interlocked.Read(ref _stateHash);
+
+        /// <summary>
+        /// Apply a parsed <see cref="SetCommand"/>. No-op for
+        /// <see cref="SetCommand.CommandKind.SetLocal"/> (transient — cache
+        /// participation is gated on transaction-idle anyway), no-op for
+        /// safe GUC names.
+        /// </summary>
+        public void Apply(SetCommand cmd)
+        {
+            if (cmd == null) return;
+            bool changed = false;
+            lock (_lock)
+            {
+                switch (cmd.Kind)
+                {
+                    case SetCommand.CommandKind.Set:
+                        if (NativeCache.IsUnsafeGuc(cmd.Name))
+                        {
+                            _values[cmd.Name] = cmd.Value;
+                            changed = true;
+                        }
+                        break;
+                    case SetCommand.CommandKind.SetLocal:
+                        // Intentionally ignored — see class remarks.
+                        break;
+                    case SetCommand.CommandKind.Reset:
+                        if (NativeCache.IsUnsafeGuc(cmd.Name) && _values.Remove(cmd.Name))
+                        {
+                            changed = true;
+                        }
+                        break;
+                    case SetCommand.CommandKind.ResetAll:
+                        if (_values.Count > 0)
+                        {
+                            _values.Clear();
+                            changed = true;
+                        }
+                        break;
+                }
+                if (changed) RecomputeHashLocked();
+            }
+        }
+
+        /// <summary>
+        /// Convenience: parse a SQL string and apply every recognised
+        /// <c>SET</c> / <c>RESET</c> it contains. Multi-statement bodies
+        /// are split on top-level <c>;</c> (string literals respected).
+        /// Returns <c>true</c> if the hash changed.
+        /// </summary>
+        public bool ObserveSql(string sql)
+        {
+            if (string.IsNullOrEmpty(sql)) return false;
+            var before = StateHash;
+
+            // Fast path for the common single-statement case — avoid
+            // allocating the segments list for every SQL that isn't a
+            // multi-statement body. Strip trailing `;`s (any number) and
+            // scan the remaining prefix for an inner top-level `;` not
+            // inside a string literal.
+            var trimmed = sql.TrimEnd();
+            while (trimmed.EndsWith(";", StringComparison.Ordinal))
+                trimmed = trimmed.Substring(0, trimmed.Length - 1).TrimEnd();
+            bool hasInnerSemicolon = false;
+            char? quote = null;
+            for (int i = 0; i < trimmed.Length; i++)
+            {
+                var c = trimmed[i];
+                if (quote.HasValue)
+                {
+                    if (c == quote.Value)
+                    {
+                        // PG's `''` doubled-quote escape (and SQL `""`).
+                        if (i + 1 < trimmed.Length && trimmed[i + 1] == quote.Value)
+                        { i++; continue; }
+                        quote = null;
+                    }
+                }
+                else
+                {
+                    if (c == '\'' || c == '"') quote = c;
+                    else if (c == ';') { hasInnerSemicolon = true; break; }
+                }
+            }
+
+            if (!hasInnerSemicolon)
+            {
+                var cmd = NativeCache.ParseSetCommand(sql);
+                if (cmd != null) Apply(cmd);
+            }
+            else
+            {
+                foreach (var stmt in NativeCache.SplitStatements(sql))
+                {
+                    var cmd = NativeCache.ParseSetCommand(stmt);
+                    if (cmd != null) Apply(cmd);
+                }
+            }
+            return StateHash != before;
+        }
+
+        // Caller holds _lock. Recomputes the deterministic FNV-1a-style
+        // hash of the (ordered) name=value pairs. Empty state hashes to 0
+        // — matches the proxy's BTreeMap-empty -> 0 invariant.
+        private void RecomputeHashLocked()
+        {
+            if (_values.Count == 0)
+            {
+                Interlocked.Exchange(ref _stateHash, 0);
+                return;
+            }
+            // FNV-1a 64-bit. Stable across runs (no DefaultHasher
+            // randomization), order-invariant via SortedDictionary
+            // iteration, fast enough for the hot path.
+            const ulong FnvOffset = 14695981039346656037UL;
+            const ulong FnvPrime = 1099511628211UL;
+            ulong h = FnvOffset;
+            foreach (var kvp in _values)
+            {
+                foreach (var b in Encoding.UTF8.GetBytes(kvp.Key))
+                {
+                    h ^= b;
+                    h *= FnvPrime;
+                }
+                // 0x00 separator between key and value to avoid the
+                // ("ab","c") vs ("a","bc") collision class.
+                h ^= 0;
+                h *= FnvPrime;
+                foreach (var b in Encoding.UTF8.GetBytes(kvp.Value))
+                {
+                    h ^= b;
+                    h *= FnvPrime;
+                }
+                // 0x01 separator between pairs.
+                h ^= 1;
+                h *= FnvPrime;
+            }
+            // Avoid hashing to 0 by accident — 0 is reserved for "empty".
+            // Probability is ~1/2^64, but we'd rather be deterministic.
+            if (h == 0) h = 1;
+            Interlocked.Exchange(ref _stateHash, unchecked((long)h));
+        }
+    }
+
     public class NativeCache
     {
         internal const string DdlSentinel = "__ddl__";
@@ -220,6 +451,16 @@ namespace GoldLapel
 
         public CacheEntry Get(string sql, object[] parameters)
         {
+            return Get(sql, parameters, 0);
+        }
+
+        // State-hash-aware cache lookup. The per-connection
+        // <see cref="ConnectionGucState.StateHash"/> is folded into the
+        // key so two connections with different unsafe-GUC values never
+        // share a cache slot — closes the GUC-driven RLS leak that the
+        // proxy commit `3e02359` fixed at the L2 layer.
+        public CacheEntry Get(string sql, object[] parameters, long stateHash)
+        {
             if (!_enabled || !_invalidationConnected) return null;
             // DisableNativeCache: tick misses (callers measure miss rate),
             // never hit. Skip the key build + cache lookup entirely — no
@@ -229,7 +470,7 @@ namespace GoldLapel
                 Interlocked.Increment(ref StatsMisses);
                 return null;
             }
-            var key = MakeKey(sql, parameters);
+            var key = MakeKey(sql, parameters, stateHash);
             if (key == null) return null;
             CacheEntry entry;
             if (_cache.TryGetValue(key, out entry))
@@ -244,11 +485,17 @@ namespace GoldLapel
 
         public void Put(string sql, object[] parameters, object[][] rows, string[] columns)
         {
+            Put(sql, parameters, rows, columns, 0);
+        }
+
+        // State-hash-aware cache insert. See <see cref="Get(string, object[], long)"/>.
+        public void Put(string sql, object[] parameters, object[][] rows, string[] columns, long stateHash)
+        {
             if (!_enabled || !_invalidationConnected) return;
             // DisableNativeCache: silent no-op. Don't touch cache state,
             // the eviction-rate window, or counters — the layer is off.
             if (_disableNativeCache) return;
-            var key = MakeKey(sql, parameters);
+            var key = MakeKey(sql, parameters, stateHash);
             if (key == null) return;
             var tables = ExtractTables(sql);
 
@@ -437,9 +684,23 @@ namespace GoldLapel
 
         internal static string MakeKey(string sql, object[] parameters)
         {
-            if (parameters == null || parameters.Length == 0)
-                return sql + "\0null";
-            return sql + "\0" + string.Join(",", parameters.Select(p => p?.ToString() ?? "null"));
+            return MakeKey(sql, parameters, 0);
+        }
+
+        // Cache key shape including the per-connection unsafe-GUC state
+        // hash. Format: `<sql>\0<state_hash_hex>\0<params>`. State hash 0
+        // is the empty/baseline — fresh connections still hit cache slots
+        // populated by other state-0 connections.
+        internal static string MakeKey(string sql, object[] parameters, long stateHash)
+        {
+            var paramsPart = (parameters == null || parameters.Length == 0)
+                ? "null"
+                : string.Join(",", parameters.Select(p => p?.ToString() ?? "null"));
+            // Format the state hash as lowercase hex for parity with the
+            // proxy's `{:x}` rendering — same human-readable form across
+            // proxy and wrapper (eases log correlation).
+            var sh = ((ulong)stateHash).ToString("x", System.Globalization.CultureInfo.InvariantCulture);
+            return sql + "\0" + sh + "\0" + paramsPart;
         }
 
         internal static string DetectWrite(string sql)
@@ -551,6 +812,230 @@ namespace GoldLapel
 
         internal static bool IsTxStart(string sql) { return TxStart.IsMatch(sql); }
         internal static bool IsTxEnd(string sql) { return TxEnd.IsMatch(sql); }
+
+        // ── Unsafe-GUC classification + SET parsing ───────────────
+        //
+        // Mirrors the proxy's guc_state.rs. See ConnectionGucState class
+        // docs for the design rationale.
+
+        // GUC names whose value can change query results without
+        // changing the SQL text. Matched case-insensitively. Any GUC
+        // with a `.` in the name is also treated as unsafe (namespaced
+        // GUCs are the canonical custom-RLS pattern).
+        private static readonly HashSet<string> UnsafeGucShortList =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                "search_path",
+                "role",
+                "session_authorization",
+                "default_transaction_isolation",
+                "default_transaction_read_only",
+                "transaction_isolation",
+                "row_security",
+            };
+
+        /// <summary>
+        /// Classify a GUC name as state-affecting (<c>true</c>) or
+        /// harmless (<c>false</c>). A GUC is unsafe if it's in the short
+        /// hardcoded list OR contains a <c>.</c> (namespaced —
+        /// <c>app.*</c>, <c>myapp.*</c>, etc.). Comparison is
+        /// case-insensitive.
+        /// </summary>
+        public static bool IsUnsafeGuc(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return false;
+            if (name.IndexOf('.') >= 0) return true;
+            return UnsafeGucShortList.Contains(name);
+        }
+
+        /// <summary>
+        /// Split a SQL string on top-level <c>;</c> characters,
+        /// respecting single- and double-quoted string literals. PG's
+        /// doubled-quote escape (<c>''</c> / <c>""</c>) is honored.
+        /// Empty segments are dropped, surrounding whitespace trimmed.
+        /// </summary>
+        /// <remarks>
+        /// Lightest-possible statement splitter: does not understand
+        /// dollar-quoted strings, comments, or any other lexical
+        /// nuance. Good enough for the only thing it needs to do —
+        /// splitting <c>SET foo = 'a'; SELECT 1</c>-style multi-statement
+        /// bodies. Mirrors the proxy's <c>split_statements</c>.
+        /// </remarks>
+        public static List<string> SplitStatements(string sql)
+        {
+            var result = new List<string>();
+            if (string.IsNullOrEmpty(sql)) return result;
+
+            int start = 0;
+            char? quote = null;
+            int i = 0;
+            while (i < sql.Length)
+            {
+                var c = sql[i];
+                if (quote.HasValue)
+                {
+                    if (c == quote.Value)
+                    {
+                        // PG's `''` doubled-quote escape (and SQL `""`).
+                        if (i + 1 < sql.Length && sql[i + 1] == quote.Value)
+                        {
+                            i += 2;
+                            continue;
+                        }
+                        quote = null;
+                    }
+                }
+                else
+                {
+                    if (c == '\'' || c == '"')
+                    {
+                        quote = c;
+                    }
+                    else if (c == ';')
+                    {
+                        var segment = sql.Substring(start, i - start).Trim();
+                        if (segment.Length > 0) result.Add(segment);
+                        start = i + 1;
+                    }
+                }
+                i++;
+            }
+            var tail = sql.Substring(start).Trim();
+            if (tail.Length > 0) result.Add(tail);
+            return result;
+        }
+
+        /// <summary>
+        /// Parse a <c>SET</c> / <c>RESET</c> command out of a single SQL
+        /// statement. Recognises <c>SET name = value</c>, <c>SET name TO
+        /// value</c>, <c>SET SESSION ...</c>, <c>SET LOCAL ...</c>,
+        /// <c>RESET name</c>, <c>RESET ALL</c>. Returns <c>null</c> for
+        /// anything else (including the legacy <c>SET TIME ZONE 'UTC'</c>
+        /// two-word form — timezone is harmless, treating it as
+        /// "not-a-trackable-SET" is correct for cache safety).
+        /// </summary>
+        public static SetCommand ParseSetCommand(string sql)
+        {
+            if (string.IsNullOrEmpty(sql)) return null;
+            var s = sql.Trim();
+            if (s.EndsWith(";", StringComparison.Ordinal))
+                s = s.Substring(0, s.Length - 1).TrimEnd();
+            if (s.Length == 0) return null;
+
+            // Split on whitespace into a token stream.
+            var tokens = s.Split(new[] { ' ', '\t', '\n', '\r' },
+                StringSplitOptions.RemoveEmptyEntries);
+            if (tokens.Length == 0) return null;
+
+            var head = tokens[0];
+
+            // ── RESET ───────────────────────────────────────────────
+            if (head.Equals("RESET", StringComparison.OrdinalIgnoreCase))
+            {
+                if (tokens.Length < 2) return null;
+                var target = tokens[1];
+                // `RESET name` — anything after `name` is junk we don't expect.
+                if (tokens.Length > 2) return null;
+                if (target.Equals("ALL", StringComparison.OrdinalIgnoreCase))
+                    return SetCommand.ResetAll();
+                var name = NormalizeGucName(target);
+                if (name == null) return null;
+                return SetCommand.Reset(name);
+            }
+
+            // ── SET ─────────────────────────────────────────────────
+            if (!head.Equals("SET", StringComparison.OrdinalIgnoreCase))
+                return null;
+            if (tokens.Length < 2) return null;
+
+            int idx = 1;
+            bool isLocal = false;
+            var modifier = tokens[idx];
+            if (modifier.Equals("LOCAL", StringComparison.OrdinalIgnoreCase))
+            {
+                isLocal = true;
+                idx++;
+            }
+            else if (modifier.Equals("SESSION", StringComparison.OrdinalIgnoreCase))
+            {
+                idx++;
+            }
+            if (idx >= tokens.Length) return null;
+
+            var nameToken = tokens[idx];
+            idx++;
+
+            // The token may have an `=` glued onto it (e.g. `SET app.user='42'`).
+            string gluedValue = null;
+            var eqPos = nameToken.IndexOf('=');
+            if (eqPos >= 0)
+            {
+                var n = nameToken.Substring(0, eqPos);
+                var rest = nameToken.Substring(eqPos + 1);
+                nameToken = n;
+                if (rest.Length > 0) gluedValue = rest;
+            }
+
+            var gucName = NormalizeGucName(nameToken);
+            if (gucName == null) return null;
+
+            string valueStr;
+            if (gluedValue != null)
+            {
+                if (idx < tokens.Length)
+                {
+                    var rest = string.Join(" ", tokens, idx, tokens.Length - idx);
+                    valueStr = (rest.Length > 0) ? gluedValue + " " + rest : gluedValue;
+                }
+                else
+                {
+                    valueStr = gluedValue;
+                }
+            }
+            else
+            {
+                if (idx >= tokens.Length) return null;
+                var sep = tokens[idx];
+                idx++;
+                if (!(sep == "=" || sep.Equals("TO", StringComparison.OrdinalIgnoreCase)))
+                    return null;
+                if (idx >= tokens.Length) return null;
+                valueStr = string.Join(" ", tokens, idx, tokens.Length - idx);
+            }
+
+            var value = StripValueQuotes(valueStr.Trim());
+            if (value.Length == 0 && valueStr.Trim().Length == 0)
+                return null;
+
+            return isLocal ? SetCommand.Local(gucName, value) : SetCommand.Set(gucName, value);
+        }
+
+        // Lowercase the GUC name and strip surrounding double quotes
+        // (PG treats `"app.user_id"` and `app.user_id` as the same
+        // identifier when it's a configuration parameter).
+        private static string NormalizeGucName(string token)
+        {
+            if (string.IsNullOrEmpty(token)) return null;
+            var trimmed = token.Trim('"');
+            if (trimmed.Length == 0) return null;
+            return trimmed.ToLowerInvariant();
+        }
+
+        // Strip a single layer of matching surrounding quotes (`'...'`
+        // or `"..."`) from a value. Multi-token quoted values arrive as
+        // the joined string; this just peels the outer quotes.
+        private static string StripValueQuotes(string value)
+        {
+            var v = value.Trim();
+            if (v.Length >= 2)
+            {
+                var first = v[0];
+                var last = v[v.Length - 1];
+                if ((first == '\'' && last == '\'') || (first == '"' && last == '"'))
+                    return v.Substring(1, v.Length - 2);
+            }
+            return v;
+        }
 
         private void EvictOne()
         {

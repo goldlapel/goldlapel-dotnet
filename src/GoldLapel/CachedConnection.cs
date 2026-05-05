@@ -9,6 +9,12 @@ namespace GoldLapel
     {
         private readonly DbConnection _inner;
         private readonly NativeCache _cache;
+        // Per-connection unsafe-GUC state. Mirrors the proxy's
+        // per-connection ConnectionGucState (commit `3e02359`). Each
+        // wrapper-side cache key folds in this connection's state hash so
+        // two connections with different `app.user_id` (or any namespaced
+        // GUC, role, search_path, etc.) never share a cache slot.
+        private readonly ConnectionGucState _gucState = new ConnectionGucState();
         private bool _inTransaction;
 
         public CachedConnection(DbConnection inner, NativeCache cache)
@@ -19,6 +25,7 @@ namespace GoldLapel
 
         internal DbConnection Inner => _inner;
         internal NativeCache Cache => _cache;
+        internal ConnectionGucState GucState => _gucState;
         internal bool InTransaction
         {
             get => _inTransaction;
@@ -177,6 +184,14 @@ namespace GoldLapel
                 return _inner.ExecuteReader(behavior);
             }
 
+            // GUC-RLS cache safety: observe every SQL for SET / RESET so
+            // the per-connection state hash is up to date before the
+            // cache key is built. Multi-statement bodies (e.g.
+            // `SET app.user_id = '42'; SELECT ...`) update state on the
+            // SET segment and the SELECT segment looks up against the
+            // new state hash.
+            _conn.GucState.ObserveSql(sql);
+
             // Write detection
             var writeTable = NativeCache.DetectWrite(sql);
             if (writeTable != null)
@@ -192,15 +207,18 @@ namespace GoldLapel
             if (_conn.InTransaction)
                 return _inner.ExecuteReader(behavior);
 
-            // Check native cache
+            // Check native cache — fold in the connection's state hash so
+            // two connections with different unsafe-GUC values never
+            // share a cache slot.
             var parameters = GetParameterArray();
-            var entry = cache.Get(sql, parameters);
+            var stateHash = _conn.GucState.StateHash;
+            var entry = cache.Get(sql, parameters, stateHash);
             if (entry != null)
                 return new CachedDataReader(entry.Rows, entry.Columns);
 
             // Cache miss
             var reader = _inner.ExecuteReader(behavior);
-            return CacheAndReturn(sql, parameters, reader);
+            return CacheAndReturn(sql, parameters, reader, stateHash);
         }
 
         public override int ExecuteNonQuery()
@@ -212,6 +230,9 @@ namespace GoldLapel
                 _conn.InTransaction = true;
             else if (NativeCache.IsTxEnd(sql))
                 _conn.InTransaction = false;
+
+            // GUC-RLS cache safety: see ExecuteDbDataReader.
+            _conn.GucState.ObserveSql(sql);
 
             var writeTable = NativeCache.DetectWrite(sql);
             if (writeTable != null)
@@ -233,6 +254,9 @@ namespace GoldLapel
                 _conn.InTransaction = true;
             else if (NativeCache.IsTxEnd(sql))
                 _conn.InTransaction = false;
+
+            // GUC-RLS cache safety: see ExecuteDbDataReader.
+            _conn.GucState.ObserveSql(sql);
 
             var writeTable = NativeCache.DetectWrite(sql);
             if (writeTable != null)
@@ -261,7 +285,7 @@ namespace GoldLapel
             return arr;
         }
 
-        private DbDataReader CacheAndReturn(string sql, object[] parameters, DbDataReader reader)
+        private DbDataReader CacheAndReturn(string sql, object[] parameters, DbDataReader reader, long stateHash)
         {
             try
             {
@@ -281,7 +305,7 @@ namespace GoldLapel
                 reader.Close();
 
                 var rowArray = rows.ToArray();
-                _conn.Cache.Put(sql, parameters, rowArray, columns);
+                _conn.Cache.Put(sql, parameters, rowArray, columns, stateHash);
                 return new CachedDataReader(rowArray, columns);
             }
             catch

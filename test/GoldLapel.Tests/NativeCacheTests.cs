@@ -374,6 +374,12 @@ namespace GoldLapel.Tests
     }
 
     // ── MakeKey ──────────────────────────────────────────────
+    //
+    // Cache key shape: `<sql>\0<state_hash_hex>\0<params>`. The
+    // state-hash segment renders as lowercase hex (parity with the
+    // proxy's `{:x}` formatting, eases log correlation). State hash
+    // 0 means "no unsafe-GUC state set" — fresh connections still
+    // hit cache slots populated by other state-0 connections.
 
     public class MakeKeyTest
     {
@@ -381,28 +387,46 @@ namespace GoldLapel.Tests
         public void NullParams()
         {
             var key = NativeCache.MakeKey("SELECT 1", null);
-            Assert.Equal("SELECT 1\0null", key);
+            Assert.Equal("SELECT 1\00\0null", key);
         }
 
         [Fact]
         public void EmptyParams()
         {
             var key = NativeCache.MakeKey("SELECT 1", new object[0]);
-            Assert.Equal("SELECT 1\0null", key);
+            Assert.Equal("SELECT 1\00\0null", key);
         }
 
         [Fact]
         public void WithParams()
         {
             var key = NativeCache.MakeKey("SELECT $1", new object[] { 42 });
-            Assert.Equal("SELECT $1\042", key);
+            Assert.Equal("SELECT $1\00\042", key);
         }
 
         [Fact]
         public void MultipleParams()
         {
             var key = NativeCache.MakeKey("SELECT $1, $2", new object[] { "a", "b" });
-            Assert.Equal("SELECT $1, $2\0a,b", key);
+            Assert.Equal("SELECT $1, $2\00\0a,b", key);
+        }
+
+        [Fact]
+        public void StateHashRendersAsLowercaseHex()
+        {
+            // 0xdeadbeef = 3735928559 — chosen for the obvious hex form.
+            var key = NativeCache.MakeKey("SELECT 1", null, 0xdeadbeefL);
+            Assert.Equal("SELECT 1\0deadbeef\0null", key);
+        }
+
+        [Fact]
+        public void DifferentStateHashesYieldDifferentKeys()
+        {
+            // Same SQL + params, different state hashes → different keys
+            // (the whole point of folding the hash into the key).
+            var k0 = NativeCache.MakeKey("SELECT * FROM accounts", null, 0);
+            var k1 = NativeCache.MakeKey("SELECT * FROM accounts", null, 0x42);
+            Assert.NotEqual(k0, k1);
         }
     }
 
@@ -969,6 +993,481 @@ namespace GoldLapel.Tests
                 cache.StopInvalidation();
                 server.Stop();
             }
+        }
+    }
+
+    // ── GUC-RLS cache safety (Option Y, wrapper-side L1) ──────────────
+    //
+    // Mirrors `goldlapel/src/guc_state.rs` (commit `3e02359`). Tests cover:
+    //   * IsUnsafeGuc classification (short list + namespaced + case)
+    //   * ParseSetCommand shapes (= / TO / SESSION / LOCAL / glued / quoted)
+    //   * SplitStatements (string-literal-aware, doubled-quote escape)
+    //   * ConnectionGucState invariants (insertion-order, RESET round-trip,
+    //     SET LOCAL no-op, safe-GUC no-op, multi-statement)
+    //   * Cache-key isolation by state hash (the actual leak the layer fixes)
+
+    public class IsUnsafeGucTest
+    {
+        [Fact] public void SearchPathIsUnsafe() => Assert.True(NativeCache.IsUnsafeGuc("search_path"));
+        [Fact] public void RoleIsUnsafe() => Assert.True(NativeCache.IsUnsafeGuc("role"));
+        [Fact] public void SessionAuthorizationIsUnsafe() => Assert.True(NativeCache.IsUnsafeGuc("session_authorization"));
+        [Fact] public void DefaultTxnIsolationIsUnsafe() => Assert.True(NativeCache.IsUnsafeGuc("default_transaction_isolation"));
+        [Fact] public void DefaultTxnReadOnlyIsUnsafe() => Assert.True(NativeCache.IsUnsafeGuc("default_transaction_read_only"));
+        [Fact] public void TransactionIsolationIsUnsafe() => Assert.True(NativeCache.IsUnsafeGuc("transaction_isolation"));
+        [Fact] public void RowSecurityIsUnsafe() => Assert.True(NativeCache.IsUnsafeGuc("row_security"));
+
+        [Fact] public void ClassificationCaseInsensitive()
+        {
+            Assert.True(NativeCache.IsUnsafeGuc("ROLE"));
+            Assert.True(NativeCache.IsUnsafeGuc("Search_Path"));
+            Assert.True(NativeCache.IsUnsafeGuc("SEARCH_PATH"));
+        }
+
+        [Fact] public void NamespacedGucsAreUnsafe()
+        {
+            Assert.True(NativeCache.IsUnsafeGuc("app.user_id"));
+            Assert.True(NativeCache.IsUnsafeGuc("myapp.tenant"));
+            Assert.True(NativeCache.IsUnsafeGuc("rls.account"));
+            // Even unknown / arbitrarily nested namespaces.
+            Assert.True(NativeCache.IsUnsafeGuc("a.b.c"));
+            Assert.True(NativeCache.IsUnsafeGuc("APP.USER"));
+        }
+
+        [Fact] public void HarmlessGucsAreSafe()
+        {
+            Assert.False(NativeCache.IsUnsafeGuc("timezone"));
+            Assert.False(NativeCache.IsUnsafeGuc("application_name"));
+            Assert.False(NativeCache.IsUnsafeGuc("statement_timeout"));
+            Assert.False(NativeCache.IsUnsafeGuc("work_mem"));
+            Assert.False(NativeCache.IsUnsafeGuc("client_encoding"));
+            Assert.False(NativeCache.IsUnsafeGuc("DateStyle"));
+        }
+
+        [Fact] public void EmptyAndNullAreSafe()
+        {
+            Assert.False(NativeCache.IsUnsafeGuc(""));
+            Assert.False(NativeCache.IsUnsafeGuc(null));
+        }
+    }
+
+    public class ParseSetCommandTest
+    {
+        [Fact] public void ParseSetEqQuoted()
+        {
+            var cmd = NativeCache.ParseSetCommand("SET foo = 'bar'");
+            Assert.Equal(SetCommand.CommandKind.Set, cmd.Kind);
+            Assert.Equal("foo", cmd.Name);
+            Assert.Equal("bar", cmd.Value);
+        }
+
+        [Fact] public void ParseSetToQuoted()
+        {
+            var cmd = NativeCache.ParseSetCommand("SET foo TO 'bar'");
+            Assert.Equal(SetCommand.CommandKind.Set, cmd.Kind);
+            Assert.Equal("foo", cmd.Name);
+            Assert.Equal("bar", cmd.Value);
+        }
+
+        [Fact] public void ParseSetUnquoted()
+        {
+            var cmd = NativeCache.ParseSetCommand("SET foo = 42");
+            Assert.Equal("foo", cmd.Name);
+            Assert.Equal("42", cmd.Value);
+        }
+
+        [Fact] public void ParseSetSessionModifier()
+        {
+            var cmd = NativeCache.ParseSetCommand("SET SESSION foo = 'bar'");
+            Assert.Equal(SetCommand.CommandKind.Set, cmd.Kind);
+            Assert.Equal("foo", cmd.Name);
+            Assert.Equal("bar", cmd.Value);
+        }
+
+        [Fact] public void ParseSetLocalModifier()
+        {
+            var cmd = NativeCache.ParseSetCommand("SET LOCAL foo = 'bar'");
+            Assert.Equal(SetCommand.CommandKind.SetLocal, cmd.Kind);
+            Assert.Equal("foo", cmd.Name);
+            Assert.Equal("bar", cmd.Value);
+        }
+
+        [Fact] public void ParseResetNamed()
+        {
+            var cmd = NativeCache.ParseSetCommand("RESET foo");
+            Assert.Equal(SetCommand.CommandKind.Reset, cmd.Kind);
+            Assert.Equal("foo", cmd.Name);
+            Assert.Null(cmd.Value);
+        }
+
+        [Fact] public void ParseResetAll()
+        {
+            var cmd = NativeCache.ParseSetCommand("RESET ALL");
+            Assert.Equal(SetCommand.CommandKind.ResetAll, cmd.Kind);
+            Assert.Null(cmd.Name);
+        }
+
+        [Fact] public void ParseCaseInsensitiveKeywords()
+        {
+            Assert.Equal(SetCommand.CommandKind.Set, NativeCache.ParseSetCommand("set foo = 'bar'").Kind);
+            Assert.Equal(SetCommand.CommandKind.SetLocal, NativeCache.ParseSetCommand("Set Local foo To 'bar'").Kind);
+            Assert.Equal(SetCommand.CommandKind.ResetAll, NativeCache.ParseSetCommand("reset all").Kind);
+        }
+
+        [Fact] public void ParseLowercasesGucName()
+        {
+            var cmd = NativeCache.ParseSetCommand("SET App.User_ID = '42'");
+            Assert.Equal("app.user_id", cmd.Name);
+            Assert.Equal("42", cmd.Value);
+        }
+
+        [Fact] public void ParseTrailingSemicolon()
+        {
+            Assert.Equal("foo", NativeCache.ParseSetCommand("SET foo = 'bar';").Name);
+            Assert.Equal("foo", NativeCache.ParseSetCommand("RESET foo ;").Name);
+        }
+
+        [Fact] public void ParseExtraWhitespace()
+        {
+            var cmd = NativeCache.ParseSetCommand("   SET    foo   =   'bar'   ");
+            Assert.Equal("foo", cmd.Name);
+            Assert.Equal("bar", cmd.Value);
+        }
+
+        [Fact] public void ParseGluedEquals()
+        {
+            // Some clients send `SET name=value` with no spaces.
+            var cmd = NativeCache.ParseSetCommand("SET app.user_id='42'");
+            Assert.Equal("app.user_id", cmd.Name);
+            Assert.Equal("42", cmd.Value);
+        }
+
+        [Fact] public void ParseDoubleQuotedValue()
+        {
+            var cmd = NativeCache.ParseSetCommand("SET foo = \"bar\"");
+            Assert.Equal("bar", cmd.Value);
+        }
+
+        [Fact] public void ParseDoubleQuotedName()
+        {
+            // `"app.user_id"` is a quoted identifier — same value as bare.
+            var cmd = NativeCache.ParseSetCommand("SET \"app.user_id\" = '42'");
+            Assert.Equal("app.user_id", cmd.Name);
+        }
+
+        [Fact] public void ParseRejectsNonSetStatements()
+        {
+            Assert.Null(NativeCache.ParseSetCommand("SELECT 1"));
+            Assert.Null(NativeCache.ParseSetCommand("BEGIN"));
+            Assert.Null(NativeCache.ParseSetCommand("UPDATE t SET x = 1"));
+        }
+
+        [Fact] public void ParseRejectsEmpty()
+        {
+            Assert.Null(NativeCache.ParseSetCommand(""));
+            Assert.Null(NativeCache.ParseSetCommand("   "));
+            Assert.Null(NativeCache.ParseSetCommand(";"));
+        }
+
+        [Fact] public void ParseRejectsSetWithoutValue()
+        {
+            Assert.Null(NativeCache.ParseSetCommand("SET foo ="));
+            Assert.Null(NativeCache.ParseSetCommand("SET foo TO"));
+            Assert.Null(NativeCache.ParseSetCommand("SET foo"));
+        }
+
+        [Fact] public void ParseRejectsResetWithGarbage()
+        {
+            // `RESET foo bar` — second token after RESET is unexpected.
+            Assert.Null(NativeCache.ParseSetCommand("RESET foo bar"));
+        }
+
+        [Fact] public void ParseRejectsSetTimeZoneTwoWordForm()
+        {
+            // `SET TIME ZONE 'UTC'` — legacy two-word form. We don't
+            // model it because timezone is harmless. Returning null is
+            // correct: the wrapper treats it as not-a-trackable-SET,
+            // i.e. cache-safe.
+            Assert.Null(NativeCache.ParseSetCommand("SET TIME ZONE 'UTC'"));
+        }
+    }
+
+    public class SplitStatementsTest
+    {
+        [Fact] public void SimpleTwoStatements()
+        {
+            var v = NativeCache.SplitStatements("SET foo = '42'; SELECT 1");
+            Assert.Equal(new[] { "SET foo = '42'", "SELECT 1" }, v);
+        }
+
+        [Fact] public void DropsEmptySegments()
+        {
+            var v = NativeCache.SplitStatements("; SET foo = '42';;SELECT 1;");
+            Assert.Equal(new[] { "SET foo = '42'", "SELECT 1" }, v);
+        }
+
+        [Fact] public void RespectsSingleQuotes()
+        {
+            // The `;` inside the literal must NOT split the statement.
+            var v = NativeCache.SplitStatements("SET foo = 'a;b'; SELECT 1");
+            Assert.Equal(new[] { "SET foo = 'a;b'", "SELECT 1" }, v);
+        }
+
+        [Fact] public void RespectsDoubleQuotes()
+        {
+            var v = NativeCache.SplitStatements("SET \"app;guc\" = 'x'; SELECT 1");
+            Assert.Equal(new[] { "SET \"app;guc\" = 'x'", "SELECT 1" }, v);
+        }
+
+        [Fact] public void HandlesDoubledQuoteEscape()
+        {
+            // PG escapes a literal `'` inside a string by doubling: `''`.
+            var v = NativeCache.SplitStatements("SET foo = 'it''s; ok'; SELECT 1");
+            Assert.Equal(new[] { "SET foo = 'it''s; ok'", "SELECT 1" }, v);
+        }
+
+        [Fact] public void SingleStatementPassThrough()
+        {
+            var v = NativeCache.SplitStatements("SET foo = '42'");
+            Assert.Equal(new[] { "SET foo = '42'" }, v);
+        }
+
+        [Fact] public void EmptyInput()
+        {
+            Assert.Empty(NativeCache.SplitStatements(""));
+            Assert.Empty(NativeCache.SplitStatements("   "));
+            Assert.Empty(NativeCache.SplitStatements(";;;"));
+        }
+    }
+
+    public class ConnectionGucStateTest
+    {
+        [Fact] public void EmptyStateHashIsZero()
+        {
+            var s = new ConnectionGucState();
+            Assert.Equal(0L, s.StateHash);
+        }
+
+        [Fact] public void SafeSetDoesNotChangeHash()
+        {
+            var s = new ConnectionGucState();
+            s.ObserveSql("SET timezone = 'UTC'");
+            Assert.Equal(0L, s.StateHash);
+            s.ObserveSql("SET application_name = 'foo'");
+            Assert.Equal(0L, s.StateHash);
+            s.ObserveSql("SET statement_timeout = 5000");
+            Assert.Equal(0L, s.StateHash);
+        }
+
+        [Fact] public void UnsafeSetChangesHash()
+        {
+            var s = new ConnectionGucState();
+            var h0 = s.StateHash;
+            s.ObserveSql("SET app.user_id = '42'");
+            var h1 = s.StateHash;
+            Assert.NotEqual(h0, h1);
+        }
+
+        [Fact] public void SameUnsafeSetYieldsSameHash()
+        {
+            var a = new ConnectionGucState();
+            var b = new ConnectionGucState();
+            a.ObserveSql("SET app.user_id = '42'");
+            b.ObserveSql("SET app.user_id = '42'");
+            Assert.Equal(a.StateHash, b.StateHash);
+        }
+
+        [Fact] public void DifferentValuesYieldDifferentHashes()
+        {
+            var a = new ConnectionGucState();
+            var b = new ConnectionGucState();
+            a.ObserveSql("SET app.user_id = '42'");
+            b.ObserveSql("SET app.user_id = '43'");
+            Assert.NotEqual(a.StateHash, b.StateHash);
+        }
+
+        [Fact] public void InsertionOrderDoesNotMatter()
+        {
+            var a = new ConnectionGucState();
+            a.ObserveSql("SET app.user_id = '42'");
+            a.ObserveSql("SET app.tenant = 'alpha'");
+
+            var b = new ConnectionGucState();
+            b.ObserveSql("SET app.tenant = 'alpha'");
+            b.ObserveSql("SET app.user_id = '42'");
+
+            Assert.Equal(a.StateHash, b.StateHash);
+        }
+
+        [Fact] public void ResetReturnsHashToBaseline()
+        {
+            var s = new ConnectionGucState();
+            var baseline = s.StateHash;
+            s.ObserveSql("SET app.user_id = '42'");
+            Assert.NotEqual(baseline, s.StateHash);
+            s.ObserveSql("RESET app.user_id");
+            Assert.Equal(baseline, s.StateHash);
+        }
+
+        [Fact] public void ResetAllClearsAllUnsafeState()
+        {
+            var s = new ConnectionGucState();
+            s.ObserveSql("SET app.user_id = '42'");
+            s.ObserveSql("SET search_path TO 'tenant_a'");
+            s.ObserveSql("SET role = 'app_user'");
+            Assert.NotEqual(0L, s.StateHash);
+            s.ObserveSql("RESET ALL");
+            Assert.Equal(0L, s.StateHash);
+        }
+
+        [Fact] public void SetLocalDoesNotChangeHash()
+        {
+            // Even an unsafe-named SET LOCAL must not move the hash —
+            // SET LOCAL only takes effect inside a txn, and the cache
+            // bypasses transactions anyway.
+            var s = new ConnectionGucState();
+            s.ObserveSql("SET LOCAL app.user_id = '42'");
+            Assert.Equal(0L, s.StateHash);
+        }
+
+        [Fact] public void ObserveSqlReturnsChangeFlag()
+        {
+            var s = new ConnectionGucState();
+            Assert.True(s.ObserveSql("SET app.user_id = '42'"));
+            Assert.False(s.ObserveSql("SELECT 1"));
+            Assert.False(s.ObserveSql("SET timezone = 'UTC'"));
+            Assert.True(s.ObserveSql("RESET app.user_id"));
+        }
+
+        [Fact] public void ResetSafeGucIsNoop()
+        {
+            var s = new ConnectionGucState();
+            s.ObserveSql("SET app.user_id = '42'");
+            var h = s.StateHash;
+            s.ObserveSql("RESET timezone");
+            Assert.Equal(h, s.StateHash);
+        }
+
+        [Fact] public void OverwriteUnsafeValueChangesHash()
+        {
+            var s = new ConnectionGucState();
+            s.ObserveSql("SET app.user_id = '42'");
+            var h1 = s.StateHash;
+            s.ObserveSql("SET app.user_id = '43'");
+            var h2 = s.StateHash;
+            Assert.NotEqual(h1, h2);
+        }
+
+        [Fact] public void ObserveMultiStatementAppliesAllSets()
+        {
+            // Real-world pattern: client batches a SET with the query.
+            var s = new ConnectionGucState();
+            s.ObserveSql("SET app.user_id = '42'; SELECT * FROM accounts");
+            Assert.NotEqual(0L, s.StateHash);
+        }
+
+        [Fact] public void MultiStatementMatchesSeparateStatements()
+        {
+            var a = new ConnectionGucState();
+            a.ObserveSql("SET app.user_id = '42'");
+            a.ObserveSql("SET app.tenant = 'alpha'");
+
+            var b = new ConnectionGucState();
+            b.ObserveSql("SET app.user_id = '42'; SET app.tenant = 'alpha'");
+
+            Assert.Equal(a.StateHash, b.StateHash);
+        }
+
+        [Fact] public void ObserveMultiStatementWithQuotedSemicolon()
+        {
+            // The `;` inside the value must not be treated as a statement
+            // separator.
+            var s = new ConnectionGucState();
+            s.ObserveSql("SET app.tenant = 'has;semicolon'; SELECT 1");
+            Assert.NotEqual(0L, s.StateHash);
+        }
+
+        [Fact] public void NullSqlIsNoOp()
+        {
+            // Defensive: ObserveSql(null) must not throw or perturb state.
+            var s = new ConnectionGucState();
+            Assert.False(s.ObserveSql(null));
+            Assert.False(s.ObserveSql(""));
+            Assert.Equal(0L, s.StateHash);
+        }
+    }
+
+    // ── Cache isolation by state hash ─────────────────────────────
+    //
+    // The actual security goal: same SQL + same params + DIFFERENT unsafe
+    // GUCs must NOT share a cache slot. Closes the GUC-driven RLS leak at
+    // the L1 layer (the proxy commit `3e02359` closed it at L2).
+
+    public class StateHashCacheIsolationTest : IDisposable
+    {
+        public StateHashCacheIsolationTest() { NativeCache.Reset(); }
+        public void Dispose() { NativeCache.Reset(); }
+
+        private NativeCache MakeCache()
+        {
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            return cache;
+        }
+
+        [Fact]
+        public void DifferentStateHashesIsolateEntries()
+        {
+            // Same SQL — but two callers with different unsafe-GUC state
+            // store and retrieve their own rows.
+            var cache = MakeCache();
+            var sql = "SELECT * FROM accounts";
+
+            cache.Put(sql, null,
+                new[] { new object[] { "alice-row" } }, new[] { "name" }, 0x111);
+            cache.Put(sql, null,
+                new[] { new object[] { "bob-row" } }, new[] { "name" }, 0x222);
+
+            var aliceEntry = cache.Get(sql, null, 0x111);
+            var bobEntry = cache.Get(sql, null, 0x222);
+            Assert.NotNull(aliceEntry);
+            Assert.NotNull(bobEntry);
+            Assert.Equal("alice-row", aliceEntry.Rows[0][0]);
+            Assert.Equal("bob-row", bobEntry.Rows[0][0]);
+        }
+
+        [Fact]
+        public void SameStateHashShare()
+        {
+            // Sanity check the other direction: same SQL + same state
+            // hash → cache hit (the layer's whole job).
+            var cache = MakeCache();
+            cache.Put("SELECT 1", null,
+                new[] { new object[] { "x" } }, new[] { "v" }, 0x42);
+            var entry = cache.Get("SELECT 1", null, 0x42);
+            Assert.NotNull(entry);
+        }
+
+        [Fact]
+        public void DefaultOverloadIsStateHashZero()
+        {
+            // Get/Put without an explicit state hash use 0 (baseline).
+            // Asserts the back-compat overload routes to the same slot.
+            var cache = MakeCache();
+            cache.Put("SELECT 1", null,
+                new[] { new object[] { "x" } }, new[] { "v" });
+            var entry = cache.Get("SELECT 1", null, 0);
+            Assert.NotNull(entry);
+        }
+
+        [Fact]
+        public void DisabledNativeCacheStillTicksMissesWithStateHash()
+        {
+            // DisableNativeCache short-circuits before key building, so
+            // any state hash is fine — miss counter still ticks.
+            var cache = MakeCache();
+            cache.DisableNativeCache = true;
+            Assert.Null(cache.Get("SELECT 1", null, 0xdead));
+            Assert.Equal(1L, Interlocked.Read(ref cache.StatsMisses));
         }
     }
 }
