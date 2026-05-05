@@ -870,33 +870,39 @@ namespace GoldLapel
         }
 
         // Tokens that flip the wrapper's per-connection InTransaction
-        // flag. Lowercased for case-insensitive matching against the
-        // first non-whitespace token of each segment.
+        // flag. Case-insensitive match against the first non-whitespace
+        // token of each segment. SAVEPOINT and RELEASE are intentionally
+        // omitted — they are intra-transaction markers, not boundaries:
+        //   - SAVEPOINT errors outside a tx (Postgres requires an open
+        //     transaction). The flag is already true; flipping to true
+        //     is a no-op.
+        //   - RELEASE SAVEPOINT does NOT end the outer transaction.
+        //     Flipping to false here would desync wrapper state from
+        //     server state — wrapper out-of-tx while server in-tx —
+        //     causing stale cache reads inside the still-open tx.
+        // Mirrors the JS (0d19816) and Ruby (77d4313) classifiers.
         private static readonly HashSet<string> TxStartTokens =
             new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            { "BEGIN", "START", "SAVEPOINT" };
+            { "BEGIN", "START" };
         private static readonly HashSet<string> TxEndTokens =
             new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            { "COMMIT", "ROLLBACK", "RELEASE", "END" };
+            { "COMMIT", "ROLLBACK", "END" };
 
         /// <summary>
         /// Walk every statement segment in <paramref name="sql"/> and
         /// return the final wrapper-side <c>InTransaction</c> state change.
         /// Returns <c>true</c> if the last tx-relevant segment is a tx
-        /// start (<c>BEGIN</c> / <c>START TRANSACTION</c> / <c>SAVEPOINT</c>),
-        /// <c>false</c> if it's a tx end (<c>COMMIT</c> / <c>ROLLBACK</c> /
-        /// <c>RELEASE</c> / <c>END</c>), or <c>null</c> if no segment
-        /// matches (no flag change). Last-segment-wins so a multi-statement
-        /// body like <c>BEGIN; INSERT...; COMMIT</c> correctly settles to
+        /// start (<c>BEGIN</c> / <c>START TRANSACTION</c>), <c>false</c>
+        /// if it's a tx end (<c>COMMIT</c> / <c>ROLLBACK</c> / <c>END</c>),
+        /// or <c>null</c> if no segment matches (no flag change).
+        /// Last-segment-wins so a multi-statement body like
+        /// <c>BEGIN; INSERT...; COMMIT</c> correctly settles to
         /// out-of-transaction at the end — the pre-fix single-token check
         /// only saw <c>BEGIN</c> and left the wrapper stuck in
         /// <c>InTransaction = true</c> forever, bypassing cache reads
-        /// permanently. <c>SAVEPOINT</c> and <c>RELEASE</c> are treated as
-        /// start/end markers respectively per the cross-wrapper spec; this
-        /// is conservative for the common <c>BEGIN; SAVEPOINT a; ...; RELEASE
-        /// a; COMMIT</c> pattern and contrived <c>RELEASE</c>-without-final-
-        /// <c>COMMIT</c> bodies are out-of-scope (rare and would already be
-        /// cache-unsafe under the pre-fix flow too).
+        /// permanently. <c>SAVEPOINT</c> and <c>RELEASE SAVEPOINT</c> are
+        /// intra-transaction markers and produce no flag change — see
+        /// <see cref="TxStartTokens"/> for rationale.
         /// </summary>
         internal static bool? DetectTxTransition(string sql)
         {

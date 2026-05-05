@@ -133,11 +133,15 @@ namespace GoldLapel.Tests
         [Fact] public void SingleEndIsEnd()
             => Assert.False(NativeCache.DetectTxTransition("END"));
 
-        [Fact] public void SingleSavepointIsStart()
-            => Assert.True(NativeCache.DetectTxTransition("SAVEPOINT s1"));
+        // SAVEPOINT and RELEASE SAVEPOINT are intra-transaction markers,
+        // not boundaries. SAVEPOINT errors outside a tx (no-op flip), and
+        // RELEASE does NOT end the outer tx — flipping the flag to false
+        // would desync wrapper from server. Both are no-change.
+        [Fact] public void SingleSavepointNoChange()
+            => Assert.Null(NativeCache.DetectTxTransition("SAVEPOINT s1"));
 
-        [Fact] public void SingleReleaseIsEnd()
-            => Assert.False(NativeCache.DetectTxTransition("RELEASE SAVEPOINT s1"));
+        [Fact] public void SingleReleaseNoChange()
+            => Assert.Null(NativeCache.DetectTxTransition("RELEASE SAVEPOINT s1"));
 
         [Fact] public void CaseInsensitive()
         {
@@ -181,10 +185,33 @@ namespace GoldLapel.Tests
 
         [Fact] public void NestedSavepointReleaseCommit()
         {
-            // `BEGIN; SAVEPOINT a; INSERT...; RELEASE a; COMMIT` — last
-            // tx-relevant segment is COMMIT (false). Settles correctly.
+            // `BEGIN; SAVEPOINT a; INSERT...; RELEASE a; COMMIT` — the
+            // SAVEPOINT/RELEASE markers don't change the flag; only BEGIN
+            // (true) and COMMIT (false) matter, so the body settles false.
             var t = NativeCache.DetectTxTransition(
                 "BEGIN; SAVEPOINT a; INSERT INTO orders VALUES (1); RELEASE SAVEPOINT a; COMMIT");
+            Assert.False(t);
+        }
+
+        [Fact] public void SavepointReleaseInsideTxStaysOpen()
+        {
+            // Regression: `BEGIN; SAVEPOINT s; SELECT 1; RELEASE s; SELECT 2`
+            // — InTransaction must stay true through the SAVEPOINT/RELEASE
+            // markers. Pre-fix, RELEASE incorrectly flipped to false,
+            // desyncing the wrapper from the still-open server transaction
+            // and serving stale cache reads for the trailing SELECT 2.
+            var t = NativeCache.DetectTxTransition(
+                "BEGIN; SAVEPOINT s; SELECT 1; RELEASE SAVEPOINT s; SELECT 2");
+            Assert.True(t);
+        }
+
+        [Fact] public void SavepointReleaseFullCycleClosesOnCommit()
+        {
+            // `BEGIN; SAVEPOINT s; SELECT 1; RELEASE s; SELECT 2; COMMIT`
+            // — same as above but with the trailing COMMIT, which is the
+            // only segment that flips the flag to false.
+            var t = NativeCache.DetectTxTransition(
+                "BEGIN; SAVEPOINT s; SELECT 1; RELEASE SAVEPOINT s; SELECT 2; COMMIT");
             Assert.False(t);
         }
 
