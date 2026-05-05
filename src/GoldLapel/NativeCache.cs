@@ -703,6 +703,56 @@ namespace GoldLapel
             return sql + "\0" + sh + "\0" + paramsPart;
         }
 
+        /// <summary>
+        /// Replace the contents of <c>'...'</c> and <c>"..."</c> string
+        /// literals with spaces, preserving overall length so positions
+        /// line up with the original. PG's doubled-quote <c>''</c> /
+        /// <c>""</c> escapes are handled the same way as in
+        /// <see cref="SplitStatements"/>. Used by
+        /// <see cref="DetectWrite"/>'s SELECT branch so that bare words
+        /// like <c>INTO</c> inside a literal (e.g.
+        /// <c>SELECT 'INSERT INTO orders' FROM audit_log</c>) don't trip
+        /// the SELECT-INTO DDL classifier. Mirrors goldlapel-js commit
+        /// <c>63753fe</c>.
+        /// </summary>
+        internal static string StripStringLiterals(string sql)
+        {
+            if (string.IsNullOrEmpty(sql)) return sql;
+            var buf = sql.ToCharArray();
+            char? quote = null;
+            int i = 0;
+            while (i < sql.Length)
+            {
+                var c = sql[i];
+                if (quote.HasValue)
+                {
+                    if (c == quote.Value)
+                    {
+                        if (i + 1 < sql.Length && sql[i + 1] == quote.Value)
+                        {
+                            // Doubled-quote escape: blank both, stay inside literal.
+                            buf[i] = ' ';
+                            buf[i + 1] = ' ';
+                            i += 2;
+                            continue;
+                        }
+                        // Closing quote: leave the delimiter, drop the literal body.
+                        quote = null;
+                    }
+                    else
+                    {
+                        buf[i] = ' ';
+                    }
+                }
+                else
+                {
+                    if (c == '\'' || c == '"') quote = c;
+                }
+                i++;
+            }
+            return new string(buf);
+        }
+
         internal static string DetectWrite(string sql)
         {
             var trimmed = sql.Trim();
@@ -740,11 +790,22 @@ namespace GoldLapel
                     if (tokens.Length < 3 || !tokens[1].Equals("INTO", StringComparison.OrdinalIgnoreCase)) return null;
                     return BareTable(tokens[2]);
                 case "SELECT":
+                    // Re-tokenize from a literal-stripped form so that bare
+                    // words like `INTO` or `FROM` inside `'...'` / `"..."`
+                    // don't trigger the SELECT-INTO DDL classifier (e.g.
+                    // `SELECT 'INSERT INTO orders' FROM audit_log`,
+                    // `SELECT * FROM "into_table"`). Other branches above
+                    // use fixed-position token checks (tokens[1], tokens[2])
+                    // and aren't affected — only SELECT scans the full token
+                    // stream looking for INTO. Mirrors goldlapel-js commit
+                    // `63753fe`.
+                    var scanTokens = StripStringLiterals(trimmed)
+                        .Split(new[] { ' ', '\t', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
                     var sawInto = false;
                     string intoTarget = null;
-                    for (int i = 1; i < tokens.Length; i++)
+                    for (int i = 1; i < scanTokens.Length; i++)
                     {
-                        var upper = tokens[i].ToUpper();
+                        var upper = scanTokens[i].ToUpper();
                         if (upper == "INTO" && !sawInto)
                         {
                             sawInto = true;
@@ -754,7 +815,7 @@ namespace GoldLapel
                         {
                             if (upper == "TEMPORARY" || upper == "TEMP" || upper == "UNLOGGED")
                                 continue;
-                            intoTarget = tokens[i];
+                            intoTarget = scanTokens[i];
                             continue;
                         }
                         if (sawInto && intoTarget != null && upper == "FROM")

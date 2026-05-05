@@ -34,6 +34,28 @@ namespace GoldLapel.Tests
         [Fact] public void Empty() => Assert.Null(NativeCache.DetectWrite(""));
         [Fact] public void Whitespace() => Assert.Null(NativeCache.DetectWrite("   "));
         [Fact] public void CopyWithColumns() => Assert.Equal("orders", NativeCache.DetectWrite("COPY orders(id, name) FROM '/tmp/data.csv'"));
+
+        // ── SELECT-INTO false-positive on string literals ──
+        //
+        // Pre-fix tokenizer split SELECTs on whitespace only, so a bare
+        // `INTO` inside a `'...'` / `"..."` literal got classified as the
+        // SELECT-INTO DDL form and returned DdlSentinel — silently
+        // flushing the whole cache on plain reads. Fix: re-tokenize the
+        // SELECT branch from a literal-stripped form. Mirrors
+        // goldlapel-js commit `63753fe`. Spec:
+        // docs/todos/wrapper-detect-write-string-literal-false-positive.md.
+        [Fact] public void SelectIntoSingleQuotedLiteralIsNotDdl()
+            => Assert.Null(NativeCache.DetectWrite("SELECT 'INSERT INTO orders;' FROM audit_log"));
+        [Fact] public void SelectIntoDoubleQuotedIdentifierIsNotDdl()
+            => Assert.Null(NativeCache.DetectWrite("SELECT * FROM \"into_table\""));
+        [Fact] public void SelectIntoLikePatternLiteralIsNotDdl()
+            => Assert.Null(NativeCache.DetectWrite("SELECT message FROM logs WHERE message LIKE '%INTO%'"));
+        [Fact] public void SelectIntoDoubledQuoteEscapeIsNotDdl()
+            => Assert.Null(NativeCache.DetectWrite("SELECT 'It''s INTO trouble' FROM notes"));
+        [Fact] public void RealSelectIntoNewTableStillDdl()
+            => Assert.Equal(NativeCache.DdlSentinel, NativeCache.DetectWrite("SELECT * INTO new_table FROM source"));
+        [Fact] public void RealSelectIntoTempStillDdl()
+            => Assert.Equal(NativeCache.DdlSentinel, NativeCache.DetectWrite("SELECT id INTO TEMP scratch FROM source"));
     }
 
     // ── ExtractTables ────────────────────────────────────────
