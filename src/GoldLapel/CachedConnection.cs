@@ -310,7 +310,15 @@ namespace GoldLapel
                 reader.Close();
 
                 var rowArray = rows.ToArray();
-                _conn.Cache.Put(sql, parameters, rowArray, columns, stateHash);
+                // Skip cache-put for session-state commands (SET / RESET /
+                // LISTEN / UNLISTEN / NOTIFY / etc.). They return empty
+                // rowsets but would otherwise satisfy the "rows + columns
+                // are non-null" gate and bloat the cache with no-row
+                // entries that never serve real data. See
+                // NativeCache.IsSessionStateCommand and
+                // docs/todos/wrapper-cache-set-responses.md.
+                if (!NativeCache.IsSessionStateCommand(sql))
+                    _conn.Cache.Put(sql, parameters, rowArray, columns, stateHash);
                 return new CachedDataReader(rowArray, columns);
             }
             catch

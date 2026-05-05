@@ -522,6 +522,82 @@ namespace GoldLapel.Tests
             // DDL anywhere → invalidate all.
             Assert.Equal(0, cache.Size);
         }
+
+        // ── Session-state commands not cached (cross-wrapper bug fix) ──
+        //
+        // ExecuteReader on `SET foo = 'bar'` returns an empty rowset
+        // (FieldCount = 0). Without the IsSessionStateCommand guard the
+        // wrapper would put `(rows=[], columns=[])` into the cache —
+        // bloating the cache with no-row entries that never serve real
+        // data and applying needless eviction pressure on chatty
+        // sessions.
+
+        [Fact]
+        public void SetThroughExecuteReaderIsNotCached()
+        {
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var inner = new FakeConnection();
+            inner.NextReader = new FakeDataReader(new object[0][], new string[0]);
+            var conn = new CachedConnection(inner, cache);
+
+            var cmd = conn.CreateCommand();
+            cmd.CommandText = "SET application_name = 'app1'";
+            cmd.ExecuteReader();
+
+            Assert.Equal(0, cache.Size);
+        }
+
+        [Fact]
+        public void ResetThroughExecuteReaderIsNotCached()
+        {
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var inner = new FakeConnection();
+            inner.NextReader = new FakeDataReader(new object[0][], new string[0]);
+            var conn = new CachedConnection(inner, cache);
+
+            var cmd = conn.CreateCommand();
+            cmd.CommandText = "RESET application_name";
+            cmd.ExecuteReader();
+
+            Assert.Equal(0, cache.Size);
+        }
+
+        [Fact]
+        public void ListenThroughExecuteReaderIsNotCached()
+        {
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var inner = new FakeConnection();
+            inner.NextReader = new FakeDataReader(new object[0][], new string[0]);
+            var conn = new CachedConnection(inner, cache);
+
+            var cmd = conn.CreateCommand();
+            cmd.CommandText = "LISTEN channel_x";
+            cmd.ExecuteReader();
+
+            Assert.Equal(0, cache.Size);
+        }
+
+        [Fact]
+        public void EmptySelectStillCaches()
+        {
+            // Sanity check: the IsSessionStateCommand guard must NOT
+            // catch genuine SELECTs that happen to return zero rows.
+            // Those should still be cached so the next call hits.
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var inner = new FakeConnection();
+            inner.NextReader = new FakeDataReader(new object[0][], new[] { "id" });
+            var conn = new CachedConnection(inner, cache);
+
+            var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT * FROM orders WHERE 1=0";
+            cmd.ExecuteReader();
+
+            Assert.Equal(1, cache.Size);
+        }
     }
 
     // ── CachedCommand.DbConnection setter ─────────────────────

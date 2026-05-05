@@ -1320,6 +1320,38 @@ namespace GoldLapel.Tests
             => Assert.Empty(NativeCache.DetectWritesMulti(null));
     }
 
+    // ── IsSessionStateCommand ────────────────────────────────
+    //
+    // Cross-wrapper fix for the "wrappers cache SET responses
+    // pointlessly" gap (docs/todos/wrapper-cache-set-responses.md).
+    // Used by CachedConnection.CacheAndReturn to skip the cache-put on
+    // session-state commands whose responses are empty rowsets.
+
+    public class IsSessionStateCommandTest
+    {
+        [Fact] public void Set() => Assert.True(NativeCache.IsSessionStateCommand("SET app.user_id = '42'"));
+        [Fact] public void Reset() => Assert.True(NativeCache.IsSessionStateCommand("RESET app.user_id"));
+        [Fact] public void Listen() => Assert.True(NativeCache.IsSessionStateCommand("LISTEN channel_x"));
+        [Fact] public void Unlisten() => Assert.True(NativeCache.IsSessionStateCommand("UNLISTEN channel_x"));
+        [Fact] public void Notify() => Assert.True(NativeCache.IsSessionStateCommand("NOTIFY channel_x, 'payload'"));
+        [Fact] public void Begin() => Assert.True(NativeCache.IsSessionStateCommand("BEGIN"));
+        [Fact] public void Commit() => Assert.True(NativeCache.IsSessionStateCommand("COMMIT"));
+        [Fact] public void Rollback() => Assert.True(NativeCache.IsSessionStateCommand("ROLLBACK"));
+        [Fact] public void Savepoint() => Assert.True(NativeCache.IsSessionStateCommand("SAVEPOINT sp1"));
+        [Fact] public void CaseInsensitive() => Assert.True(NativeCache.IsSessionStateCommand("set app.user_id = '42'"));
+        [Fact] public void LeadingWhitespace() => Assert.True(NativeCache.IsSessionStateCommand("   SET foo = 'bar'"));
+        [Fact] public void Select() => Assert.False(NativeCache.IsSessionStateCommand("SELECT * FROM orders"));
+        [Fact] public void Insert() => Assert.False(NativeCache.IsSessionStateCommand("INSERT INTO orders VALUES (1)"));
+        [Fact] public void Empty() => Assert.False(NativeCache.IsSessionStateCommand(""));
+        [Fact] public void Whitespace() => Assert.False(NativeCache.IsSessionStateCommand("   "));
+        [Fact] public void Null() => Assert.False(NativeCache.IsSessionStateCommand(null));
+        // Substrings of session-state commands must not match — only
+        // exact first tokens. e.g. `SETTLE` or `RESETTING` are not SET /
+        // RESET. We bound the first-token at whitespace OR `;`.
+        [Fact] public void NotPrefixMatch() => Assert.False(NativeCache.IsSessionStateCommand("SETTLE foo"));
+        [Fact] public void TerminatedBySemicolon() => Assert.True(NativeCache.IsSessionStateCommand("SET;"));
+    }
+
     public class ConnectionGucStateTest
     {
         [Fact] public void EmptyStateHashIsZero()

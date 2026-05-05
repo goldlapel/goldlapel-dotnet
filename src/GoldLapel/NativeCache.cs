@@ -813,6 +813,43 @@ namespace GoldLapel
         internal static bool IsTxStart(string sql) { return TxStart.IsMatch(sql); }
         internal static bool IsTxEnd(string sql) { return TxEnd.IsMatch(sql); }
 
+        // Session-state commands whose responses are not cacheable. SET /
+        // RESET / LISTEN / UNLISTEN / NOTIFY return empty rowsets but
+        // would otherwise satisfy the "rows + columns are non-null" gate
+        // in CacheAndReturn — caching them bloats the cache with no-row
+        // entries that never serve real data and costs needless eviction
+        // pressure on chatty sessions. BEGIN/COMMIT/ROLLBACK/SAVEPOINT are
+        // listed for parity with the cross-wrapper spec; the existing TX
+        // short-circuit already handles BEGIN/COMMIT/ROLLBACK before any
+        // cache path runs, but listing them here keeps the helper
+        // self-contained. Mirrors the cross-wrapper fix
+        // (docs/todos/wrapper-cache-set-responses.md).
+        private static readonly HashSet<string> SessionStateCommands =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                "SET", "RESET", "LISTEN", "UNLISTEN", "NOTIFY",
+                "BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT",
+            };
+
+        /// <summary>
+        /// Return true when the SQL's first token is a session-state
+        /// command (SET / RESET / LISTEN / UNLISTEN / NOTIFY / BEGIN /
+        /// COMMIT / ROLLBACK / SAVEPOINT). Used to skip cache-put on
+        /// commands whose responses are empty rowsets and have no value
+        /// as cached entries.
+        /// </summary>
+        internal static bool IsSessionStateCommand(string sql)
+        {
+            if (string.IsNullOrEmpty(sql)) return false;
+            var trimmed = sql.TrimStart();
+            if (trimmed.Length == 0) return false;
+            int end = 0;
+            while (end < trimmed.Length && !char.IsWhiteSpace(trimmed[end])
+                   && trimmed[end] != ';') end++;
+            if (end == 0) return false;
+            return SessionStateCommands.Contains(trimmed.Substring(0, end));
+        }
+
         /// <summary>
         /// Run <see cref="DetectWrite"/> over each statement in a
         /// possibly-multi-statement SQL body and return the union of
