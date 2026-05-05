@@ -319,7 +319,7 @@ namespace GoldLapel.Tests
             Assert.Equal(0, cache.Size);
         }
 
-        // ── GUC-RLS cache safety integration ─────────────────────────
+        // ── GUC-RLS cache safety integration (wrapper-side native cache) ──
         //
         // End-to-end through CachedConnection: a SET on an unsafe GUC
         // updates the per-connection state hash, and subsequent SELECTs

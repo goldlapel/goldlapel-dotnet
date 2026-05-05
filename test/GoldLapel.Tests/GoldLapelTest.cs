@@ -1417,6 +1417,36 @@ namespace GoldLapel.Tests
             Assert.Contains("--disable-auto-indexes", gl.BuildSpawnArgs());
         }
 
+        [Fact]
+        public void PromotedDisableFlagsEmitInAlphabeticalOrder()
+        {
+            // BuildSpawnArgs commits to alphabetical emission order for the
+            // four promoted disable flags (matches the proxy's main.rs
+            // declaration order). Locking this in lets downstream argv-diff
+            // tooling rely on a stable shape.
+            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
+                new GoldLapelOptions
+                {
+                    DisableProxyCache = true,
+                    DisableMatviews = true,
+                    DisableSqloptimize = true,
+                    DisableAutoIndexes = true,
+                });
+            var args = gl.BuildSpawnArgs();
+            var ai = args.IndexOf("--disable-auto-indexes");
+            var mv = args.IndexOf("--disable-matviews");
+            var pc = args.IndexOf("--disable-proxy-cache");
+            var so = args.IndexOf("--disable-sqloptimize");
+            Assert.True(ai >= 0 && mv >= 0 && pc >= 0 && so >= 0,
+                "all four promoted disable flags must appear in argv");
+            Assert.True(ai < mv,
+                $"--disable-auto-indexes (index {ai}) should precede --disable-matviews (index {mv})");
+            Assert.True(mv < pc,
+                $"--disable-matviews (index {mv}) should precede --disable-proxy-cache (index {pc})");
+            Assert.True(pc < so,
+                $"--disable-proxy-cache (index {pc}) should precede --disable-sqloptimize (index {so})");
+        }
+
         // ─── DisableNativeCache ─────────────────────────────────────────
         //
         // DisableNativeCache is a wrapper-only knob — there is no

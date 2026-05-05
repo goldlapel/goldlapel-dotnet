@@ -996,7 +996,7 @@ namespace GoldLapel.Tests
         }
     }
 
-    // ── GUC-RLS cache safety (Option Y, wrapper-side L1) ──────────────
+    // ── GUC-RLS cache safety (Option Y, wrapper-side native cache) ────
     //
     // Mirrors `goldlapel/src/guc_state.rs` (commit `3e02359`). Tests cover:
     //   * IsUnsafeGuc classification (short list + namespaced + case)
@@ -1394,13 +1394,38 @@ namespace GoldLapel.Tests
             Assert.False(s.ObserveSql(""));
             Assert.Equal(0L, s.StateHash);
         }
+
+        [Fact] public void SetTextInsideStringLiteralIsNotApplied()
+        {
+            // A SELECT whose value column happens to contain literal SQL
+            // text that looks like a SET command must NOT be parsed as a
+            // SET — the head token is SELECT, so ParseSetCommand rejects.
+            // Regression guard: lexer-naive shortcuts that prefix-match
+            // "SET" anywhere in the body would leak.
+            var s = new ConnectionGucState();
+            Assert.False(s.ObserveSql("SELECT 'SET app.user_id = ''42'''"));
+            Assert.Equal(0L, s.StateHash);
+        }
+
+        [Fact] public void SetEmbeddedInStringLiteralBetweenStatementsIgnored()
+        {
+            // The full SQL is a single SELECT whose argument contains the
+            // bytes `; SET app.user_id = '42'`. The semicolon is inside a
+            // quoted literal, so SplitStatements must NOT split it; the
+            // single segment is then parsed as SELECT (head != SET) and
+            // produces no state mutation.
+            var s = new ConnectionGucState();
+            Assert.False(s.ObserveSql("SELECT 'a; SET app.user_id = ''42'''"));
+            Assert.Equal(0L, s.StateHash);
+        }
     }
 
     // ── Cache isolation by state hash ─────────────────────────────
     //
     // The actual security goal: same SQL + same params + DIFFERENT unsafe
     // GUCs must NOT share a cache slot. Closes the GUC-driven RLS leak at
-    // the L1 layer (the proxy commit `3e02359` closed it at L2).
+    // the wrapper-side native cache (the proxy commit `3e02359` closed it
+    // at the proxy-cache layer).
 
     public class StateHashCacheIsolationTest : IDisposable
     {

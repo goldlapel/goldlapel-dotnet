@@ -31,7 +31,7 @@ namespace GoldLapel
     // Mirrors the proxy's `guc_state.rs` (commit `3e02359`). Custom-GUC-driven
     // RLS (e.g. `SET app.user_id = '42'; SELECT * FROM accounts;` where the
     // policy reads `current_setting('app.user_id')`) is a real cache leak: the
-    // wrapper's L1 cache today keys by SQL+params, so user A's cached rows
+    // wrapper's native cache today keys by SQL+params, so user A's cached rows
     // could be served to user B over the same connection after a SET.
     //
     // We fingerprint the subset of GUC values that can change query results
@@ -79,7 +79,7 @@ namespace GoldLapel
     /// <summary>
     /// Per-connection unsafe-GUC state. Each <see cref="CachedConnection"/>
     /// owns one. The cached <see cref="StateHash"/> is folded into the
-    /// L1 cache key so two connections with different unsafe-GUC values
+    /// native cache key so two connections with different unsafe-GUC values
     /// (different <c>app.user_id</c>, different <c>role</c>, etc.) never
     /// share a cache slot.
     /// </summary>
@@ -458,7 +458,7 @@ namespace GoldLapel
         // <see cref="ConnectionGucState.StateHash"/> is folded into the
         // key so two connections with different unsafe-GUC values never
         // share a cache slot — closes the GUC-driven RLS leak that the
-        // proxy commit `3e02359` fixed at the L2 layer.
+        // proxy commit `3e02359` fixed at the proxy-cache layer.
         public CacheEntry Get(string sql, object[] parameters, long stateHash)
         {
             if (!_enabled || !_invalidationConnected) return null;
