@@ -354,8 +354,12 @@ namespace GoldLapel.Tests
             var inner = new FakeConnection();
             var conn = new CachedConnection(inner, cache);
 
+            // application_name is harmless — wrappers see it on every
+            // libpq handshake and we don't want a per-connection setting
+            // to fragment the cache. timezone moved to the unsafe list
+            // (it changes the textual representation of timestamp cols).
             var setCmd = conn.CreateCommand();
-            setCmd.CommandText = "SET timezone = 'UTC'";
+            setCmd.CommandText = "SET application_name = 'foo'";
             inner.NextNonQueryResult = 0;
             setCmd.ExecuteNonQuery();
 

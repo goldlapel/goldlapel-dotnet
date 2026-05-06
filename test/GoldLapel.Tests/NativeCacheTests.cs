@@ -1191,12 +1191,36 @@ namespace GoldLapel.Tests
 
         [Fact] public void HarmlessGucsAreSafe()
         {
-            Assert.False(NativeCache.IsUnsafeGuc("timezone"));
             Assert.False(NativeCache.IsUnsafeGuc("application_name"));
             Assert.False(NativeCache.IsUnsafeGuc("statement_timeout"));
             Assert.False(NativeCache.IsUnsafeGuc("work_mem"));
             Assert.False(NativeCache.IsUnsafeGuc("client_encoding"));
-            Assert.False(NativeCache.IsUnsafeGuc("DateStyle"));
+            Assert.False(NativeCache.IsUnsafeGuc("default_statistics_target"));
+        }
+
+        // Output-formatting and locale GUCs are unsafe — they alter the
+        // textual representation of returned columns, so two connections
+        // with different settings receive different bytes for the same
+        // SELECT. Mirrors the dispatch spec for guc-rls-cache-safety.md.
+        [Fact] public void FormattingGucsAreUnsafe()
+        {
+            Assert.True(NativeCache.IsUnsafeGuc("DateStyle"));
+            Assert.True(NativeCache.IsUnsafeGuc("datestyle"));
+            Assert.True(NativeCache.IsUnsafeGuc("IntervalStyle"));
+            Assert.True(NativeCache.IsUnsafeGuc("intervalstyle"));
+            Assert.True(NativeCache.IsUnsafeGuc("TimeZone"));
+            Assert.True(NativeCache.IsUnsafeGuc("timezone"));
+            Assert.True(NativeCache.IsUnsafeGuc("bytea_output"));
+            Assert.True(NativeCache.IsUnsafeGuc("BYTEA_OUTPUT"));
+        }
+
+        [Fact] public void LocaleGucsAreUnsafe()
+        {
+            Assert.True(NativeCache.IsUnsafeGuc("lc_messages"));
+            Assert.True(NativeCache.IsUnsafeGuc("lc_monetary"));
+            Assert.True(NativeCache.IsUnsafeGuc("lc_numeric"));
+            Assert.True(NativeCache.IsUnsafeGuc("lc_time"));
+            Assert.True(NativeCache.IsUnsafeGuc("LC_MONETARY"));
         }
 
         [Fact] public void EmptyAndNullAreSafe()
@@ -1340,10 +1364,178 @@ namespace GoldLapel.Tests
         [Fact] public void ParseRejectsSetTimeZoneTwoWordForm()
         {
             // `SET TIME ZONE 'UTC'` — legacy two-word form. We don't
-            // model it because timezone is harmless. Returning null is
-            // correct: the wrapper treats it as not-a-trackable-SET,
-            // i.e. cache-safe.
+            // model it. Returning null means the parser doesn't recognise
+            // this shape — the wrapper falls back to the post-call
+            // verify path (Concern 6) when this form is used. Modern
+            // form `SET TimeZone = 'UTC'` IS recognised and mutates
+            // state — TimeZone is in the unsafe list (formatting GUC).
             Assert.Null(NativeCache.ParseSetCommand("SET TIME ZONE 'UTC'"));
+        }
+
+        // ── DISCARD ─────────────────────────────────────────────────
+        // PG's DISCARD command. ALL clears all session state including
+        // SETs, so it must wipe the unsafe-GUC hash. Other variants
+        // (PLANS / SEQUENCES / TEMP / TEMPORARY) don't affect GUCs.
+
+        [Fact] public void ParseDiscardAll()
+        {
+            var cmd = NativeCache.ParseSetCommand("DISCARD ALL");
+            Assert.NotNull(cmd);
+            Assert.Equal(SetCommand.CommandKind.DiscardAll, cmd.Kind);
+            Assert.Null(cmd.Name);
+        }
+
+        [Fact] public void ParseDiscardAllCaseInsensitive()
+        {
+            Assert.Equal(SetCommand.CommandKind.DiscardAll,
+                NativeCache.ParseSetCommand("discard all").Kind);
+            Assert.Equal(SetCommand.CommandKind.DiscardAll,
+                NativeCache.ParseSetCommand("Discard All").Kind);
+        }
+
+        [Fact] public void ParseDiscardAllTrailingSemicolon()
+        {
+            Assert.Equal(SetCommand.CommandKind.DiscardAll,
+                NativeCache.ParseSetCommand("DISCARD ALL;").Kind);
+        }
+
+        [Fact] public void ParseDiscardPlansIsNoop()
+            => Assert.Null(NativeCache.ParseSetCommand("DISCARD PLANS"));
+
+        [Fact] public void ParseDiscardSequencesIsNoop()
+            => Assert.Null(NativeCache.ParseSetCommand("DISCARD SEQUENCES"));
+
+        [Fact] public void ParseDiscardTempIsNoop()
+            => Assert.Null(NativeCache.ParseSetCommand("DISCARD TEMP"));
+
+        [Fact] public void ParseDiscardTemporaryIsNoop()
+            => Assert.Null(NativeCache.ParseSetCommand("DISCARD TEMPORARY"));
+
+        [Fact] public void ParseDiscardWithJunkRejected()
+        {
+            // `DISCARD` alone isn't valid; `DISCARD ALL extra` either.
+            Assert.Null(NativeCache.ParseSetCommand("DISCARD"));
+            Assert.Null(NativeCache.ParseSetCommand("DISCARD ALL extra"));
+        }
+
+        // ── SELECT set_config(...) ───────────────────────────────────
+        // Supabase's canonical JWT pattern. is_local=false → state mutates;
+        // is_local=true → SET LOCAL semantics (no-op for our hash).
+
+        [Fact] public void ParseSetConfigBasic()
+        {
+            var cmd = NativeCache.ParseSetCommand("SELECT set_config('app.user_id', '42', false)");
+            Assert.NotNull(cmd);
+            Assert.Equal(SetCommand.CommandKind.Set, cmd.Kind);
+            Assert.Equal("app.user_id", cmd.Name);
+            Assert.Equal("42", cmd.Value);
+        }
+
+        [Fact] public void ParseSetConfigLocalTrue()
+        {
+            var cmd = NativeCache.ParseSetCommand("SELECT set_config('app.user_id', '42', true)");
+            Assert.NotNull(cmd);
+            Assert.Equal(SetCommand.CommandKind.SetLocal, cmd.Kind);
+            Assert.Equal("app.user_id", cmd.Name);
+            Assert.Equal("42", cmd.Value);
+        }
+
+        [Fact] public void ParseSetConfigPgCatalogPrefix()
+        {
+            var cmd = NativeCache.ParseSetCommand("SELECT pg_catalog.set_config('app.user_id', '42', false)");
+            Assert.NotNull(cmd);
+            Assert.Equal(SetCommand.CommandKind.Set, cmd.Kind);
+            Assert.Equal("app.user_id", cmd.Name);
+        }
+
+        [Fact] public void ParseSetConfigCaseInsensitive()
+        {
+            var cmd = NativeCache.ParseSetCommand("select Set_Config('role', 'app_user', FALSE)");
+            Assert.NotNull(cmd);
+            Assert.Equal("role", cmd.Name);
+        }
+
+        [Fact] public void ParseSetConfigSingleQuotedTrueFalse()
+        {
+            // Some apps use `'t'`/`'f'` strings.
+            var cmd1 = NativeCache.ParseSetCommand("SELECT set_config('app.id', '1', 't')");
+            Assert.Equal(SetCommand.CommandKind.SetLocal, cmd1.Kind);
+            var cmd2 = NativeCache.ParseSetCommand("SELECT set_config('app.id', '1', 'f')");
+            Assert.Equal(SetCommand.CommandKind.Set, cmd2.Kind);
+        }
+
+        [Fact] public void ParseSetConfigBoolCast()
+        {
+            var cmd = NativeCache.ParseSetCommand("SELECT set_config('app.id', '42', false::bool)");
+            Assert.NotNull(cmd);
+            Assert.Equal(SetCommand.CommandKind.Set, cmd.Kind);
+            Assert.Equal("app.id", cmd.Name);
+        }
+
+        [Fact] public void ParseSetConfigDoubledQuoteEscape()
+        {
+            // The value contains an escaped single quote `''` (PG syntax
+            // for a literal `'`). The parser must collapse `''` → `'`.
+            var cmd = NativeCache.ParseSetCommand("SELECT set_config('app.note', 'it''s ok', false)");
+            Assert.NotNull(cmd);
+            Assert.Equal("it's ok", cmd.Value);
+        }
+
+        [Fact] public void ParseSetConfigSafeNameNotTracked()
+        {
+            // set_config on a safe GUC parses but flagging it Set is fine —
+            // ConnectionGucState.Apply gates on IsUnsafeGuc and ignores it.
+            var cmd = NativeCache.ParseSetCommand("SELECT set_config('application_name', 'foo', false)");
+            Assert.NotNull(cmd);
+            Assert.Equal("application_name", cmd.Name);
+        }
+
+        [Fact] public void ParseSetConfigRejectsNonLiteralArgs()
+        {
+            // Cant statically resolve a parameter placeholder — return
+            // null so the caller falls back to post-call verify.
+            Assert.Null(NativeCache.ParseSetCommand("SELECT set_config($1, $2, $3)"));
+            // Function call as second arg — too dynamic for static parse.
+            Assert.Null(NativeCache.ParseSetCommand("SELECT set_config('app.id', current_user, false)"));
+        }
+
+        [Fact] public void ParseSetConfigRejectsExtraExpressions()
+        {
+            // `SELECT set_config(...) || 'x'` — there's stuff after the
+            // closing `)`, so this is part of a larger expression. We
+            // don't track those.
+            Assert.Null(NativeCache.ParseSetCommand("SELECT set_config('app.id', '1', false) || 'x'"));
+            // `SELECT 1, set_config(...)` — junk between SELECT and set_config.
+            Assert.Null(NativeCache.ParseSetCommand("SELECT 1, set_config('app.id', '1', false)"));
+        }
+
+        [Fact] public void ParseSetConfigRejectsMalformed()
+        {
+            // Unclosed paren.
+            Assert.Null(NativeCache.ParseSetCommand("SELECT set_config('app.id', '1', false"));
+            // Wrong arg count.
+            Assert.Null(NativeCache.ParseSetCommand("SELECT set_config('app.id', '1')"));
+            Assert.Null(NativeCache.ParseSetCommand("SELECT set_config('app.id')"));
+            // Non-bool third arg.
+            Assert.Null(NativeCache.ParseSetCommand("SELECT set_config('app.id', '1', 42)"));
+        }
+
+        [Fact] public void ParseSetConfigTrailingSemicolon()
+        {
+            var cmd = NativeCache.ParseSetCommand("SELECT set_config('app.id', '1', false);");
+            Assert.NotNull(cmd);
+            Assert.Equal("app.id", cmd.Name);
+        }
+
+        [Fact] public void ParseSetConfigNullValueResetsUnsafe()
+        {
+            // PG's set_config treats NULL value as a reset; we model it
+            // as a Reset for unsafe names (so the value drops from the
+            // hash map) and ignore for safe names.
+            var cmd = NativeCache.ParseSetCommand("SELECT set_config('app.id', NULL, false)");
+            Assert.NotNull(cmd);
+            Assert.Equal(SetCommand.CommandKind.Reset, cmd.Kind);
+            Assert.Equal("app.id", cmd.Name);
         }
     }
 
@@ -1525,11 +1717,11 @@ namespace GoldLapel.Tests
         [Fact] public void SafeSetDoesNotChangeHash()
         {
             var s = new ConnectionGucState();
-            s.ObserveSql("SET timezone = 'UTC'");
-            Assert.Equal(0L, s.StateHash);
             s.ObserveSql("SET application_name = 'foo'");
             Assert.Equal(0L, s.StateHash);
             s.ObserveSql("SET statement_timeout = 5000");
+            Assert.Equal(0L, s.StateHash);
+            s.ObserveSql("SET work_mem = '64MB'");
             Assert.Equal(0L, s.StateHash);
         }
 
@@ -1609,7 +1801,7 @@ namespace GoldLapel.Tests
             var s = new ConnectionGucState();
             Assert.True(s.ObserveSql("SET app.user_id = '42'"));
             Assert.False(s.ObserveSql("SELECT 1"));
-            Assert.False(s.ObserveSql("SET timezone = 'UTC'"));
+            Assert.False(s.ObserveSql("SET application_name = 'foo'"));
             Assert.True(s.ObserveSql("RESET app.user_id"));
         }
 
@@ -1618,7 +1810,7 @@ namespace GoldLapel.Tests
             var s = new ConnectionGucState();
             s.ObserveSql("SET app.user_id = '42'");
             var h = s.StateHash;
-            s.ObserveSql("RESET timezone");
+            s.ObserveSql("RESET application_name");
             Assert.Equal(h, s.StateHash);
         }
 
@@ -1692,6 +1884,256 @@ namespace GoldLapel.Tests
             var s = new ConnectionGucState();
             Assert.False(s.ObserveSql("SELECT 'a; SET app.user_id = ''42'''"));
             Assert.Equal(0L, s.StateHash);
+        }
+
+        // ── DISCARD ALL clears state ────────────────────────────────
+
+        [Fact] public void DiscardAllClearsAllUnsafeState()
+        {
+            var s = new ConnectionGucState();
+            s.ObserveSql("SET app.user_id = '42'");
+            s.ObserveSql("SET search_path TO 'tenant_a'");
+            Assert.NotEqual(0L, s.StateHash);
+            Assert.True(s.ObserveSql("DISCARD ALL"));
+            Assert.Equal(0L, s.StateHash);
+        }
+
+        [Fact] public void DiscardAllOnEmptyStateIsNoChange()
+        {
+            var s = new ConnectionGucState();
+            Assert.False(s.ObserveSql("DISCARD ALL"));
+            Assert.Equal(0L, s.StateHash);
+        }
+
+        [Fact] public void DiscardPlansDoesNotClearGucState()
+        {
+            var s = new ConnectionGucState();
+            s.ObserveSql("SET app.user_id = '42'");
+            var h = s.StateHash;
+            Assert.False(s.ObserveSql("DISCARD PLANS"));
+            Assert.Equal(h, s.StateHash);
+        }
+
+        [Fact] public void DiscardSequencesDoesNotClearGucState()
+        {
+            var s = new ConnectionGucState();
+            s.ObserveSql("SET app.user_id = '42'");
+            var h = s.StateHash;
+            Assert.False(s.ObserveSql("DISCARD SEQUENCES"));
+            Assert.Equal(h, s.StateHash);
+        }
+
+        [Fact] public void DiscardTempDoesNotClearGucState()
+        {
+            var s = new ConnectionGucState();
+            s.ObserveSql("SET app.user_id = '42'");
+            var h = s.StateHash;
+            Assert.False(s.ObserveSql("DISCARD TEMP"));
+            Assert.False(s.ObserveSql("DISCARD TEMPORARY"));
+            Assert.Equal(h, s.StateHash);
+        }
+
+        [Fact] public void DiscardAllInMultiStatementBody()
+        {
+            var s = new ConnectionGucState();
+            s.ObserveSql("SET app.user_id = '42'");
+            Assert.NotEqual(0L, s.StateHash);
+            // Pool returns sometimes batch DISCARD ALL with subsequent SQL.
+            Assert.True(s.ObserveSql("DISCARD ALL; SELECT 1"));
+            Assert.Equal(0L, s.StateHash);
+        }
+
+        // ── set_config function form ────────────────────────────────
+
+        [Fact] public void SetConfigUnsafeMutatesHash()
+        {
+            var s = new ConnectionGucState();
+            Assert.True(s.ObserveSql("SELECT set_config('app.user_id', '42', false)"));
+            Assert.NotEqual(0L, s.StateHash);
+        }
+
+        [Fact] public void SetConfigEqualsRegularSet()
+        {
+            // The result of `SELECT set_config('x', 'y', false)` and
+            // `SET x = 'y'` must produce the same state hash.
+            var a = new ConnectionGucState();
+            a.ObserveSql("SET app.user_id = '42'");
+
+            var b = new ConnectionGucState();
+            b.ObserveSql("SELECT set_config('app.user_id', '42', false)");
+
+            Assert.Equal(a.StateHash, b.StateHash);
+        }
+
+        [Fact] public void SetConfigPgCatalogPrefixMutatesHash()
+        {
+            var s = new ConnectionGucState();
+            s.ObserveSql("SELECT pg_catalog.set_config('app.user_id', '42', false)");
+            Assert.NotEqual(0L, s.StateHash);
+        }
+
+        [Fact] public void SetConfigLocalIsNoop()
+        {
+            // is_local=true → SET LOCAL semantics, no hash change.
+            var s = new ConnectionGucState();
+            Assert.False(s.ObserveSql("SELECT set_config('app.user_id', '42', true)"));
+            Assert.Equal(0L, s.StateHash);
+        }
+
+        [Fact] public void SetConfigSafeNameDoesNotChangeHash()
+        {
+            var s = new ConnectionGucState();
+            Assert.False(s.ObserveSql("SELECT set_config('application_name', 'foo', false)"));
+            Assert.Equal(0L, s.StateHash);
+        }
+
+        [Fact] public void SetConfigInMultiStatementBody()
+        {
+            var s = new ConnectionGucState();
+            // Supabase's exact pattern: set_config + the actual query.
+            Assert.True(s.ObserveSql(
+                "SELECT set_config('app.jwt.user_id', 'alice', false); " +
+                "SELECT * FROM accounts"));
+            Assert.NotEqual(0L, s.StateHash);
+        }
+
+        [Fact] public void SetConfigNullResetsHash()
+        {
+            // PG's set_config with NULL value resets the parameter.
+            var s = new ConnectionGucState();
+            s.ObserveSql("SET app.user_id = '42'");
+            var h = s.StateHash;
+            Assert.True(s.ObserveSql("SELECT set_config('app.user_id', NULL, false)"));
+            Assert.NotEqual(h, s.StateHash);
+            Assert.Equal(0L, s.StateHash);
+        }
+
+        // ── Formatting / locale GUCs are unsafe ────────────────────
+
+        [Fact] public void DateStyleSetMutatesHash()
+        {
+            var s = new ConnectionGucState();
+            Assert.True(s.ObserveSql("SET DateStyle = 'ISO, MDY'"));
+            Assert.NotEqual(0L, s.StateHash);
+        }
+
+        [Fact] public void TimeZoneSetMutatesHash()
+        {
+            var s = new ConnectionGucState();
+            Assert.True(s.ObserveSql("SET TimeZone = 'UTC'"));
+            Assert.NotEqual(0L, s.StateHash);
+        }
+
+        [Fact] public void DifferentDateStylesIsolateState()
+        {
+            var a = new ConnectionGucState();
+            var b = new ConnectionGucState();
+            a.ObserveSql("SET DateStyle = 'ISO, MDY'");
+            b.ObserveSql("SET DateStyle = 'German, DMY'");
+            Assert.NotEqual(a.StateHash, b.StateHash);
+        }
+
+        [Fact] public void LcMonetarySetMutatesHash()
+        {
+            var s = new ConnectionGucState();
+            Assert.True(s.ObserveSql("SET lc_monetary = 'en_US.UTF-8'"));
+            Assert.NotEqual(0L, s.StateHash);
+        }
+
+        // ── ApplyVerifiedState (verify-on-checkout fallback) ───────
+
+        [Fact] public void ApplyVerifiedStateReplacesMap()
+        {
+            var s = new ConnectionGucState();
+            s.ObserveSql("SET app.user_id = '42'");
+            Assert.NotEqual(0L, s.StateHash);
+
+            // Verify pulled fresh state showing only `app.tenant`. The
+            // user_id should disappear (server-side state is authoritative).
+            var verified = new Dictionary<string, string>
+            {
+                { "app.tenant", "alpha" }
+            };
+            s.ApplyVerifiedState(verified);
+
+            // Verify hash matches a fresh state with only app.tenant set.
+            var b = new ConnectionGucState();
+            b.ObserveSql("SET app.tenant = 'alpha'");
+            Assert.Equal(b.StateHash, s.StateHash);
+        }
+
+        [Fact] public void ApplyVerifiedStateFiltersSafeGucs()
+        {
+            // Verify can return all session-source GUCs; we drop the
+            // safe ones. Result hash should match a state with only the
+            // unsafe ones applied.
+            var s = new ConnectionGucState();
+            var verified = new Dictionary<string, string>
+            {
+                { "application_name", "myapp" },
+                { "statement_timeout", "5000" },
+                { "app.user_id", "42" },
+                { "search_path", "public" },
+            };
+            s.ApplyVerifiedState(verified);
+
+            var b = new ConnectionGucState();
+            b.ObserveSql("SET app.user_id = '42'");
+            b.ObserveSql("SET search_path = 'public'");
+            Assert.Equal(b.StateHash, s.StateHash);
+        }
+
+        [Fact] public void ApplyVerifiedStateNullClearsMap()
+        {
+            var s = new ConnectionGucState();
+            s.ObserveSql("SET app.user_id = '42'");
+            s.ApplyVerifiedState(null);
+            Assert.Equal(0L, s.StateHash);
+        }
+
+        [Fact] public void ApplyVerifiedStateEmptyClearsMap()
+        {
+            var s = new ConnectionGucState();
+            s.ObserveSql("SET app.user_id = '42'");
+            s.ApplyVerifiedState(new Dictionary<string, string>());
+            Assert.Equal(0L, s.StateHash);
+        }
+
+        // ── Dirty flag for verify-on-checkout fallback ─────────────
+
+        [Fact] public void DirtyFlagDefaultsFalse()
+        {
+            var s = new ConnectionGucState();
+            Assert.False(s.IsDirty);
+        }
+
+        [Fact] public void MarkDirtySetsFlag()
+        {
+            var s = new ConnectionGucState();
+            s.MarkDirty();
+            Assert.True(s.IsDirty);
+        }
+
+        [Fact] public void ClearDirtyResetsFlag()
+        {
+            var s = new ConnectionGucState();
+            s.MarkDirty();
+            s.ClearDirty();
+            Assert.False(s.IsDirty);
+        }
+
+        [Fact] public void ApplyVerifiedStateClearsDirty()
+        {
+            // The whole point of verify-on-checkout: after a successful
+            // verify, dirty must be cleared so we don't re-verify on the
+            // next checkout.
+            var s = new ConnectionGucState();
+            s.MarkDirty();
+            s.ApplyVerifiedState(new Dictionary<string, string>
+            {
+                { "app.user_id", "42" }
+            });
+            Assert.False(s.IsDirty);
         }
     }
 

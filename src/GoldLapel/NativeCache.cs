@@ -51,12 +51,12 @@ namespace GoldLapel
     /// </summary>
     public class SetCommand
     {
-        public enum CommandKind { Set, SetLocal, Reset, ResetAll }
+        public enum CommandKind { Set, SetLocal, Reset, ResetAll, DiscardAll }
 
         public CommandKind Kind { get; }
-        /// <summary>Lowercased GUC name. Null for <c>RESET ALL</c>.</summary>
+        /// <summary>Lowercased GUC name. Null for <c>RESET ALL</c> / <c>DISCARD ALL</c>.</summary>
         public string Name { get; }
-        /// <summary>Raw value string with surrounding quotes stripped. Null for RESET / RESET ALL.</summary>
+        /// <summary>Raw value string with surrounding quotes stripped. Null for RESET / RESET ALL / DISCARD ALL.</summary>
         public string Value { get; }
 
         private SetCommand(CommandKind kind, string name, string value)
@@ -74,6 +74,8 @@ namespace GoldLapel
             new SetCommand(CommandKind.Reset, name, null);
         internal static SetCommand ResetAll() =>
             new SetCommand(CommandKind.ResetAll, null, null);
+        internal static SetCommand DiscardAll() =>
+            new SetCommand(CommandKind.DiscardAll, null, null);
     }
 
     /// <summary>
@@ -109,11 +111,45 @@ namespace GoldLapel
         // 32-bit hosts; written via Interlocked.Exchange.
         private long _stateHash;
 
+        // Dirty flag — set when the wrapper can't be sure observation
+        // captured a state change (post-call verify failed, pool reset
+        // semantics unknown, stored function might have SET internally).
+        // CachedConnection checks this on checkout and runs verify if
+        // set. Stored as int for Interlocked.* compatibility (no
+        // Interlocked.Exchange overload for bool).
+        private int _dirty;
+
         /// <summary>
         /// Current unsafe-GUC state hash. <c>0</c> for the empty baseline
         /// (fresh connection or after <c>RESET ALL</c> on an empty state).
         /// </summary>
         public long StateHash => Interlocked.Read(ref _stateHash);
+
+        /// <summary>
+        /// True when the connection's observed state may be out of sync
+        /// with the server's actual state. Set by post-call verify
+        /// failures (Concern 6) or by callers that detect a possible
+        /// pool reset they couldn't observe (Concern 4 / 5). Cleared
+        /// after a successful verify-on-checkout that calls
+        /// <see cref="ApplyVerifiedState"/>.
+        /// </summary>
+        public bool IsDirty => Interlocked.CompareExchange(ref _dirty, 0, 0) != 0;
+
+        /// <summary>
+        /// Mark the connection's state as potentially-stale. The next
+        /// wrapper checkout (or before-cache-lookup point) will issue
+        /// a verify query against <c>pg_settings</c>.
+        /// </summary>
+        public void MarkDirty() => Interlocked.Exchange(ref _dirty, 1);
+
+        /// <summary>
+        /// Clear the dirty flag. Callers that hand-applied a verified
+        /// state via <see cref="ApplyVerifiedState"/> shouldn't need to
+        /// call this — it's done atomically there. Exposed for testing
+        /// and for callers that performed verification through a
+        /// different path.
+        /// </summary>
+        public void ClearDirty() => Interlocked.Exchange(ref _dirty, 0);
 
         /// <summary>
         /// Apply a parsed <see cref="SetCommand"/>. No-op for
@@ -146,6 +182,7 @@ namespace GoldLapel
                         }
                         break;
                     case SetCommand.CommandKind.ResetAll:
+                    case SetCommand.CommandKind.DiscardAll:
                         if (_values.Count > 0)
                         {
                             _values.Clear();
@@ -155,6 +192,36 @@ namespace GoldLapel
                 }
                 if (changed) RecomputeHashLocked();
             }
+        }
+
+        /// <summary>
+        /// Apply a verified state snapshot from <c>pg_settings</c>. Used
+        /// by the verify-on-checkout fallback path: when the wrapper
+        /// can't observe a state change on the wire (stored functions,
+        /// pool resets it can't see, etc.), it queries
+        /// <c>pg_settings WHERE source='session'</c> to reconstruct
+        /// authoritative state, then calls this to swap the entire map
+        /// atomically. Safe values (timezone, application_name, etc.)
+        /// are filtered out during reconstruction by callers.
+        /// </summary>
+        public void ApplyVerifiedState(IDictionary<string, string> verified)
+        {
+            lock (_lock)
+            {
+                _values.Clear();
+                if (verified != null)
+                {
+                    foreach (var kvp in verified)
+                    {
+                        if (string.IsNullOrEmpty(kvp.Key)) continue;
+                        if (NativeCache.IsUnsafeGuc(kvp.Key))
+                            _values[kvp.Key.ToLowerInvariant()] = kvp.Value ?? string.Empty;
+                    }
+                }
+                RecomputeHashLocked();
+            }
+            // Verified state IS the truth — drop the dirty flag.
+            Interlocked.Exchange(ref _dirty, 0);
         }
 
         /// <summary>
@@ -1024,6 +1091,15 @@ namespace GoldLapel
         // changing the SQL text. Matched case-insensitively. Any GUC
         // with a `.` in the name is also treated as unsafe (namespaced
         // GUCs are the canonical custom-RLS pattern).
+        //
+        // Output-formatting and locale GUCs are also unsafe: changing
+        // DateStyle, IntervalStyle, TimeZone, bytea_output, or any of
+        // the lc_* monetary/numeric/time/messages GUCs alters the
+        // textual representation of returned columns. Two connections
+        // with different DateStyle settings receive different bytes
+        // for the same SELECT — caching across them would serve the
+        // wrong format. (PG's RLS predicates can also branch on these
+        // via current_setting('TimeZone')-style patterns.)
         private static readonly HashSet<string> UnsafeGucShortList =
             new HashSet<string>(StringComparer.OrdinalIgnoreCase)
             {
@@ -1034,6 +1110,15 @@ namespace GoldLapel
                 "default_transaction_read_only",
                 "transaction_isolation",
                 "row_security",
+                // Output-formatting / locale GUCs:
+                "datestyle",
+                "intervalstyle",
+                "timezone",
+                "bytea_output",
+                "lc_messages",
+                "lc_monetary",
+                "lc_numeric",
+                "lc_time",
             };
 
         /// <summary>
@@ -1108,13 +1193,20 @@ namespace GoldLapel
         }
 
         /// <summary>
-        /// Parse a <c>SET</c> / <c>RESET</c> command out of a single SQL
-        /// statement. Recognises <c>SET name = value</c>, <c>SET name TO
-        /// value</c>, <c>SET SESSION ...</c>, <c>SET LOCAL ...</c>,
-        /// <c>RESET name</c>, <c>RESET ALL</c>. Returns <c>null</c> for
-        /// anything else (including the legacy <c>SET TIME ZONE 'UTC'</c>
-        /// two-word form — timezone is harmless, treating it as
-        /// "not-a-trackable-SET" is correct for cache safety).
+        /// Parse a <c>SET</c> / <c>RESET</c> / <c>DISCARD</c> command,
+        /// or a <c>SELECT set_config(...)</c> function-form invocation,
+        /// out of a single SQL statement. Recognises:
+        /// <list type="bullet">
+        ///   <item><c>SET name = value</c>, <c>SET name TO value</c>,
+        ///         <c>SET SESSION ...</c>, <c>SET LOCAL ...</c></item>
+        ///   <item><c>RESET name</c>, <c>RESET ALL</c></item>
+        ///   <item><c>DISCARD ALL</c> (treated like <c>RESET ALL</c> — clears all unsafe state)</item>
+        ///   <item><c>DISCARD PLANS / SEQUENCES / TEMP / TEMPORARY</c> — no-op (returns null)</item>
+        ///   <item><c>SELECT set_config('name', 'value', is_local)</c> and
+        ///         <c>SELECT pg_catalog.set_config(...)</c> — Supabase's canonical JWT pattern</item>
+        /// </list>
+        /// Returns <c>null</c> for anything else (including the legacy
+        /// <c>SET TIME ZONE 'UTC'</c> two-word form, which we don't model).
         /// </summary>
         public static SetCommand ParseSetCommand(string sql)
         {
@@ -1143,6 +1235,41 @@ namespace GoldLapel
                 var name = NormalizeGucName(target);
                 if (name == null) return null;
                 return SetCommand.Reset(name);
+            }
+
+            // ── DISCARD ─────────────────────────────────────────────
+            // PG's DISCARD command resets parts of session state. Of the
+            // four variants:
+            //   - DISCARD ALL clears EVERYTHING — including SET state —
+            //     so it must clear the unsafe-GUC hash.
+            //   - DISCARD PLANS clears the plan cache only. Wrapper has
+            //     no plan cache; no state change.
+            //   - DISCARD SEQUENCES / TEMP / TEMPORARY don't affect GUCs.
+            // Anything else (including malformed) returns null.
+            if (head.Equals("DISCARD", StringComparison.OrdinalIgnoreCase))
+            {
+                if (tokens.Length != 2) return null;
+                var what = tokens[1];
+                if (what.Equals("ALL", StringComparison.OrdinalIgnoreCase))
+                    return SetCommand.DiscardAll();
+                if (what.Equals("PLANS", StringComparison.OrdinalIgnoreCase) ||
+                    what.Equals("SEQUENCES", StringComparison.OrdinalIgnoreCase) ||
+                    what.Equals("TEMP", StringComparison.OrdinalIgnoreCase) ||
+                    what.Equals("TEMPORARY", StringComparison.OrdinalIgnoreCase))
+                    return null;
+                return null;
+            }
+
+            // ── SELECT set_config(...) ──────────────────────────────
+            // Supabase / PostgREST canonical JWT-handoff pattern. Args
+            // are (setting_name, new_value, is_local). is_local=true is
+            // a transactional override — same semantics as SET LOCAL,
+            // so we model it as Local; is_local=false mutates state.
+            // We accept `set_config(...)` and `pg_catalog.set_config(...)`.
+            if (head.Equals("SELECT", StringComparison.OrdinalIgnoreCase))
+            {
+                var fn = ParseSetConfigCall(s);
+                return fn;
             }
 
             // ── SET ─────────────────────────────────────────────────
@@ -1210,6 +1337,276 @@ namespace GoldLapel
                 return null;
 
             return isLocal ? SetCommand.Local(gucName, value) : SetCommand.Set(gucName, value);
+        }
+
+        /// <summary>
+        /// Parse a <c>SELECT set_config(name, value, is_local)</c>
+        /// invocation (also accepts <c>pg_catalog.set_config(...)</c>).
+        /// Returns a <see cref="SetCommand"/> on success, or null if
+        /// the SQL doesn't match the function-form shape.
+        /// </summary>
+        /// <remarks>
+        /// Lightweight scanner — not a full SQL parser. Handles:
+        /// <list type="bullet">
+        ///   <item>String literals with PG's <c>''</c> doubled-quote escape</item>
+        ///   <item>Optional <c>pg_catalog.</c> schema prefix</item>
+        ///   <item><c>true</c> / <c>false</c> as bareword and as
+        ///         single-quoted (<c>'t'</c>, <c>'true'</c>, etc.)</item>
+        ///   <item>Trailing <c>::bool</c> casts on the third arg</item>
+        /// </list>
+        /// Casted-value first/second args (e.g.
+        /// <c>set_config('app.id', '42'::text, false)</c>) are accepted
+        /// — the cast is stripped and the literal value is used. Anything
+        /// else (CASE expressions, nested function calls, parameter
+        /// placeholders <c>$1</c> in args) returns null — the wrapper
+        /// can't statically resolve those, so the post-call verify path
+        /// (Concern 6) picks up the change.
+        /// </remarks>
+        internal static SetCommand ParseSetConfigCall(string sql)
+        {
+            if (string.IsNullOrEmpty(sql)) return null;
+            // Locate `set_config(` (case-insensitive). Allow optional
+            // `pg_catalog.` prefix — common in security-hardened apps.
+            int idx = IndexOfIgnoreCase(sql, "set_config");
+            if (idx < 0) return null;
+
+            // Verify the head between SELECT and set_config is just
+            // whitespace + optional `pg_catalog.`. Reject random
+            // additional tokens like `SELECT 1, set_config(...)`.
+            int selectEnd = -1;
+            for (int i = 0; i < sql.Length; i++)
+            {
+                if (char.IsWhiteSpace(sql[i])) continue;
+                if (i + 6 <= sql.Length &&
+                    sql.Substring(i, 6).Equals("SELECT", StringComparison.OrdinalIgnoreCase))
+                {
+                    selectEnd = i + 6;
+                    break;
+                }
+                return null;
+            }
+            if (selectEnd < 0 || selectEnd > idx) return null;
+            var between = sql.Substring(selectEnd, idx - selectEnd).Trim();
+            if (between.Length > 0 &&
+                !between.Equals("pg_catalog.", StringComparison.OrdinalIgnoreCase))
+                return null;
+
+            // Verify the next non-whitespace char after `set_config` is `(`.
+            int p = idx + "set_config".Length;
+            while (p < sql.Length && char.IsWhiteSpace(sql[p])) p++;
+            if (p >= sql.Length || sql[p] != '(') return null;
+            p++; // skip `(`
+
+            // Three comma-separated args. We need a tiny arg-aware
+            // tokenizer that respects `'...'` literals (with `''`
+            // doubled-quote escape) and tracks paren depth so a cast
+            // expression like `'42'::int` doesn't confuse us.
+            var args = new List<string>(3);
+            int argStart = p;
+            int depth = 0;
+            char? quote = null;
+            while (p < sql.Length)
+            {
+                var c = sql[p];
+                if (quote.HasValue)
+                {
+                    if (c == quote.Value)
+                    {
+                        if (p + 1 < sql.Length && sql[p + 1] == quote.Value)
+                        { p += 2; continue; }
+                        quote = null;
+                    }
+                }
+                else
+                {
+                    if (c == '\'' || c == '"') quote = c;
+                    else if (c == '(') depth++;
+                    else if (c == ')')
+                    {
+                        if (depth == 0)
+                        {
+                            args.Add(sql.Substring(argStart, p - argStart).Trim());
+                            p++;
+                            goto Done;
+                        }
+                        depth--;
+                    }
+                    else if (c == ',' && depth == 0)
+                    {
+                        args.Add(sql.Substring(argStart, p - argStart).Trim());
+                        argStart = p + 1;
+                    }
+                }
+                p++;
+            }
+            return null; // unterminated `(`
+            Done:
+            // Anything after the closing `)` — strip optional trailing
+            // `;`, allow nothing else (would mean it's part of a larger
+            // expression, e.g. `SELECT set_config(...) || ...`).
+            while (p < sql.Length && char.IsWhiteSpace(sql[p])) p++;
+            if (p < sql.Length && sql[p] == ';') p++;
+            while (p < sql.Length && char.IsWhiteSpace(sql[p])) p++;
+            if (p != sql.Length) return null;
+
+            if (args.Count != 3) return null;
+
+            var nameRaw = StripCast(args[0]);
+            var valueRaw = StripCast(args[1]);
+            var isLocalRaw = StripCast(args[2]);
+
+            var name = ExtractStringLiteral(nameRaw);
+            if (name == null) return null;
+            name = NormalizeGucName(name);
+            if (name == null) return null;
+
+            var value = ExtractStringLiteral(valueRaw);
+            // PG's set_config takes text for value. We accept:
+            //   - a single-quoted literal  → use the inner string
+            //   - NULL                     → treat as Reset (PG semantics)
+            //   - a plain numeric literal  → use the digits as the value
+            // Barewords like `current_user`, `$1`, function calls, or
+            // CASE expressions are too dynamic for static parse — return
+            // null so the caller falls back to post-call verify.
+            if (value == null)
+            {
+                var v = valueRaw.Trim();
+                if (v.Equals("NULL", StringComparison.OrdinalIgnoreCase))
+                    return IsUnsafeGuc(name) ? SetCommand.Reset(name) : null;
+                // Allow numeric literals (digits with optional `.`/`-`).
+                if (!IsNumericLiteral(v)) return null;
+                value = v;
+            }
+
+            var isLocal = ParseBoolLiteral(isLocalRaw);
+            if (!isLocal.HasValue) return null;
+
+            return isLocal.Value
+                ? SetCommand.Local(name, value)
+                : SetCommand.Set(name, value);
+        }
+
+        // Strip a trailing `::type` cast off a SQL expression. Common in
+        // hand-written set_config calls (e.g. `'true'::bool`). We only
+        // strip a single trailing cast; nested casts are rare and would
+        // require a real expression parser.
+        private static string StripCast(string expr)
+        {
+            if (string.IsNullOrEmpty(expr)) return expr;
+            // Walk from the end looking for `::` outside any string
+            // literal, return the prefix.
+            char? quote = null;
+            int castAt = -1;
+            for (int i = 0; i < expr.Length; i++)
+            {
+                var c = expr[i];
+                if (quote.HasValue)
+                {
+                    if (c == quote.Value)
+                    {
+                        if (i + 1 < expr.Length && expr[i + 1] == quote.Value)
+                        { i++; continue; }
+                        quote = null;
+                    }
+                }
+                else
+                {
+                    if (c == '\'' || c == '"') quote = c;
+                    else if (c == ':' && i + 1 < expr.Length && expr[i + 1] == ':')
+                    { castAt = i; break; }
+                }
+            }
+            if (castAt < 0) return expr;
+            return expr.Substring(0, castAt).TrimEnd();
+        }
+
+        // Extract the contents of a single-quoted string literal.
+        // Returns null if the expression isn't a single literal.
+        // Handles PG's `''` doubled-quote escape.
+        private static string ExtractStringLiteral(string expr)
+        {
+            if (string.IsNullOrEmpty(expr)) return null;
+            var s = expr.Trim();
+            if (s.Length < 2 || s[0] != '\'' || s[s.Length - 1] != '\'') return null;
+            // The whole thing must be a single quoted region — not
+            // `'a' || 'b'`. Walk inside and confirm the only closing
+            // quote is the last char.
+            var sb = new StringBuilder(s.Length - 2);
+            int i = 1;
+            while (i < s.Length - 1)
+            {
+                var c = s[i];
+                if (c == '\'')
+                {
+                    if (i + 1 < s.Length - 1 && s[i + 1] == '\'')
+                    {
+                        sb.Append('\'');
+                        i += 2;
+                        continue;
+                    }
+                    // Premature closing quote — expression is more than
+                    // one literal.
+                    return null;
+                }
+                sb.Append(c);
+                i++;
+            }
+            return sb.ToString();
+        }
+
+        // Parse a SQL boolean literal in any of the common forms:
+        // bareword `true`/`false`, single-quoted `'t'`/`'f'`/`'true'`/
+        // `'false'`/`'on'`/`'off'`/`'yes'`/`'no'`/`'1'`/`'0'`. Returns
+        // null if not parseable — caller then rejects the whole call.
+        private static bool? ParseBoolLiteral(string expr)
+        {
+            if (string.IsNullOrEmpty(expr)) return null;
+            var v = expr.Trim();
+            // Strip optional surrounding quotes (single).
+            if (v.Length >= 2 && v[0] == '\'' && v[v.Length - 1] == '\'')
+                v = v.Substring(1, v.Length - 2);
+            if (v.Length == 0) return null;
+            if (v.Equals("true", StringComparison.OrdinalIgnoreCase)) return true;
+            if (v.Equals("false", StringComparison.OrdinalIgnoreCase)) return false;
+            if (v.Equals("t", StringComparison.OrdinalIgnoreCase)) return true;
+            if (v.Equals("f", StringComparison.OrdinalIgnoreCase)) return false;
+            if (v.Equals("on", StringComparison.OrdinalIgnoreCase)) return true;
+            if (v.Equals("off", StringComparison.OrdinalIgnoreCase)) return false;
+            if (v.Equals("yes", StringComparison.OrdinalIgnoreCase)) return true;
+            if (v.Equals("no", StringComparison.OrdinalIgnoreCase)) return false;
+            if (v == "1") return true;
+            if (v == "0") return false;
+            return null;
+        }
+
+        // True iff the string is a plain numeric literal: optional sign,
+        // digits, optional `.`, more digits. No `e+exp`, no casts. Used
+        // as a permissive fallback for the value arg of set_config so a
+        // call like `set_config('x', 42, false)` works without quotes.
+        private static bool IsNumericLiteral(string v)
+        {
+            if (string.IsNullOrEmpty(v)) return false;
+            int i = 0;
+            if (v[0] == '+' || v[0] == '-') i++;
+            bool sawDigit = false;
+            bool sawDot = false;
+            while (i < v.Length)
+            {
+                var c = v[i];
+                if (c >= '0' && c <= '9') sawDigit = true;
+                else if (c == '.' && !sawDot) sawDot = true;
+                else return false;
+                i++;
+            }
+            return sawDigit;
+        }
+
+        // Case-insensitive IndexOf using ordinal matching, scoped to a
+        // string. Returns first match or -1.
+        private static int IndexOfIgnoreCase(string haystack, string needle)
+        {
+            if (string.IsNullOrEmpty(haystack) || string.IsNullOrEmpty(needle)) return -1;
+            return haystack.IndexOf(needle, StringComparison.OrdinalIgnoreCase);
         }
 
         // Lowercase the GUC name and strip surrounding double quotes
