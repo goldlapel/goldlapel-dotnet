@@ -59,11 +59,89 @@ namespace GoldLapel
         // deadlocked, only deferred.
         private readonly SemaphoreSlim _verifyGate = new SemaphoreSlim(1, 1);
 
+        // ── Smart aggressive-verify state ────────────────────────────
+        //
+        // _aggressiveVerifyMode is the explicit override (Auto / On / Off);
+        // _licensePayload optionally carries the HQ-issued claim
+        // `aggressive_verify_active`. _aggressiveVerifyResolved memoises
+        // the final decision — set eagerly when an override / license
+        // claim short-circuits, or asynchronously by the lazy detection
+        // probe (Auto + no-license-claim path) on first DML.
+        //
+        // When IsAggressiveVerifyEnabled() returns true, post-DML SQL
+        // (INSERT / UPDATE / DELETE / MERGE / TRUNCATE) schedules an
+        // async verify via the same ScheduleAsyncVerify machinery used
+        // for function calls. This is the trigger-internal-SET safety
+        // net — ~1ms tax per write, off by default unless the schema
+        // needs it. See src/GoldLapel/AggressiveVerify.cs and
+        // docs/todos/aggressive-verify-flag.md.
+        private readonly AggressiveVerifyMode _aggressiveVerifyMode;
+        private readonly IReadOnlyDictionary<string, object> _licensePayload;
+        // Memoised resolution. _aggressiveVerifyResolved=false means
+        // "not yet decided" (Auto + no license claim, no probe completed).
+        // Both fields are guarded by _aggressiveVerifyLock for the
+        // first-write race; subsequent reads of `Resolved` are racy but
+        // benign — once true, the value never changes within the
+        // lifetime of the connection.
+        private bool _aggressiveVerifyResolved;
+        private bool _aggressiveVerifyValue;
+        private readonly object _aggressiveVerifyLock = new object();
+
         public CachedConnection(DbConnection inner, NativeCache cache)
+            : this(inner, cache, AggressiveVerifyMode.Auto, null)
+        {
+        }
+
+        /// <summary>
+        /// Construct a CachedConnection with explicit aggressive-verify
+        /// configuration. See <see cref="AggressiveVerifyMode"/>.
+        /// </summary>
+        /// <param name="inner">The underlying DbConnection (typically NpgsqlConnection).</param>
+        /// <param name="cache">Shared <see cref="NativeCache"/> instance.</param>
+        /// <param name="aggressiveVerify">Override mode — Auto by default.</param>
+        /// <param name="licensePayload">Optional license-payload dictionary. When
+        /// it contains a truthy <c>aggressive_verify_active</c> key, aggressive
+        /// verify is forced on (subject to an explicit Off override winning).</param>
+        public CachedConnection(
+            DbConnection inner,
+            NativeCache cache,
+            AggressiveVerifyMode aggressiveVerify,
+            IReadOnlyDictionary<string, object> licensePayload)
         {
             _inner = inner ?? throw new ArgumentNullException(nameof(inner));
             _cache = cache ?? throw new ArgumentNullException(nameof(cache));
             _npgsqlAutoReset = DetectNpgsqlAutoReset(inner);
+            _aggressiveVerifyMode = aggressiveVerify;
+            _licensePayload = licensePayload;
+            // Eager-resolve the cheap cases: explicit On/Off and license
+            // claim. Auto-with-no-license still defers detection until the
+            // first DML so we don't pay an unnecessary round-trip on
+            // schemas that never write.
+            if (aggressiveVerify == AggressiveVerifyMode.On)
+            {
+                _aggressiveVerifyValue = true;
+                _aggressiveVerifyResolved = true;
+            }
+            else if (aggressiveVerify == AggressiveVerifyMode.Off)
+            {
+                _aggressiveVerifyValue = false;
+                _aggressiveVerifyResolved = true;
+            }
+            else if (AggressiveVerify.LicenseClaimsActive(licensePayload))
+            {
+                _aggressiveVerifyValue = true;
+                _aggressiveVerifyResolved = true;
+            }
+            else
+            {
+                // Auto + no license — try the cheap cache lookup now.
+                // If a previous CachedConnection on the same upstream
+                // already probed, we can resolve eagerly without SQL.
+                // Otherwise resolution defers until a user command
+                // (MaybeScheduleAsyncVerify) so the probe doesn't race
+                // user reads on the inner connection.
+                TryResolveFromUpstreamCache();
+            }
         }
 
         internal DbConnection Inner => _inner;
@@ -75,6 +153,144 @@ namespace GoldLapel
             set => _inTransaction = value;
         }
         internal bool NpgsqlAutoReset => _npgsqlAutoReset;
+        internal AggressiveVerifyMode AggressiveVerifyModeValue => _aggressiveVerifyMode;
+        internal IReadOnlyDictionary<string, object> LicensePayloadValue => _licensePayload;
+        // Test hook — read the memoised value without forcing a probe.
+        // Returns null if Auto-with-no-license hasn't run a DML yet.
+        internal bool? AggressiveVerifyResolvedTest
+        {
+            get
+            {
+                lock (_aggressiveVerifyLock)
+                {
+                    return _aggressiveVerifyResolved ? (bool?)_aggressiveVerifyValue : null;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Returns the effective aggressive-verify state — true when DML
+        /// should schedule a post-call async verify. Read-only fast path:
+        /// just two field reads, no SQL, no Task.Run. The Auto-probe
+        /// itself runs lazily via <see cref="ScheduleProbeIfNeeded"/>
+        /// (called from MaybeScheduleAsyncVerify after the user's
+        /// command has executed). Until the probe completes this method
+        /// returns false — the conservative Wave 1 default. This means
+        /// the very first DML on the very first connection to a new
+        /// upstream may miss the safety net by one call; subsequent DML
+        /// on the same connection (and all DML on subsequent
+        /// connections, which resolve eagerly via the per-upstream
+        /// cache) get the resolved answer.
+        /// </summary>
+        internal bool IsAggressiveVerifyEnabled()
+        {
+            return _aggressiveVerifyResolved && _aggressiveVerifyValue;
+        }
+
+        // Cheap path: hit the process-wide per-upstream cache. No SQL,
+        // no Task.Run — just a dictionary lookup. Idempotent.
+        private void TryResolveFromUpstreamCache()
+        {
+            if (_aggressiveVerifyResolved) return;
+            if (_aggressiveVerifyMode != AggressiveVerifyMode.Auto) return;
+            if (AggressiveVerify.LicenseClaimsActive(_licensePayload)) return;
+            var key = AggressiveVerify.UpstreamKey(_inner);
+            if (key == null) return;
+            if (!AggressiveVerify.TryGetCached(key, out var cached)) return;
+            lock (_aggressiveVerifyLock)
+            {
+                if (_aggressiveVerifyResolved) return;
+                _aggressiveVerifyValue = cached;
+                _aggressiveVerifyResolved = true;
+            }
+        }
+
+        // Slow path: schedule a background Task.Run that runs the SQL
+        // probe under _verifyGate so it serialises with the existing
+        // post-call verify path (mirrors ScheduleAsyncVerify). Until
+        // the probe completes IsAggressiveVerifyEnabled returns false —
+        // conservative Wave 1 behavior. Subsequent DML on the same
+        // connection (or on any connection sharing the upstream) gets
+        // the resolved answer.
+        //
+        // Called from MaybeScheduleAsyncVerify, AFTER the user's command
+        // has executed and (for ExecuteReader) returned its reader. Yes,
+        // the user might still be reading — same as ScheduleAsyncVerify.
+        // _verifyGate prevents two probes/verifies racing each other; a
+        // user command racing isn't fully guarded but is not new with
+        // this change.
+        internal void ScheduleProbeIfNeeded()
+        {
+            if (_aggressiveVerifyResolved) return;
+            if (_aggressiveVerifyMode != AggressiveVerifyMode.Auto) return;
+            if (AggressiveVerify.LicenseClaimsActive(_licensePayload)) return;
+            // First check cheap cache once more (another connection may
+            // have populated it since construction).
+            TryResolveFromUpstreamCache();
+            if (_aggressiveVerifyResolved) return;
+            if (_inner.State != ConnectionState.Open) return;
+
+            CancellationToken ct;
+            lock (_verifyCtsLock) { ct = _verifyCts.Token; }
+            if (ct.IsCancellationRequested) return;
+
+            _ = Task.Run(() =>
+            {
+                bool acquired = false;
+                try
+                {
+                    try { acquired = _verifyGate.Wait(0, ct); }
+                    catch (OperationCanceledException) { return; }
+                    catch (ObjectDisposedException) { return; }
+                    if (!acquired) return;
+                    if (ct.IsCancellationRequested) return;
+                    bool detected;
+                    try { detected = AggressiveVerify.Detect(_inner); }
+                    catch { detected = false; }
+                    lock (_aggressiveVerifyLock)
+                    {
+                        if (!_aggressiveVerifyResolved)
+                        {
+                            _aggressiveVerifyValue = detected;
+                            _aggressiveVerifyResolved = true;
+                        }
+                    }
+                }
+                catch
+                {
+                    // Probe failure — leave unresolved so the next
+                    // MaybeScheduleAsyncVerify retries. Worst case:
+                    // aggressive verify stays off (Wave 1 default).
+                }
+                finally
+                {
+                    if (acquired)
+                    {
+                        try { _verifyGate.Release(); }
+                        catch (ObjectDisposedException) { }
+                        catch (SemaphoreFullException) { }
+                    }
+                }
+            }, ct);
+        }
+
+        /// <summary>
+        /// Test hook — synchronously block until the auto-detection
+        /// probe resolves (or the timeout elapses). Returns the resolved
+        /// state. Not used by product code; tests use it to
+        /// deterministically observe an Auto path without racing the
+        /// background Task.Run.
+        /// </summary>
+        internal bool? WaitForAggressiveVerifyResolved(int timeoutMs)
+        {
+            var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+            while (DateTime.UtcNow < deadline)
+            {
+                if (_aggressiveVerifyResolved) return _aggressiveVerifyValue;
+                Thread.Sleep(10);
+            }
+            return _aggressiveVerifyResolved ? (bool?)_aggressiveVerifyValue : null;
+        }
         internal CancellationToken VerifyCancellationToken
         {
             get
@@ -124,6 +340,11 @@ namespace GoldLapel
                 _gucState.ApplyVerifiedState(null);
             else
                 _gucState.MarkDirty();
+            // Smart aggressive-verify: re-check the per-upstream cache
+            // after Open() in case another connection's probe completed
+            // since we constructed. Cheap (no SQL) — just a dictionary
+            // lookup.
+            TryResolveFromUpstreamCache();
         }
 
         public override void Close()
@@ -719,10 +940,34 @@ namespace GoldLapel
         // call or stored-procedure invocation. The function body might
         // have done a SET we couldn't see on the wire; the async path
         // catches it without blocking the user.
+        //
+        // When aggressive-verify is enabled (smart-auto-detected on
+        // first DML, or explicitly forced via AggressiveVerifyMode /
+        // license claim), post-DML SQL ALSO schedules an async verify.
+        // This catches trigger-internal SETs — a row-level-security
+        // trigger that does PERFORM set_config('app.user_id', ..., true)
+        // during an INSERT mutates session state without anything
+        // observable on the wire.
         private void MaybeScheduleAsyncVerify(string sql)
         {
             if (NativeCache.IsFunctionCallStatement(sql))
+            {
                 _conn.ScheduleAsyncVerify();
+                return;
+            }
+            // Aggressive verify: schedule on DML. We pass the same SQL
+            // through DetectWritesMulti — non-empty result means at least
+            // one segment is a write. The Auto-detection probe runs
+            // lazily here too (via ScheduleProbeIfNeeded), behind a
+            // Task.Run guarded by _verifyGate so it doesn't race the
+            // user's command. Until the probe completes,
+            // IsAggressiveVerifyEnabled returns false (Wave 1 default).
+            if (NativeCache.DetectWritesMulti(sql).Count > 0)
+            {
+                _conn.ScheduleProbeIfNeeded();
+                if (_conn.IsAggressiveVerifyEnabled())
+                    _conn.ScheduleAsyncVerify();
+            }
         }
 
         protected override void Dispose(bool disposing)

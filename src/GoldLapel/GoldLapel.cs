@@ -134,6 +134,32 @@ namespace GoldLapel
         /// <c>--disable-auto-indexes</c>.
         /// </summary>
         public bool DisableAutoIndexes { get; set; }
+
+        /// <summary>
+        /// Aggressive-verify override. <see cref="AggressiveVerifyMode.Auto"/>
+        /// (the default) probes for triggers that mutate session state on
+        /// first connection per upstream and caches the result. Pass
+        /// <see cref="AggressiveVerifyMode.On"/> to force the post-DML
+        /// async-verify safety net regardless of detection (paranoid mode
+        /// for legacy or third-party schemas), or
+        /// <see cref="AggressiveVerifyMode.Off"/> to suppress detection
+        /// entirely (no triggers mutate session state, you've audited).
+        /// HQ may force it on via the license payload's
+        /// <c>aggressive_verify_active</c> claim — see
+        /// <see cref="LicensePayload"/>.
+        /// </summary>
+        public AggressiveVerifyMode AggressiveVerify { get; set; } = AggressiveVerifyMode.Auto;
+
+        /// <summary>
+        /// Optional license-payload dictionary parsed from the on-disk
+        /// license file. When the dictionary contains a truthy
+        /// <c>aggressive_verify_active</c> key, aggressive verify is
+        /// forced on (subject to an explicit
+        /// <see cref="AggressiveVerifyMode.Off"/> override winning).
+        /// Use <see cref="GoldLapel.ParseLicensePayload"/> to parse a JSON
+        /// license file into the right shape.
+        /// </summary>
+        public IReadOnlyDictionary<string, object> LicensePayload { get; set; }
     }
 
     /// <summary>
@@ -1116,6 +1142,24 @@ namespace GoldLapel
             }
 
             return sb.ToString();
+        }
+
+        /// <summary>
+        /// Parse a license payload (JSON object) into the dictionary
+        /// shape accepted by <see cref="GoldLapelOptions.LicensePayload"/>.
+        /// Returns null on parse failure — the caller can then default to
+        /// no license claim. Convenience wrapper around
+        /// <c>System.Text.Json</c>; uses no third-party deps.
+        /// </summary>
+        /// <example>
+        /// <code>
+        /// var payload = GoldLapel.ParseLicensePayload(File.ReadAllText("license.json"));
+        /// var gl = await GoldLapel.StartAsync(url, opts =&gt; opts.LicensePayload = payload);
+        /// </code>
+        /// </example>
+        public static IReadOnlyDictionary<string, object> ParseLicensePayload(string json)
+        {
+            return AggressiveVerify.ParseLicensePayload(json);
         }
 
         internal static bool WaitForPort(string host, int port, long timeoutMs)
