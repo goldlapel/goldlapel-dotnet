@@ -1513,6 +1513,652 @@ namespace GoldLapel.Tests
         }
     }
 
+    // xUnit collection that serializes the aggressive-verify test
+    // classes. They share the process-wide AggressiveVerify._cache and
+    // call ResetCache() in their lifecycle hooks; running them in
+    // parallel across classes would race the resets and create
+    // intermittent failures.
+    [CollectionDefinition("AggressiveVerifyTests", DisableParallelization = true)]
+    public class AggressiveVerifyTestsCollection { }
+
+    // ── Smart-auto-enable aggressive verify ──────────────────
+    //
+    // Aggressive verify is the safety net for trigger-internal SETs:
+    // when on, every INSERT/UPDATE/DELETE/MERGE/TRUNCATE schedules an
+    // async pg_settings verify, not just the function-call cases the
+    // wire-observation parser already covers. The smart-auto-enable
+    // logic resolves three sources in priority order:
+    //
+    //   1. AggressiveVerifyMode.On / Off (explicit override) wins.
+    //   2. License-payload `aggressive_verify_active` claim wins over Auto.
+    //   3. Auto: probe pg_trigger / pg_proc on first connection per
+    //      upstream and cache the bool in a process-wide
+    //      ConcurrentDictionary keyed by host|port|database.
+
+    [Collection("AggressiveVerifyTests")]
+    public class AggressiveVerifyResolutionTest : IDisposable
+    {
+        public AggressiveVerifyResolutionTest()
+        {
+            NativeCache.Reset();
+            AggressiveVerify.ResetCache();
+        }
+        public void Dispose()
+        {
+            NativeCache.Reset();
+            AggressiveVerify.ResetCache();
+        }
+
+        // Helper: stamp the detection SQL onto a FakeConnection. The
+        // probe runs `SELECT EXISTS (...)`; we hand back a single-row,
+        // single-column boolean reader.
+        private static FakeConnection MakeInnerWithDetection(bool detected, string upstream = null)
+        {
+            var inner = new FakeConnection();
+            if (upstream != null) inner.ConnectionString = upstream;
+            var rows = new object[][] { new object[] { detected } };
+            inner.ReaderBySql[AggressiveVerify.DetectionSql] =
+                () => new FakeDataReader(rows, new[] { "exists" });
+            return inner;
+        }
+
+        [Fact]
+        public void OnOverrideForcesEnabled()
+        {
+            var cache = new NativeCache();
+            var inner = MakeInnerWithDetection(false);
+            var conn = new CachedConnection(inner, cache, AggressiveVerifyMode.On, null);
+            Assert.True(conn.IsAggressiveVerifyEnabled());
+            // Resolution is eager for explicit On.
+            Assert.Equal(true, conn.AggressiveVerifyResolvedTest);
+            // No probe should have run.
+            lock (inner.ExecutedSql)
+                Assert.DoesNotContain(AggressiveVerify.DetectionSql, inner.ExecutedSql);
+        }
+
+        [Fact]
+        public void OffOverrideForcesDisabled()
+        {
+            var cache = new NativeCache();
+            var inner = MakeInnerWithDetection(true);  // Even if probe would say yes...
+            var conn = new CachedConnection(inner, cache, AggressiveVerifyMode.Off, null);
+            Assert.False(conn.IsAggressiveVerifyEnabled());
+            Assert.Equal(false, conn.AggressiveVerifyResolvedTest);
+            lock (inner.ExecutedSql)
+                Assert.DoesNotContain(AggressiveVerify.DetectionSql, inner.ExecutedSql);
+        }
+
+        [Fact]
+        public void LicenseClaimForcesOnInAuto()
+        {
+            var cache = new NativeCache();
+            var inner = MakeInnerWithDetection(false);  // Probe says no, license says yes.
+            var payload = new Dictionary<string, object> { { "aggressive_verify_active", true } };
+            var conn = new CachedConnection(inner, cache, AggressiveVerifyMode.Auto, payload);
+            Assert.True(conn.IsAggressiveVerifyEnabled());
+            // License-claim case is also eager.
+            Assert.Equal(true, conn.AggressiveVerifyResolvedTest);
+            lock (inner.ExecutedSql)
+                Assert.DoesNotContain(AggressiveVerify.DetectionSql, inner.ExecutedSql);
+        }
+
+        [Fact]
+        public void OffOverrideBeatsLicenseClaim()
+        {
+            // Explicit Off must win — paranoid HQ shouldn't override an
+            // operator who has audited their schema.
+            var cache = new NativeCache();
+            var inner = MakeInnerWithDetection(true);
+            var payload = new Dictionary<string, object> { { "aggressive_verify_active", true } };
+            var conn = new CachedConnection(inner, cache, AggressiveVerifyMode.Off, payload);
+            Assert.False(conn.IsAggressiveVerifyEnabled());
+        }
+
+        [Fact]
+        public void AutoProbeFiresOnFirstDmlAndCachesPerUpstream()
+        {
+            // The probe is fire-and-forget on first DML — running it
+            // synchronously at construction would race a user command
+            // that's mid-flight. We schedule from MaybeScheduleAsyncVerify
+            // (after the user's reader is returned), then assert via
+            // the test-only WaitForAggressiveVerifyResolved hook.
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var inner = MakeInnerWithDetection(true,
+                upstream: "Host=db1.example;Port=5432;Database=prod");
+            // Pre-stamp the pg_settings response so the async verify
+            // (also scheduled by aggressive-on) doesn't error out.
+            inner.ReaderBySql["SELECT name, setting FROM pg_settings WHERE source='session'"] =
+                () => new FakeDataReader(new object[0][], new[] { "name", "setting" });
+            var conn = new CachedConnection(inner, cache, AggressiveVerifyMode.Auto, null);
+
+            // Pre-DML: nothing memoised, no probe yet.
+            Assert.Null(conn.AggressiveVerifyResolvedTest);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "INSERT INTO orders VALUES (1)";
+                cmd.ExecuteNonQuery();
+            }
+
+            // Probe runs in a Task.Run after MaybeScheduleAsyncVerify.
+            var resolved = conn.WaitForAggressiveVerifyResolved(2000);
+            Assert.Equal(true, resolved);
+
+            int probeCount;
+            lock (inner.ExecutedSql)
+                probeCount = inner.ExecutedSql.FindAll(s => s == AggressiveVerify.DetectionSql).Count;
+            Assert.Equal(1, probeCount);
+
+            // The result is also stamped into the per-upstream cache.
+            Assert.True(AggressiveVerify.TryGetCached(
+                AggressiveVerify.UpstreamKey(inner), out var cached));
+            Assert.True(cached);
+        }
+
+        [Fact]
+        public void AutoNoDmlNoProbe()
+        {
+            // No user DML → no probe scheduled → no SQL round-trip on
+            // detection. Schemas that are read-only never pay the
+            // probe tax.
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var inner = MakeInnerWithDetection(true,
+                upstream: "Host=readonly;Port=5432;Database=prod");
+            inner.NextReader = new FakeDataReader(
+                new[] { new object[] { 1 } }, new[] { "v" });
+            var conn = new CachedConnection(inner, cache, AggressiveVerifyMode.Auto, null);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "SELECT v FROM accounts";
+                cmd.ExecuteReader().Dispose();
+            }
+            // Give a window for any spurious task.
+            Thread.Sleep(100);
+            lock (inner.ExecutedSql)
+                Assert.DoesNotContain(AggressiveVerify.DetectionSql, inner.ExecutedSql);
+            Assert.Null(conn.AggressiveVerifyResolvedTest);
+        }
+
+        [Fact]
+        public void AutoProbeFalseDisablesAggressiveVerify()
+        {
+            // Probe says "no triggers mutate state" → aggressive verify
+            // stays off. Same lazy-probe shape as the true case.
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var inner = MakeInnerWithDetection(false,
+                upstream: "Host=db2.example;Port=5432;Database=prod");
+            inner.ReaderBySql["SELECT name, setting FROM pg_settings WHERE source='session'"] =
+                () => new FakeDataReader(new object[0][], new[] { "name", "setting" });
+            var conn = new CachedConnection(inner, cache, AggressiveVerifyMode.Auto, null);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "INSERT INTO orders VALUES (1)";
+                cmd.ExecuteNonQuery();
+            }
+
+            var resolved = conn.WaitForAggressiveVerifyResolved(2000);
+            Assert.Equal(false, resolved);
+            Assert.False(conn.IsAggressiveVerifyEnabled());
+        }
+
+        [Fact]
+        public void AutoProbeIsCachedPerUpstream()
+        {
+            // Two distinct CachedConnections wrapping connections that
+            // share a normalised upstream key should probe at most once
+            // across both. The second connection sees the cached value
+            // EAGERLY (cheap-path lookup at construction) — no DML
+            // required to resolve.
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var innerA = MakeInnerWithDetection(true,
+                upstream: "Host=db3.example;Port=5432;Database=prod");
+            innerA.ReaderBySql["SELECT name, setting FROM pg_settings WHERE source='session'"] =
+                () => new FakeDataReader(new object[0][], new[] { "name", "setting" });
+
+            var connA = new CachedConnection(innerA, cache, AggressiveVerifyMode.Auto, null);
+            // First connection: drive a DML to fire the probe.
+            using (var cmd = connA.CreateCommand())
+            {
+                cmd.CommandText = "INSERT INTO orders VALUES (1)";
+                cmd.ExecuteNonQuery();
+            }
+            Assert.Equal(true, connA.WaitForAggressiveVerifyResolved(2000));
+
+            // Second connection (case-variant connection-string,
+            // normalises to the same upstream key).
+            var innerB = MakeInnerWithDetection(true,
+                upstream: "host=db3.example;port=5432;database=prod");
+            var connB = new CachedConnection(innerB, cache, AggressiveVerifyMode.Auto, null);
+            // Cheap path: resolved at construction from the per-upstream
+            // cache. No probe SQL on innerB.
+            Assert.Equal(true, connB.AggressiveVerifyResolvedTest);
+            Assert.True(connB.IsAggressiveVerifyEnabled());
+            lock (innerB.ExecutedSql)
+                Assert.DoesNotContain(AggressiveVerify.DetectionSql, innerB.ExecutedSql);
+        }
+
+        [Fact]
+        public void AutoProbeFailureIsNotParanoidDefault()
+        {
+            // Concierge, not bouncer — when the probe can't run we don't
+            // synthesize a paranoid `true`. The Wave 1 verify path is
+            // already in place; aggressive-verify is the *opt-in* layer.
+            // Closed inner → ScheduleProbeIfNeeded skips outright.
+            var cache = new NativeCache();
+            var inner = new FakeConnection { ConnectionString = "Host=fail-probe;Port=5432;Database=p" };
+            inner.ForceClosed = true;
+            var conn = new CachedConnection(inner, cache, AggressiveVerifyMode.Auto, null);
+            // No DML attempted; the explicit IsAggressiveVerifyEnabled
+            // path returns false because nothing has resolved.
+            Assert.False(conn.IsAggressiveVerifyEnabled());
+            Assert.Null(conn.AggressiveVerifyResolvedTest);
+        }
+
+        [Fact]
+        public void DefaultConstructorIsAuto()
+        {
+            // Two-arg constructor preserves Wave 1 callers — they get
+            // Auto + no license payload.
+            var cache = new NativeCache();
+            var inner = MakeInnerWithDetection(false);
+            var conn = new CachedConnection(inner, cache);
+            Assert.Equal(AggressiveVerifyMode.Auto, conn.AggressiveVerifyModeValue);
+            Assert.Null(conn.LicensePayloadValue);
+        }
+
+        [Fact]
+        public void LicenseClaimPermissiveTruthy()
+        {
+            // Accept "true" / "1" / "yes" — license loaders may vary.
+            var payloads = new[]
+            {
+                new Dictionary<string, object> { { "aggressive_verify_active", "true" } },
+                new Dictionary<string, object> { { "aggressive_verify_active", "1" } },
+                new Dictionary<string, object> { { "aggressive_verify_active", 1L } },
+            };
+            foreach (var payload in payloads)
+            {
+                Assert.True(AggressiveVerify.LicenseClaimsActive(payload));
+            }
+            // Falsy / missing.
+            Assert.False(AggressiveVerify.LicenseClaimsActive(null));
+            Assert.False(AggressiveVerify.LicenseClaimsActive(new Dictionary<string, object>()));
+            Assert.False(AggressiveVerify.LicenseClaimsActive(
+                new Dictionary<string, object> { { "aggressive_verify_active", false } }));
+        }
+
+        [Fact]
+        public void ParseLicensePayloadRoundtrip()
+        {
+            var payload = GoldLapel.ParseLicensePayload(
+                "{\"aggressive_verify_active\": true, \"plan\": \"esquire\"}");
+            Assert.NotNull(payload);
+            Assert.True(AggressiveVerify.LicenseClaimsActive(payload));
+            Assert.Equal("esquire", payload["plan"]);
+        }
+
+        [Fact]
+        public void ParseLicensePayloadGracefullyHandlesGarbage()
+        {
+            Assert.Null(GoldLapel.ParseLicensePayload(null));
+            Assert.Null(GoldLapel.ParseLicensePayload(""));
+            Assert.Null(GoldLapel.ParseLicensePayload("not json"));
+            // Top-level array isn't an object — reject.
+            Assert.Null(GoldLapel.ParseLicensePayload("[1, 2, 3]"));
+        }
+
+        [Fact]
+        public void UpstreamKeyNormalisesCaseAndQuoting()
+        {
+            var inner1 = new FakeConnection { ConnectionString = "Host=A;Port=5432;Database=B" };
+            var inner2 = new FakeConnection { ConnectionString = "host=a;port=5432;database=b" };
+            Assert.Equal(AggressiveVerify.UpstreamKey(inner1), AggressiveVerify.UpstreamKey(inner2));
+        }
+
+        [Fact]
+        public void UpstreamKeyDistinguishesDistinctUpstreams()
+        {
+            var inner1 = new FakeConnection { ConnectionString = "Host=a;Port=5432;Database=p" };
+            var inner2 = new FakeConnection { ConnectionString = "Host=b;Port=5432;Database=p" };
+            Assert.NotEqual(AggressiveVerify.UpstreamKey(inner1), AggressiveVerify.UpstreamKey(inner2));
+        }
+    }
+
+    // ── Smart-auto-enable: post-DML async verify wiring ──────
+    //
+    // Once aggressive-verify resolves to true, every DML segment must
+    // schedule an async pg_settings verify. Pure SELECTs still don't
+    // (they can't have side-effects on session state without a function
+    // call), and DML with aggressive-verify off only schedules when the
+    // SQL is also a function call (the Wave 1 default).
+
+    [Collection("AggressiveVerifyTests")]
+    public class AggressiveVerifyPostDmlTest : IDisposable
+    {
+        public AggressiveVerifyPostDmlTest()
+        {
+            NativeCache.Reset();
+            AggressiveVerify.ResetCache();
+        }
+        public void Dispose()
+        {
+            NativeCache.Reset();
+            AggressiveVerify.ResetCache();
+        }
+
+        private static FakeConnection MakeInnerWithVerify(params (string name, string value)[] rows)
+        {
+            var inner = new FakeConnection();
+            var rowArray = new object[rows.Length][];
+            for (int i = 0; i < rows.Length; i++)
+                rowArray[i] = new object[] { rows[i].name, rows[i].value };
+            inner.ReaderBySql["SELECT name, setting FROM pg_settings WHERE source='session'"] =
+                () => new FakeDataReader(rowArray, new[] { "name", "setting" });
+            return inner;
+        }
+
+        // Spin until predicate is true or timeout — async verify is
+        // fire-and-forget.
+        private static bool SpinUntil(Func<bool> predicate, int timeoutMs = 2000)
+        {
+            var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+            while (DateTime.UtcNow < deadline)
+            {
+                if (predicate()) return true;
+                Thread.Sleep(10);
+            }
+            return predicate();
+        }
+
+        private static bool VerifyRan(FakeConnection inner)
+        {
+            lock (inner.ExecutedSql)
+                return inner.ExecutedSql.Contains(
+                    "SELECT name, setting FROM pg_settings WHERE source='session'");
+        }
+
+        [Fact]
+        public void InsertSchedulesVerifyWhenOn()
+        {
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var inner = MakeInnerWithVerify(("app.user_id", "trig-set"));
+            var conn = new CachedConnection(inner, cache, AggressiveVerifyMode.On, null);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "INSERT INTO orders (id) VALUES (1)";
+                cmd.ExecuteNonQuery();
+            }
+            Assert.True(SpinUntil(() => VerifyRan(inner)));
+        }
+
+        [Fact]
+        public void UpdateSchedulesVerifyWhenOn()
+        {
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var inner = MakeInnerWithVerify(("app.user_id", "trig-set"));
+            var conn = new CachedConnection(inner, cache, AggressiveVerifyMode.On, null);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "UPDATE orders SET total = 1 WHERE id = 2";
+                cmd.ExecuteNonQuery();
+            }
+            Assert.True(SpinUntil(() => VerifyRan(inner)));
+        }
+
+        [Fact]
+        public void DeleteSchedulesVerifyWhenOn()
+        {
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var inner = MakeInnerWithVerify();
+            var conn = new CachedConnection(inner, cache, AggressiveVerifyMode.On, null);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "DELETE FROM orders WHERE id = 3";
+                cmd.ExecuteNonQuery();
+            }
+            Assert.True(SpinUntil(() => VerifyRan(inner)));
+        }
+
+        [Fact]
+        public void TruncateSchedulesVerifyWhenOn()
+        {
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var inner = MakeInnerWithVerify();
+            var conn = new CachedConnection(inner, cache, AggressiveVerifyMode.On, null);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "TRUNCATE TABLE orders";
+                cmd.ExecuteNonQuery();
+            }
+            Assert.True(SpinUntil(() => VerifyRan(inner)));
+        }
+
+        [Fact]
+        public void MergeSchedulesVerifyWhenOn()
+        {
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var inner = MakeInnerWithVerify();
+            var conn = new CachedConnection(inner, cache, AggressiveVerifyMode.On, null);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "MERGE INTO orders USING staging ON orders.id = staging.id WHEN MATCHED THEN UPDATE SET total = staging.total";
+                cmd.ExecuteNonQuery();
+            }
+            Assert.True(SpinUntil(() => VerifyRan(inner)));
+        }
+
+        [Fact]
+        public void DmlDoesNotScheduleVerifyWhenOff()
+        {
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var inner = MakeInnerWithVerify();
+            var conn = new CachedConnection(inner, cache, AggressiveVerifyMode.Off, null);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "INSERT INTO orders (id) VALUES (1)";
+                cmd.ExecuteNonQuery();
+            }
+            // Give any spurious task a chance to run.
+            Thread.Sleep(100);
+            Assert.False(VerifyRan(inner));
+        }
+
+        [Fact]
+        public void PlainSelectDoesNotScheduleEvenWhenOn()
+        {
+            // Aggressive verify is for DML — pure SELECTs (non-function)
+            // don't mutate session state without a function call, and
+            // the Wave 1 path already covers function calls. No need to
+            // double-fire.
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var inner = MakeInnerWithVerify();
+            inner.NextReader = new FakeDataReader(new[] { new object[] { "x" } }, new[] { "v" });
+            var conn = new CachedConnection(inner, cache, AggressiveVerifyMode.On, null);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "SELECT v FROM accounts WHERE id = 1";
+                cmd.ExecuteReader().Dispose();
+            }
+            Thread.Sleep(100);
+            Assert.False(VerifyRan(inner));
+        }
+
+        [Fact]
+        public void DmlInExecuteScalarSchedulesVerifyWhenOn()
+        {
+            // INSERT ... RETURNING via ExecuteScalar — must still schedule.
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var inner = MakeInnerWithVerify();
+            var conn = new CachedConnection(inner, cache, AggressiveVerifyMode.On, null);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "DELETE FROM orders WHERE id = 1";
+                cmd.ExecuteScalar();
+            }
+            Assert.True(SpinUntil(() => VerifyRan(inner)));
+        }
+
+        [Fact]
+        public void DmlInExecuteReaderSchedulesVerifyWhenOn()
+        {
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var inner = MakeInnerWithVerify();
+            inner.NextReader = new FakeDataReader(new object[0][], new string[0]);
+            var conn = new CachedConnection(inner, cache, AggressiveVerifyMode.On, null);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "INSERT INTO orders (id) VALUES (1) RETURNING id";
+                cmd.ExecuteReader().Dispose();
+            }
+            Assert.True(SpinUntil(() => VerifyRan(inner)));
+        }
+
+        [Fact]
+        public void AutoDetectionDrivesPostDmlOnSecondConnection()
+        {
+            // Auto detection runs lazily on first DML. Once resolved
+            // and cached per-upstream, a second connection on the same
+            // upstream resolves at construction (cheap path) and gets
+            // post-DML verify on its very first write.
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var inner1 = new FakeConnection { ConnectionString = "Host=auto1;Port=5432;Database=p" };
+            inner1.ReaderBySql[AggressiveVerify.DetectionSql] =
+                () => new FakeDataReader(new[] { new object[] { true } }, new[] { "exists" });
+            inner1.ReaderBySql["SELECT name, setting FROM pg_settings WHERE source='session'"] =
+                () => new FakeDataReader(new object[0][], new[] { "name", "setting" });
+            var conn1 = new CachedConnection(inner1, cache, AggressiveVerifyMode.Auto, null);
+            // First DML: probe scheduled, verify not yet (probe pending).
+            using (var cmd = conn1.CreateCommand())
+            {
+                cmd.CommandText = "INSERT INTO orders (id) VALUES (1)";
+                cmd.ExecuteNonQuery();
+            }
+            // Wait for probe to resolve; stamps the per-upstream cache.
+            Assert.Equal(true, conn1.WaitForAggressiveVerifyResolved(2000));
+
+            // Second connection on same upstream — cheap-path resolves
+            // at construction.
+            var inner2 = new FakeConnection { ConnectionString = "Host=auto1;Port=5432;Database=p" };
+            inner2.ReaderBySql["SELECT name, setting FROM pg_settings WHERE source='session'"] =
+                () => new FakeDataReader(new object[0][], new[] { "name", "setting" });
+            var conn2 = new CachedConnection(inner2, cache, AggressiveVerifyMode.Auto, null);
+            Assert.Equal(true, conn2.AggressiveVerifyResolvedTest);
+
+            using (var cmd = conn2.CreateCommand())
+            {
+                cmd.CommandText = "INSERT INTO orders (id) VALUES (2)";
+                cmd.ExecuteNonQuery();
+            }
+            Assert.True(SpinUntil(() => VerifyRan(inner2)));
+        }
+
+        [Fact]
+        public void AutoNoTriggersSkipsPostDml()
+        {
+            // Detection probe says "no triggers mutate state" → DML
+            // doesn't schedule a verify on subsequent connections (or
+            // on subsequent DML on the same connection).
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var inner = new FakeConnection { ConnectionString = "Host=auto2;Port=5432;Database=p" };
+            inner.ReaderBySql[AggressiveVerify.DetectionSql] =
+                () => new FakeDataReader(new[] { new object[] { false } }, new[] { "exists" });
+            inner.ReaderBySql["SELECT name, setting FROM pg_settings WHERE source='session'"] =
+                () => new FakeDataReader(new object[0][], new[] { "name", "setting" });
+
+            var conn = new CachedConnection(inner, cache, AggressiveVerifyMode.Auto, null);
+            // Drive one DML to schedule the probe.
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "INSERT INTO orders (id) VALUES (1)";
+                cmd.ExecuteNonQuery();
+            }
+            Assert.Equal(false, conn.WaitForAggressiveVerifyResolved(2000));
+
+            // Drive a second DML — probe resolved to false, no verify.
+            int verifiesBefore;
+            lock (inner.ExecutedSql)
+                verifiesBefore = inner.ExecutedSql
+                    .FindAll(s => s == "SELECT name, setting FROM pg_settings WHERE source='session'").Count;
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "INSERT INTO orders (id) VALUES (2)";
+                cmd.ExecuteNonQuery();
+            }
+            Thread.Sleep(100);
+            int verifiesAfter;
+            lock (inner.ExecutedSql)
+                verifiesAfter = inner.ExecutedSql
+                    .FindAll(s => s == "SELECT name, setting FROM pg_settings WHERE source='session'").Count;
+            Assert.Equal(verifiesBefore, verifiesAfter);
+        }
+
+        [Fact]
+        public void FunctionCallStillSchedulesEvenWhenAggressiveOff()
+        {
+            // The Wave 1 path is independent of aggressive-verify. A
+            // function call still schedules a verify whether or not
+            // aggressive is on.
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var inner = MakeInnerWithVerify();
+            var conn = new CachedConnection(inner, cache, AggressiveVerifyMode.Off, null);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "SELECT my_func()";
+                cmd.ExecuteReader().Dispose();
+            }
+            Assert.True(SpinUntil(() => VerifyRan(inner)));
+        }
+
+        [Fact]
+        public void MultiSegmentSetThenInsertSchedulesWhenOn()
+        {
+            // `SET app.user_id = '42'; INSERT INTO orders ...` — the SET
+            // segment already updates the GUC state hash via the
+            // observation parser, but the INSERT segment is still the
+            // surface that *might* fire a trigger. Aggressive-on means
+            // we still schedule a post-call verify.
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var inner = MakeInnerWithVerify(("app.user_id", "from-trigger"));
+            var conn = new CachedConnection(inner, cache, AggressiveVerifyMode.On, null);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "SET app.user_id = '42'; INSERT INTO orders (id) VALUES (1)";
+                cmd.ExecuteNonQuery();
+            }
+            Assert.True(SpinUntil(() => VerifyRan(inner)));
+        }
+    }
+
     // ── Fake implementations for testing ─────────────────────
 
     internal class FakeConnection : DbConnection
