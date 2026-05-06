@@ -1027,6 +1027,151 @@ namespace GoldLapel
             };
 
         /// <summary>
+        /// Detect a top-level function-call statement: <c>SELECT
+        /// fn(args)</c>, <c>SELECT schema.fn(args)</c>, or a stored
+        /// procedure invocation (<c>CALL fn(args)</c>, <c>EXEC fn ...</c>).
+        /// The function body might have run a <c>SET</c> we can't see on
+        /// the wire — callers schedule a post-call verify when this
+        /// returns true.
+        /// </summary>
+        /// <remarks>
+        /// Conservative scan — only fires when the FIRST non-whitespace
+        /// "shape" of the statement matches. Returns false for plain
+        /// reads like <c>SELECT * FROM accounts</c>, scalar SELECTs like
+        /// <c>SELECT 1</c>, or chained expressions like <c>SELECT
+        /// fn(...) || 'x'</c>. Multi-statement bodies are NOT split here
+        /// — caller is responsible (we operate on a single segment).
+        /// Mirrors the proxy's `is_function_call_statement` shape.
+        /// </remarks>
+        internal static bool IsFunctionCallStatement(string sql)
+        {
+            if (string.IsNullOrEmpty(sql)) return false;
+            // Use SplitStatements to walk segments — return true if ANY
+            // segment is a function call (any segment's body could SET).
+            var segments = sql.IndexOf(';') >= 0
+                ? SplitStatements(sql)
+                : new List<string> { sql };
+            foreach (var seg in segments)
+            {
+                if (IsSingleFunctionCallStatement(seg)) return true;
+            }
+            return false;
+        }
+
+        // Single-segment check. See IsFunctionCallStatement remarks.
+        private static bool IsSingleFunctionCallStatement(string sql)
+        {
+            if (string.IsNullOrEmpty(sql)) return false;
+            var s = sql.Trim();
+            if (s.EndsWith(";", StringComparison.Ordinal))
+                s = s.Substring(0, s.Length - 1).TrimEnd();
+            if (s.Length == 0) return false;
+
+            // Identify the leading keyword.
+            int p = 0;
+            int wordStart = p;
+            while (p < s.Length && !char.IsWhiteSpace(s[p]) && s[p] != '(') p++;
+            if (p == wordStart) return false;
+            var head = s.Substring(wordStart, p - wordStart);
+
+            if (head.Equals("CALL", StringComparison.OrdinalIgnoreCase) ||
+                head.Equals("EXEC", StringComparison.OrdinalIgnoreCase) ||
+                head.Equals("EXECUTE", StringComparison.OrdinalIgnoreCase))
+            {
+                // The token after CALL / EXEC must look like an
+                // identifier (optionally schema-qualified). We don't
+                // require the parens — `EXEC sp_foo` is valid T-SQL.
+                while (p < s.Length && char.IsWhiteSpace(s[p])) p++;
+                if (p >= s.Length) return false;
+                int idStart = p;
+                while (p < s.Length && (IsIdentChar(s[p]) || s[p] == '.')) p++;
+                return p > idStart;
+            }
+
+            if (head.Equals("SELECT", StringComparison.OrdinalIgnoreCase))
+            {
+                // After SELECT, expect (whitespace*) <ident>(.<ident>)? `(`
+                // No commas, no operators, no other keywords. Reject
+                // `SELECT 1`, `SELECT * FROM ...`, `SELECT foo, bar`.
+                while (p < s.Length && char.IsWhiteSpace(s[p])) p++;
+                if (p >= s.Length) return false;
+                int idStart = p;
+                while (p < s.Length && (IsIdentChar(s[p]) || s[p] == '.')) p++;
+                if (p == idStart) return false;
+                var ident = s.Substring(idStart, p - idStart);
+                // Reject keywords that are commonly seen at this position
+                // and aren't function calls. The full PG keyword list is
+                // huge; this list covers the realistic cases.
+                if (IsSelectListKeyword(ident)) return false;
+
+                // Must immediately have `(` (whitespace allowed).
+                while (p < s.Length && char.IsWhiteSpace(s[p])) p++;
+                if (p >= s.Length || s[p] != '(') return false;
+
+                // Walk the matching `)` so we can verify nothing
+                // remains after the closing paren (other than optional
+                // trailing whitespace / `;`).
+                p++; // past `(`
+                int depth = 1;
+                char? quote = null;
+                while (p < s.Length)
+                {
+                    var c = s[p];
+                    if (quote.HasValue)
+                    {
+                        if (c == quote.Value)
+                        {
+                            if (p + 1 < s.Length && s[p + 1] == quote.Value)
+                            { p += 2; continue; }
+                            quote = null;
+                        }
+                    }
+                    else
+                    {
+                        if (c == '\'' || c == '"') quote = c;
+                        else if (c == '(') depth++;
+                        else if (c == ')')
+                        {
+                            depth--;
+                            if (depth == 0) { p++; goto Done; }
+                        }
+                    }
+                    p++;
+                }
+                return false; // unterminated `(`
+                Done:
+                while (p < s.Length && char.IsWhiteSpace(s[p])) p++;
+                if (p < s.Length && s[p] == ';') p++;
+                while (p < s.Length && char.IsWhiteSpace(s[p])) p++;
+                return p == s.Length;
+            }
+
+            return false;
+        }
+
+        // Identifier characters in PG: letters, digits, `_`. We're
+        // lenient and accept `$` too (some PG flavours allow it).
+        private static bool IsIdentChar(char c)
+        {
+            return (c >= 'a' && c <= 'z') ||
+                   (c >= 'A' && c <= 'Z') ||
+                   (c >= '0' && c <= '9') ||
+                   c == '_' || c == '$';
+        }
+
+        // Keywords that are commonly the first identifier-shaped token
+        // after SELECT but are NOT function calls. Conservative list —
+        // any false positive here just means an extra verify (no harm
+        // beyond a round-trip).
+        private static readonly HashSet<string> NonFunctionSelectKeywords =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                "DISTINCT", "ALL", "INTO", "FROM", "AS", "TOP", "TABLE",
+            };
+        private static bool IsSelectListKeyword(string ident) =>
+            NonFunctionSelectKeywords.Contains(ident);
+
+        /// <summary>
         /// Return true when the SQL's first token is a session-state
         /// command (SET / RESET / LISTEN / UNLISTEN / NOTIFY / BEGIN /
         /// START / COMMIT / ROLLBACK / END / SAVEPOINT / RELEASE). Used

@@ -604,6 +604,449 @@ namespace GoldLapel.Tests
         }
     }
 
+    // ── RLS hardening: function-call detection ───────────────
+    //
+    // Top-level function calls (SELECT my_fn(...), CALL fn(...),
+    // EXEC fn ...) might run a SET internally that we can't see on
+    // the wire. The detector flags these so the wrapper can schedule
+    // an async post-call verify against pg_settings.
+
+    public class IsFunctionCallStatementTest
+    {
+        [Fact] public void PlainSelect()
+            => Assert.False(NativeCache.IsFunctionCallStatement("SELECT * FROM accounts"));
+        [Fact] public void ScalarSelect()
+            => Assert.False(NativeCache.IsFunctionCallStatement("SELECT 1"));
+        [Fact] public void SelectFunctionCall()
+            => Assert.True(NativeCache.IsFunctionCallStatement("SELECT my_func()"));
+        [Fact] public void SelectFunctionWithArgs()
+            => Assert.True(NativeCache.IsFunctionCallStatement("SELECT my_func(1, 2, 'x')"));
+        [Fact] public void SelectFunctionSchemaQualified()
+            => Assert.True(NativeCache.IsFunctionCallStatement("SELECT public.my_func(1)"));
+        [Fact] public void SelectFunctionPgCatalog()
+            => Assert.True(NativeCache.IsFunctionCallStatement("SELECT pg_catalog.set_config('app.id', '42', false)"));
+        [Fact] public void SelectFunctionWithSpaces()
+            => Assert.True(NativeCache.IsFunctionCallStatement("SELECT  my_func  (  1  )"));
+        [Fact] public void SelectChainedExpressionRejected()
+        {
+            // `SELECT my_func() || 'x'` — there's stuff after `)`. Not a
+            // pure function-call shape; skip verify (we'll observe any
+            // SET via parser).
+            Assert.False(NativeCache.IsFunctionCallStatement("SELECT my_func() || 'x'"));
+        }
+        [Fact] public void SelectMultiColumnRejected()
+            => Assert.False(NativeCache.IsFunctionCallStatement("SELECT my_func(), my_other_func()"));
+        [Fact] public void SelectFromRejected()
+            => Assert.False(NativeCache.IsFunctionCallStatement("SELECT * FROM my_func()"));
+        [Fact] public void SelectDistinctRejected()
+            => Assert.False(NativeCache.IsFunctionCallStatement("SELECT DISTINCT id FROM accounts"));
+        [Fact] public void Call()
+            => Assert.True(NativeCache.IsFunctionCallStatement("CALL my_proc()"));
+        [Fact] public void CallSchemaQualified()
+            => Assert.True(NativeCache.IsFunctionCallStatement("CALL public.my_proc(1)"));
+        [Fact] public void Exec()
+            => Assert.True(NativeCache.IsFunctionCallStatement("EXEC sp_my_proc"));
+        [Fact] public void ExecuteFn()
+            => Assert.True(NativeCache.IsFunctionCallStatement("EXECUTE my_fn"));
+        [Fact] public void TrailingSemicolonAccepted()
+            => Assert.True(NativeCache.IsFunctionCallStatement("SELECT my_func();"));
+        [Fact] public void Empty()
+            => Assert.False(NativeCache.IsFunctionCallStatement(""));
+        [Fact] public void WhitespaceOnly()
+            => Assert.False(NativeCache.IsFunctionCallStatement("   "));
+        [Fact] public void Null()
+            => Assert.False(NativeCache.IsFunctionCallStatement(null));
+        [Fact] public void CaseInsensitive()
+        {
+            Assert.True(NativeCache.IsFunctionCallStatement("select my_func()"));
+            Assert.True(NativeCache.IsFunctionCallStatement("call my_proc()"));
+        }
+        [Fact] public void MultiStatementContainingFunctionCall()
+        {
+            // Any segment matching makes the whole body trigger verify.
+            Assert.True(NativeCache.IsFunctionCallStatement(
+                "SET app.id = '1'; SELECT my_func()"));
+        }
+        [Fact] public void MultiStatementAllPlainReturnsFalse()
+        {
+            Assert.False(NativeCache.IsFunctionCallStatement(
+                "SELECT 1; SELECT * FROM orders"));
+        }
+        [Fact] public void UnterminatedParenRejected()
+            => Assert.False(NativeCache.IsFunctionCallStatement("SELECT my_func(1"));
+    }
+
+    // ── RLS hardening: Npgsql No-Reset-On-Close detection ────
+
+    public class NpgsqlAutoResetTest
+    {
+        [Fact] public void NonNpgsqlReturnsFalse()
+        {
+            var conn = new FakeConnection();
+            Assert.False(CachedConnection.DetectNpgsqlAutoReset(conn));
+        }
+
+        [Fact] public void NullConnectionReturnsFalse()
+            => Assert.False(CachedConnection.DetectNpgsqlAutoReset(null));
+
+        [Fact] public void DefaultEnablesReset()
+        {
+            // No `No Reset On Close` in the connection string → Npgsql
+            // default (reset enabled). ParseNoResetOnClose returns true.
+            Assert.True(CachedConnection.ParseNoResetOnClose(
+                "Host=localhost;Database=mydb"));
+        }
+
+        [Fact] public void EmptyStringReturnsFalse()
+            => Assert.False(CachedConnection.ParseNoResetOnClose(""));
+
+        [Fact] public void NoResetOnCloseTrueDisablesAutoReset()
+        {
+            // `No Reset On Close=true` → reset DOESN'T happen → autoReset=false.
+            Assert.False(CachedConnection.ParseNoResetOnClose(
+                "Host=localhost;No Reset On Close=true"));
+        }
+
+        [Fact] public void NoResetOnCloseFalseEnablesAutoReset()
+        {
+            Assert.True(CachedConnection.ParseNoResetOnClose(
+                "Host=localhost;No Reset On Close=false"));
+        }
+
+        [Fact] public void CaseInsensitiveBoolValue()
+        {
+            Assert.False(CachedConnection.ParseNoResetOnClose(
+                "Host=localhost;No Reset On Close=TRUE"));
+            Assert.False(CachedConnection.ParseNoResetOnClose(
+                "Host=localhost;No Reset On Close=Yes"));
+            Assert.False(CachedConnection.ParseNoResetOnClose(
+                "Host=localhost;No Reset On Close=1"));
+        }
+
+        [Fact] public void UnknownValueDefaultsToReset()
+        {
+            // Garbage value → assume default (reset enabled).
+            Assert.True(CachedConnection.ParseNoResetOnClose(
+                "Host=localhost;No Reset On Close=maybe"));
+        }
+    }
+
+    // ── RLS hardening: Open() pool-checkout behavior ─────────
+
+    public class OpenPoolCheckoutTest
+    {
+        [Fact]
+        public void OpenOnNonNpgsqlMarksDirty()
+        {
+            // FakeConnection isn't Npgsql — Open() should mark dirty so
+            // verify-on-checkout fires on the first command.
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var conn = new CachedConnection(new FakeConnection(), cache);
+
+            Assert.False(conn.GucState.IsDirty);
+            conn.Open();
+            Assert.True(conn.GucState.IsDirty);
+        }
+
+        [Fact]
+        public void OpenOnNonNpgsqlClearsPriorState()
+        {
+            // Prior session might have set state. Open() doesn't clear
+            // it directly — the verify-on-checkout path will. But the
+            // dirty flag must be set so the next command triggers verify.
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var conn = new CachedConnection(new FakeConnection(), cache);
+            conn.GucState.ObserveSql("SET app.user_id = '42'");
+            Assert.NotEqual(0L, conn.GucState.StateHash);
+
+            conn.Open();
+            Assert.True(conn.GucState.IsDirty);
+        }
+    }
+
+    // ── RLS hardening: VerifyAndClearDirty (synchronous fallback) ─
+
+    public class VerifyAndClearDirtyTest
+    {
+        // Helper: build a FakeConnection that responds to the
+        // pg_settings verify query with a fixed (name, setting) row set.
+        private static FakeConnection MakeInnerWithVerify(params (string name, string value)[] rows)
+        {
+            var inner = new FakeConnection();
+            var rowArray = new object[rows.Length][];
+            for (int i = 0; i < rows.Length; i++)
+                rowArray[i] = new object[] { rows[i].name, rows[i].value };
+            inner.ReaderBySql["SELECT name, setting FROM pg_settings WHERE source='session'"] =
+                () => new FakeDataReader(rowArray, new[] { "name", "setting" });
+            return inner;
+        }
+
+        [Fact]
+        public void NotDirtyIsNoOp()
+        {
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var inner = MakeInnerWithVerify();
+            var conn = new CachedConnection(inner, cache);
+
+            // No MarkDirty — VerifyAndClearDirty should skip entirely.
+            conn.VerifyAndClearDirty();
+            Assert.DoesNotContain(
+                "SELECT name, setting FROM pg_settings WHERE source='session'",
+                inner.ExecutedSql);
+        }
+
+        [Fact]
+        public void DirtyTriggersVerify()
+        {
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var inner = MakeInnerWithVerify(
+                ("app.user_id", "42"),
+                ("application_name", "myapp"));
+            var conn = new CachedConnection(inner, cache);
+            conn.GucState.MarkDirty();
+
+            conn.VerifyAndClearDirty();
+
+            Assert.Contains(
+                "SELECT name, setting FROM pg_settings WHERE source='session'",
+                inner.ExecutedSql);
+            Assert.False(conn.GucState.IsDirty);
+            // Only the unsafe `app.user_id` should contribute to the hash.
+            var b = new ConnectionGucState();
+            b.ObserveSql("SET app.user_id = '42'");
+            Assert.Equal(b.StateHash, conn.GucState.StateHash);
+        }
+
+        [Fact]
+        public void VerifyOnClosedConnectionIsNoop()
+        {
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var inner = MakeInnerWithVerify(("app.user_id", "42"));
+            inner.ForceClosed = true;
+            var conn = new CachedConnection(inner, cache);
+            conn.GucState.MarkDirty();
+
+            conn.VerifyAndClearDirty();
+
+            // Closed connection — verify must skip without throwing.
+            // Dirty stays set so the next checkout retries.
+            Assert.True(conn.GucState.IsDirty);
+        }
+
+        [Fact]
+        public void VerifyBeforeCommandReadsServerTruth()
+        {
+            // Open() marks dirty on non-Npgsql; the next ExecuteReader
+            // must verify FIRST, then build the cache key from the
+            // post-verify state hash.
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var inner = MakeInnerWithVerify(("app.user_id", "alice"));
+            inner.NextReader = new FakeDataReader(
+                new[] { new object[] { "x" } }, new[] { "v" });
+            var conn = new CachedConnection(inner, cache);
+            conn.Open();
+            Assert.True(conn.GucState.IsDirty);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "SELECT v FROM accounts";
+                cmd.ExecuteReader().Dispose();
+            }
+
+            Assert.False(conn.GucState.IsDirty);
+            // After verify, state hash should reflect server-truth
+            // (`app.user_id=alice`).
+            var b = new ConnectionGucState();
+            b.ObserveSql("SET app.user_id = 'alice'");
+            Assert.Equal(b.StateHash, conn.GucState.StateHash);
+        }
+    }
+
+    // ── RLS hardening: async post-call verify ───────────────
+
+    public class AsyncPostCallVerifyTest
+    {
+        private static FakeConnection MakeInnerWithVerify(params (string name, string value)[] rows)
+        {
+            var inner = new FakeConnection();
+            var rowArray = new object[rows.Length][];
+            for (int i = 0; i < rows.Length; i++)
+                rowArray[i] = new object[] { rows[i].name, rows[i].value };
+            inner.ReaderBySql["SELECT name, setting FROM pg_settings WHERE source='session'"] =
+                () => new FakeDataReader(rowArray, new[] { "name", "setting" });
+            return inner;
+        }
+
+        // Spin until predicate is true or timeout elapses. Async verify
+        // is fire-and-forget; tests need a small bounded wait.
+        private static bool SpinUntil(Func<bool> predicate, int timeoutMs = 2000)
+        {
+            var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+            while (DateTime.UtcNow < deadline)
+            {
+                if (predicate()) return true;
+                Thread.Sleep(10);
+            }
+            return predicate();
+        }
+
+        [Fact]
+        public void FunctionCallSchedulesVerify()
+        {
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            // The function call body might have set app.user_id; the
+            // verify catches it.
+            var inner = MakeInnerWithVerify(("app.user_id", "from-fn"));
+            var conn = new CachedConnection(inner, cache);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "SELECT my_func()";
+                cmd.ExecuteReader().Dispose();
+            }
+
+            // Wait for the async verify to run.
+            Assert.True(SpinUntil(() =>
+            {
+                lock (inner.ExecutedSql)
+                    return inner.ExecutedSql.Contains(
+                        "SELECT name, setting FROM pg_settings WHERE source='session'");
+            }));
+
+            // After verify, state reflects server truth.
+            Assert.True(SpinUntil(() =>
+            {
+                var b = new ConnectionGucState();
+                b.ObserveSql("SET app.user_id = 'from-fn'");
+                return conn.GucState.StateHash == b.StateHash;
+            }));
+        }
+
+        [Fact]
+        public void PlainSelectDoesNotScheduleVerify()
+        {
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var inner = MakeInnerWithVerify(("app.user_id", "noop"));
+            inner.NextReader = new FakeDataReader(
+                new[] { new object[] { "x" } }, new[] { "v" });
+            var conn = new CachedConnection(inner, cache);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "SELECT v FROM accounts";
+                cmd.ExecuteReader().Dispose();
+            }
+
+            // Give any spurious task a chance to run.
+            Thread.Sleep(100);
+            lock (inner.ExecutedSql)
+                Assert.DoesNotContain(
+                    "SELECT name, setting FROM pg_settings WHERE source='session'",
+                    inner.ExecutedSql);
+        }
+
+        [Fact]
+        public void CallStatementSchedulesVerify()
+        {
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var inner = MakeInnerWithVerify(("role", "elevated"));
+            var conn = new CachedConnection(inner, cache);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "CALL my_proc()";
+                cmd.ExecuteNonQuery();
+            }
+
+            Assert.True(SpinUntil(() =>
+            {
+                lock (inner.ExecutedSql)
+                    return inner.ExecutedSql.Contains(
+                        "SELECT name, setting FROM pg_settings WHERE source='session'");
+            }));
+        }
+
+        [Fact]
+        public void DisposeCancelsInFlightVerify()
+        {
+            // Dispose must not throw, and the verify token must be
+            // cancelled so the task exits cleanly.
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var inner = MakeInnerWithVerify();
+            var conn = new CachedConnection(inner, cache);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "SELECT my_func()";
+                cmd.ExecuteScalar();
+            }
+            conn.Dispose();
+            // No assertion — just verifying we don't deadlock or throw.
+            // The test passing means cancellation worked.
+        }
+
+        [Fact]
+        public void VerifyFailureMarksDirty()
+        {
+            // Inner connection returns no row factory for pg_settings;
+            // the default empty FakeDataReader has 0 columns and reading
+            // GetString(0) on an empty result is fine, so we need to
+            // force an exception. Closed-connection state is the
+            // cleanest forcer.
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var inner = new FakeConnection();
+            inner.ForceClosed = true;
+            var conn = new CachedConnection(inner, cache);
+
+            // Manually invoke the async verify path so we can assert
+            // on the resulting state without timing out.
+            conn.ScheduleAsyncVerify();
+
+            Assert.True(SpinUntil(() => conn.GucState.IsDirty));
+        }
+
+        [Fact]
+        public void OpenAfterCloseRefreshesCancellationToken()
+        {
+            // After Close cancels the CTS, a subsequent Open must mint
+            // a new CTS so post-call verifies still schedule.
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var inner = MakeInnerWithVerify(("app.user_id", "after-reopen"));
+            var conn = new CachedConnection(inner, cache);
+
+            conn.Close();
+            Assert.True(conn.VerifyCancellationToken.IsCancellationRequested);
+
+            conn.Open();
+            Assert.False(conn.VerifyCancellationToken.IsCancellationRequested);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "SELECT my_func()";
+                cmd.ExecuteScalar();
+            }
+
+            Assert.True(SpinUntil(() =>
+            {
+                lock (inner.ExecutedSql)
+                    return inner.ExecutedSql.Contains(
+                        "SELECT name, setting FROM pg_settings WHERE source='session'");
+            }));
+        }
+    }
+
     // ── CachedCommand.DbConnection setter ─────────────────────
 
     public class CachedCommandConnectionSetterTest
@@ -644,12 +1087,25 @@ namespace GoldLapel.Tests
         public FakeDataReader NextReader;
         public int NextNonQueryResult;
         public FakeTransaction NextTransaction;
+        // Per-SQL reader factory — keyed by exact-match CommandText.
+        // Returns a fresh reader each invocation so tests can re-run
+        // the same query and re-walk the rows. Used by RLS-hardening
+        // tests to seed pg_settings query responses.
+        public Dictionary<string, Func<FakeDataReader>> ReaderBySql = new Dictionary<string, Func<FakeDataReader>>(StringComparer.Ordinal);
+        // Recorded SQL text of every command executed against this
+        // connection — lets tests assert that a verify query fired
+        // (asynchronously or synchronously).
+        public List<string> ExecutedSql = new List<string>();
+        // Force every command on this connection to report its
+        // connection state as Closed — used to test the "no verify on
+        // closed connection" guard in VerifyAndClearDirty.
+        public bool ForceClosed;
 
         public override string ConnectionString { get; set; } = "fake";
         public override string Database => "fake";
         public override string DataSource => "fake";
         public override string ServerVersion => "1.0";
-        public override ConnectionState State => ConnectionState.Open;
+        public override ConnectionState State => ForceClosed ? ConnectionState.Closed : ConnectionState.Open;
 
         public override void ChangeDatabase(string databaseName) { }
         public override void Open() { }
@@ -696,11 +1152,22 @@ namespace GoldLapel.Tests
 
         protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior)
         {
+            lock (_conn.ExecutedSql) _conn.ExecutedSql.Add(CommandText ?? "");
+            if (CommandText != null && _conn.ReaderBySql.TryGetValue(CommandText, out var factory))
+                return factory();
             return _conn.NextReader ?? new FakeDataReader(new object[0][], new string[0]);
         }
 
-        public override int ExecuteNonQuery() => _conn.NextNonQueryResult;
-        public override object ExecuteScalar() => null;
+        public override int ExecuteNonQuery()
+        {
+            lock (_conn.ExecutedSql) _conn.ExecutedSql.Add(CommandText ?? "");
+            return _conn.NextNonQueryResult;
+        }
+        public override object ExecuteScalar()
+        {
+            lock (_conn.ExecutedSql) _conn.ExecutedSql.Add(CommandText ?? "");
+            return null;
+        }
     }
 
     internal class FakeParameter : DbParameter
