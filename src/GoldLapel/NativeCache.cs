@@ -160,38 +160,46 @@ namespace GoldLapel
         public void Apply(SetCommand cmd)
         {
             if (cmd == null) return;
-            bool changed = false;
             lock (_lock)
             {
-                switch (cmd.Kind)
-                {
-                    case SetCommand.CommandKind.Set:
-                        if (NativeCache.IsUnsafeGuc(cmd.Name))
-                        {
-                            _values[cmd.Name] = cmd.Value;
-                            changed = true;
-                        }
-                        break;
-                    case SetCommand.CommandKind.SetLocal:
-                        // Intentionally ignored — see class remarks.
-                        break;
-                    case SetCommand.CommandKind.Reset:
-                        if (NativeCache.IsUnsafeGuc(cmd.Name) && _values.Remove(cmd.Name))
-                        {
-                            changed = true;
-                        }
-                        break;
-                    case SetCommand.CommandKind.ResetAll:
-                    case SetCommand.CommandKind.DiscardAll:
-                        if (_values.Count > 0)
-                        {
-                            _values.Clear();
-                            changed = true;
-                        }
-                        break;
-                }
-                if (changed) RecomputeHashLocked();
+                if (ApplyLocked(cmd)) RecomputeHashLocked();
             }
+        }
+
+        // Caller holds _lock. Returns true if _values changed (caller is
+        // responsible for RecomputeHashLocked). Split out so multi-statement
+        // observation can apply several commands then recompute once, and
+        // so SnapshotAndObserveSql can drive observation without nesting
+        // lock acquisitions.
+        private bool ApplyLocked(SetCommand cmd)
+        {
+            if (cmd == null) return false;
+            switch (cmd.Kind)
+            {
+                case SetCommand.CommandKind.Set:
+                    if (NativeCache.IsUnsafeGuc(cmd.Name))
+                    {
+                        _values[cmd.Name] = cmd.Value;
+                        return true;
+                    }
+                    return false;
+                case SetCommand.CommandKind.SetLocal:
+                    // Intentionally ignored — see class remarks.
+                    return false;
+                case SetCommand.CommandKind.Reset:
+                    if (NativeCache.IsUnsafeGuc(cmd.Name) && _values.Remove(cmd.Name))
+                        return true;
+                    return false;
+                case SetCommand.CommandKind.ResetAll:
+                case SetCommand.CommandKind.DiscardAll:
+                    if (_values.Count > 0)
+                    {
+                        _values.Clear();
+                        return true;
+                    }
+                    return false;
+            }
+            return false;
         }
 
         /// <summary>
@@ -230,10 +238,67 @@ namespace GoldLapel
         /// are split on top-level <c>;</c> (string literals respected).
         /// Returns <c>true</c> if the hash changed.
         /// </summary>
+        /// <remarks>
+        /// Mutates state immediately. Callers that need to gate the
+        /// mutation on the inner DbCommand reporting success should use
+        /// <see cref="SnapshotAndObserveSql"/> instead and call
+        /// <see cref="GucStateSnapshot.Restore"/> on exception — that
+        /// pattern matches the .NET transactional-scope idiom and avoids
+        /// diverging the wrapper's view from server-side state when a
+        /// SET-bearing command throws.
+        /// </remarks>
         public bool ObserveSql(string sql)
         {
             if (string.IsNullOrEmpty(sql)) return false;
-            var before = StateHash;
+            lock (_lock)
+            {
+                return ObserveSqlLocked(sql);
+            }
+        }
+
+        /// <summary>
+        /// Capture the current values + hash, then apply every <c>SET</c>
+        /// / <c>RESET</c> in <paramref name="sql"/> in-place. Returns a
+        /// disposable-style snapshot whose <see cref="GucStateSnapshot.Restore"/>
+        /// reverts to the captured state.
+        /// </summary>
+        /// <remarks>
+        /// The wrapper's <see cref="CachedCommand"/> uses this to defer
+        /// state-hash mutation until the inner DbCommand reports success.
+        /// On <c>DbException</c> the wrapper restores the snapshot and
+        /// calls <see cref="MarkDirty"/> — server-side might have applied
+        /// some prefix of a multi-statement body (Pg lets pre-error
+        /// statements commit when there's no enclosing transaction), so
+        /// the next checkout reconciles via verify. Snapshot+restore
+        /// without MarkDirty would silently diverge from server state.
+        ///
+        /// Implementation note: snapshotting copies the SortedDictionary
+        /// contents into a small KeyValuePair[]. <c>_values</c> is
+        /// typically empty or holds 1-3 entries (search_path, role,
+        /// app.user_id) — the copy is O(k) with a tiny constant.
+        /// </remarks>
+        public GucStateSnapshot SnapshotAndObserveSql(string sql)
+        {
+            lock (_lock)
+            {
+                // Capture before applying. Empty input → snapshot is a
+                // no-op restore, matches ObserveSql's early-return.
+                var snapValues = _values.Count == 0
+                    ? Array.Empty<KeyValuePair<string, string>>()
+                    : _values.ToArray();
+                var snapHash = Interlocked.Read(ref _stateHash);
+                if (!string.IsNullOrEmpty(sql))
+                    ObserveSqlLocked(sql);
+                return new GucStateSnapshot(this, snapHash, snapValues);
+            }
+        }
+
+        // Caller holds _lock. Parses the SQL into SET/RESET commands and
+        // applies them in-place. Returns true if the hash changed.
+        private bool ObserveSqlLocked(string sql)
+        {
+            if (string.IsNullOrEmpty(sql)) return false;
+            var before = Interlocked.Read(ref _stateHash);
 
             // Fast path for the common single-statement case — avoid
             // allocating the segments list for every SQL that isn't a
@@ -265,21 +330,44 @@ namespace GoldLapel
                 }
             }
 
+            bool changed = false;
             if (!hasInnerSemicolon)
             {
                 var cmd = NativeCache.ParseSetCommand(sql);
-                if (cmd != null) Apply(cmd);
+                if (cmd != null && ApplyLocked(cmd)) changed = true;
             }
             else
             {
                 foreach (var stmt in NativeCache.SplitStatements(sql))
                 {
                     var cmd = NativeCache.ParseSetCommand(stmt);
-                    if (cmd != null) Apply(cmd);
+                    if (cmd != null && ApplyLocked(cmd)) changed = true;
                 }
             }
-            return StateHash != before;
+            if (changed) RecomputeHashLocked();
+            return Interlocked.Read(ref _stateHash) != before;
         }
+
+        // Caller holds _lock. Replaces _values with the snapshotted entries
+        // and reinstates the snapshotted hash. Used by GucStateSnapshot.Restore
+        // to roll back an optimistic ObserveSql when the underlying command
+        // throws. Bypasses RecomputeHashLocked because the snapshotted hash is
+        // the canonical hash for the snapshotted values — recomputing would
+        // burn cycles for the same answer.
+        internal void RestoreFromSnapshotLocked(long snapHash, KeyValuePair<string, string>[] snapValues)
+        {
+            _values.Clear();
+            if (snapValues != null)
+            {
+                foreach (var kv in snapValues)
+                    _values[kv.Key] = kv.Value;
+            }
+            Interlocked.Exchange(ref _stateHash, snapHash);
+        }
+
+        // Internal accessor for GucStateSnapshot.Restore to acquire the
+        // owner's lock. Avoids exposing _lock as a public field.
+        internal object SyncRoot => _lock;
 
         // Caller holds _lock. Recomputes the deterministic FNV-1a-style
         // hash of the (ordered) name=value pairs. Empty state hashes to 0
@@ -321,6 +409,52 @@ namespace GoldLapel
             // Probability is ~1/2^64, but we'd rather be deterministic.
             if (h == 0) h = 1;
             Interlocked.Exchange(ref _stateHash, unchecked((long)h));
+        }
+    }
+
+    /// <summary>
+    /// Snapshot of <see cref="ConnectionGucState"/> taken before a SQL
+    /// observation. <see cref="Restore"/> reverts the owner to the
+    /// snapshotted values and hash atomically. Used by
+    /// <see cref="CachedCommand"/> to undo an optimistic <c>ObserveSql</c>
+    /// when the underlying <c>DbCommand</c> throws.
+    /// </summary>
+    /// <remarks>
+    /// .NET idiom: a <c>readonly struct</c> (no allocation; lives on the
+    /// stack across the try/catch) with a single <see cref="Restore"/>
+    /// method. Not <c>IDisposable</c> on purpose — the wrapper restores
+    /// only on the exception branch, never the success branch, and
+    /// <c>using</c>-style auto-restore would invert that.
+    ///
+    /// A default-constructed (empty) snapshot is a no-op restore. This
+    /// matches the early-return semantics of <see cref="ConnectionGucState.SnapshotAndObserveSql"/>
+    /// for null/empty SQL — callers don't need a separate guard.
+    /// </remarks>
+    public readonly struct GucStateSnapshot
+    {
+        private readonly ConnectionGucState _owner;
+        private readonly long _stateHash;
+        private readonly KeyValuePair<string, string>[] _values;
+
+        internal GucStateSnapshot(ConnectionGucState owner, long stateHash, KeyValuePair<string, string>[] values)
+        {
+            _owner = owner;
+            _stateHash = stateHash;
+            _values = values;
+        }
+
+        /// <summary>
+        /// Revert the owning <see cref="ConnectionGucState"/> to the
+        /// values + hash captured when this snapshot was taken. No-op for
+        /// a default-constructed snapshot.
+        /// </summary>
+        public void Restore()
+        {
+            if (_owner == null) return;
+            lock (_owner.SyncRoot)
+            {
+                _owner.RestoreFromSnapshotLocked(_stateHash, _values);
+            }
         }
     }
 

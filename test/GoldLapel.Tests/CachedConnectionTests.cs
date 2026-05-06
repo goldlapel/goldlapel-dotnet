@@ -1047,6 +1047,439 @@ namespace GoldLapel.Tests
         }
     }
 
+    // ── SET-actually-applied: defer state-hash mutation until success ──
+    //
+    // Wave 2 fix (`dotnet-set-actually-applied-2026-05-05`): the wrapper
+    // observed SET commands optimistically and mutated the per-connection
+    // GUC state hash before the inner DbCommand ran. If the command then
+    // threw — e.g. the SET names a GUC that doesn't exist server-side, or
+    // a multi-statement body has a syntax error past the SET — the
+    // wrapper's observed state diverged from server-truth, leaking the
+    // old state hash into subsequent cache lookups.
+    //
+    // Fix: SnapshotAndObserveSql captures the pre-observation hash + values
+    // and applies the SETs in-place. CachedCommand wraps each inner execute
+    // in try/catch; on exception it Restores the snapshot AND MarkDirty(),
+    // so the next checkout reconciles via the existing pg_settings verify
+    // path. (MarkDirty handles the multi-statement edge case where
+    // Postgres applied a prefix of SETs before the failure.)
+
+    public class SetActuallyAppliedTest : IDisposable
+    {
+        public SetActuallyAppliedTest() { NativeCache.Reset(); }
+        public void Dispose() { NativeCache.Reset(); }
+
+        // Spin until predicate is true or timeout elapses. Async verify
+        // is fire-and-forget; tests need a small bounded wait. (Mirrors
+        // the helper in AsyncPostCallVerifyTest — kept private here so
+        // the SET-actually-applied tests stay self-contained.)
+        private static bool SpinUntil(Func<bool> predicate, int timeoutMs = 2000)
+        {
+            var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+            while (DateTime.UtcNow < deadline)
+            {
+                if (predicate()) return true;
+                Thread.Sleep(10);
+            }
+            return predicate();
+        }
+
+        // ── ExecuteNonQuery ──
+
+        [Fact]
+        public void NonQuerySetSuccessAppliesStateHash()
+        {
+            // Sanity check: the success path still mutates state. The
+            // pending mutation isn't the snapshot's restore target —
+            // the snapshot is only restored on exception.
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var inner = new FakeConnection();
+            var conn = new CachedConnection(inner, cache);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "SET app.user_id = '42'";
+                cmd.ExecuteNonQuery();
+            }
+
+            Assert.NotEqual(0L, conn.GucState.StateHash);
+            var b = new ConnectionGucState();
+            b.ObserveSql("SET app.user_id = '42'");
+            Assert.Equal(b.StateHash, conn.GucState.StateHash);
+        }
+
+        [Fact]
+        public void NonQuerySetExceptionRevertsStateHash()
+        {
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var inner = new FakeConnection();
+            inner.ThrowOnNextNonQuery = new InvalidOperationException("simulated DbException");
+            var conn = new CachedConnection(inner, cache);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "SET app.user_id = '42'";
+                Assert.Throws<InvalidOperationException>(() => cmd.ExecuteNonQuery());
+            }
+
+            // Pre-fix bug: state hash was 0 → mutated to non-zero
+            // unconditionally, so the next SELECT keyed against the
+            // wrong hash. Post-fix: snapshot restored to 0.
+            Assert.Equal(0L, conn.GucState.StateHash);
+            // Marked dirty so the next checkout reconciles via verify
+            // (covers the multi-statement-prefix-applied edge case).
+            Assert.True(conn.GucState.IsDirty);
+        }
+
+        [Fact]
+        public void NonQueryExceptionDoesNotAddSpuriousStateHash()
+        {
+            // No SET in the SQL — exception path should still not
+            // perturb the (already-zero) hash. Snapshot+restore is a
+            // no-op for non-observing SQL; only MarkDirty fires.
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var inner = new FakeConnection();
+            inner.ThrowOnNextNonQuery = new InvalidOperationException("boom");
+            var conn = new CachedConnection(inner, cache);
+
+            Assert.Equal(0L, conn.GucState.StateHash);
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "INSERT INTO orders VALUES (1)";
+                Assert.Throws<InvalidOperationException>(() => cmd.ExecuteNonQuery());
+            }
+            Assert.Equal(0L, conn.GucState.StateHash);
+        }
+
+        // ── ExecuteScalar ──
+
+        [Fact]
+        public void ScalarSetExceptionRevertsStateHash()
+        {
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var inner = new FakeConnection();
+            inner.ThrowOnNextScalar = new InvalidOperationException("simulated");
+            var conn = new CachedConnection(inner, cache);
+
+            // Pre-perturb to a known non-zero hash so we can detect a
+            // diverged state on the exception path. The success-then-
+            // failure sequence is the realistic one: prior SETs already
+            // landed, then a new SET fails.
+            conn.GucState.ObserveSql("SET role = 'admin'");
+            var preHash = conn.GucState.StateHash;
+            Assert.NotEqual(0L, preHash);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "SET app.user_id = '42'";
+                Assert.Throws<InvalidOperationException>(() => cmd.ExecuteScalar());
+            }
+
+            // Snapshot restored to the pre-call hash (role='admin' still
+            // applies, app.user_id='42' does NOT).
+            Assert.Equal(preHash, conn.GucState.StateHash);
+            Assert.True(conn.GucState.IsDirty);
+        }
+
+        // ── ExecuteReader / ExecuteDbDataReader ──
+
+        [Fact]
+        public void ReaderSetExceptionRevertsStateHash()
+        {
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var inner = new FakeConnection();
+            inner.ThrowOnNextReader = new InvalidOperationException("simulated");
+            var conn = new CachedConnection(inner, cache);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                // Multi-statement that observation will parse a SET
+                // out of, but ExecuteReader throws — ensure no diverge.
+                cmd.CommandText = "SET app.user_id = '42'; SELECT 1";
+                Assert.Throws<InvalidOperationException>(() => cmd.ExecuteReader());
+            }
+
+            Assert.Equal(0L, conn.GucState.StateHash);
+            Assert.True(conn.GucState.IsDirty);
+        }
+
+        [Fact]
+        public void ReaderExceptionInTransactionRevertsState()
+        {
+            // In-transaction reader path bypasses the cache but still
+            // observes SET; same revert contract applies.
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var inner = new FakeConnection();
+            var conn = new CachedConnection(inner, cache);
+
+            // Enter transaction the same way the existing test does.
+            inner.NextTransaction = new FakeTransaction();
+            using (var tx = conn.BeginTransaction())
+            {
+                inner.ThrowOnNextReader = new InvalidOperationException("simulated");
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.CommandText = "SET app.user_id = '99'";
+                    Assert.Throws<InvalidOperationException>(() => cmd.ExecuteReader());
+                }
+                tx.Rollback();
+            }
+
+            Assert.Equal(0L, conn.GucState.StateHash);
+            Assert.True(conn.GucState.IsDirty);
+        }
+
+        [Fact]
+        public void ReaderExceptionOnWritePathRevertsState()
+        {
+            // Write-detection path: observation runs, invalidation runs,
+            // then ExecuteReader is invoked. If it throws, GUC state must
+            // revert (and the eager invalidation already happened — that
+            // doesn't unwind, which is fine: invalidation is conservative).
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            cache.Put("SELECT * FROM orders", null,
+                new[] { new object[] { 1 } }, new[] { "id" });
+
+            var inner = new FakeConnection();
+            inner.ThrowOnNextReader = new InvalidOperationException("simulated");
+            var conn = new CachedConnection(inner, cache);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "SET app.user_id = '42'; INSERT INTO orders VALUES (1)";
+                Assert.Throws<InvalidOperationException>(() => cmd.ExecuteReader());
+            }
+
+            // GUC state reverted.
+            Assert.Equal(0L, conn.GucState.StateHash);
+            Assert.True(conn.GucState.IsDirty);
+            // Invalidation already happened — orders cache entry is gone.
+            // (We deliberately don't try to undo eager invalidation: a
+            // failed write may have already taken effect on the server,
+            // and serving stale rows is the worse failure mode.)
+            Assert.Equal(0, cache.Size);
+        }
+
+        // ── Multi-statement edge cases ──
+
+        [Fact]
+        public void MultiStatementExceptionMarksDirtyForReconciliation()
+        {
+            // Pg semantics: in a multi-statement body without an
+            // explicit BEGIN, pre-error statements DO commit. The
+            // wrapper can't tell which prefix landed, so it MarkDirty's
+            // and lets verify-on-checkout reconcile from pg_settings
+            // on the next command.
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var inner = new FakeConnection();
+            inner.ThrowOnNextNonQuery = new InvalidOperationException("syntax error past SET");
+            var conn = new CachedConnection(inner, cache);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "SET app.user_id = '42'; SET role = 'admin'; INSERT INTO orders garbage";
+                Assert.Throws<InvalidOperationException>(() => cmd.ExecuteNonQuery());
+            }
+
+            // The optimistic hash mutation is rolled back. Server may
+            // have applied 0, 1, or 2 of the SETs — we don't know.
+            // MarkDirty triggers verify-on-checkout to reconcile.
+            Assert.Equal(0L, conn.GucState.StateHash);
+            Assert.True(conn.GucState.IsDirty);
+        }
+
+        [Fact]
+        public void DirtyTriggersVerifyOnNextCommand()
+        {
+            // End-to-end: SET fails → MarkDirty → next ExecuteReader
+            // runs verify against pg_settings before building the
+            // cache key. Server reports `app.user_id = 'truth'`; the
+            // wrapper picks that up.
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var inner = new FakeConnection();
+            // Verify response: server actually has app.user_id='truth'.
+            inner.ReaderBySql["SELECT name, setting FROM pg_settings WHERE source='session'"] =
+                () => new FakeDataReader(
+                    new[] { new object[] { "app.user_id", "truth" } },
+                    new[] { "name", "setting" });
+            var conn = new CachedConnection(inner, cache);
+
+            // First command throws.
+            inner.ThrowOnNextNonQuery = new InvalidOperationException("simulated");
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "SET app.user_id = 'attempt'";
+                Assert.Throws<InvalidOperationException>(() => cmd.ExecuteNonQuery());
+            }
+            Assert.True(conn.GucState.IsDirty);
+
+            // Second command — verify-on-checkout fires before exec,
+            // pulls truth from pg_settings.
+            inner.NextReader = new FakeDataReader(
+                new[] { new object[] { 1 } }, new[] { "v" });
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "SELECT v FROM accounts";
+                cmd.ExecuteReader().Dispose();
+            }
+
+            Assert.False(conn.GucState.IsDirty);
+            var b = new ConnectionGucState();
+            b.ObserveSql("SET app.user_id = 'truth'");
+            Assert.Equal(b.StateHash, conn.GucState.StateHash);
+        }
+
+        // ── Tx-flag bookkeeping integration (Wave 1 + Wave 2) ──
+
+        [Fact]
+        public void BeginThenExceptionRevertsTxFlag()
+        {
+            // Multi-segment body opens a transaction then throws — the
+            // wrapper's InTransaction flag must NOT be left flipped to
+            // true. Pg won't have entered the tx (the whole body
+            // failed in this simulation), and leaving InTransaction=true
+            // would permanently bypass the cache for this connection.
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var inner = new FakeConnection();
+            inner.ThrowOnNextNonQuery = new InvalidOperationException("simulated");
+            var conn = new CachedConnection(inner, cache);
+
+            Assert.False(conn.InTransaction);
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "BEGIN; INSERT INTO orders VALUES (1)";
+                Assert.Throws<InvalidOperationException>(() => cmd.ExecuteNonQuery());
+            }
+
+            // Pre-fix: would be true (DetectTxTransition saw BEGIN; flipped
+            // optimistically; throw didn't undo). Post-fix: reverted.
+            Assert.False(conn.InTransaction);
+        }
+
+        // ── Async path coverage ──
+        //
+        // DbCommand's default async overrides delegate to the sync
+        // Execute* methods (Task.FromResult / Task.Run wrappers in the
+        // base class). Wrapping the sync paths in try/catch therefore
+        // protects the async paths automatically — these tests confirm
+        // it end-to-end without overriding the async methods.
+
+        [Fact]
+        public async System.Threading.Tasks.Task ExecuteNonQueryAsyncThrowRevertsStateHash()
+        {
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var inner = new FakeConnection();
+            inner.ThrowOnNextNonQuery = new InvalidOperationException("simulated");
+            var conn = new CachedConnection(inner, cache);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "SET app.user_id = 'async-attempt'";
+                await Assert.ThrowsAsync<InvalidOperationException>(
+                    async () => await cmd.ExecuteNonQueryAsync());
+            }
+
+            Assert.Equal(0L, conn.GucState.StateHash);
+            Assert.True(conn.GucState.IsDirty);
+        }
+
+        [Fact]
+        public async System.Threading.Tasks.Task ExecuteReaderAsyncThrowRevertsStateHash()
+        {
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var inner = new FakeConnection();
+            inner.ThrowOnNextReader = new InvalidOperationException("simulated");
+            var conn = new CachedConnection(inner, cache);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "SET app.user_id = 'async-r'; SELECT 1";
+                await Assert.ThrowsAsync<InvalidOperationException>(
+                    async () => { using var r = await cmd.ExecuteReaderAsync(); });
+            }
+
+            Assert.Equal(0L, conn.GucState.StateHash);
+            Assert.True(conn.GucState.IsDirty);
+        }
+
+        [Fact]
+        public async System.Threading.Tasks.Task ExecuteScalarAsyncThrowRevertsStateHash()
+        {
+            var cache = new NativeCache();
+            cache.SetConnected(true);
+            var inner = new FakeConnection();
+            inner.ThrowOnNextScalar = new InvalidOperationException("simulated");
+            var conn = new CachedConnection(inner, cache);
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "SET app.user_id = 'async-s'";
+                await Assert.ThrowsAsync<InvalidOperationException>(
+                    async () => await cmd.ExecuteScalarAsync());
+            }
+
+            Assert.Equal(0L, conn.GucState.StateHash);
+            Assert.True(conn.GucState.IsDirty);
+        }
+
+        // ── Pure ConnectionGucState contract ──
+
+        [Fact]
+        public void SnapshotRestoreReturnsToPriorState()
+        {
+            // Direct test of the snapshot mechanism, no DbCommand path.
+            var s = new ConnectionGucState();
+            s.ObserveSql("SET role = 'baseline'");
+            var pre = s.StateHash;
+            Assert.NotEqual(0L, pre);
+
+            var snap = s.SnapshotAndObserveSql("SET app.user_id = 'temp'");
+            Assert.NotEqual(pre, s.StateHash);  // optimistic apply
+
+            snap.Restore();
+            Assert.Equal(pre, s.StateHash);     // back to baseline
+        }
+
+        [Fact]
+        public void DefaultSnapshotRestoreIsNoop()
+        {
+            // A default-constructed snapshot's Restore must not throw —
+            // the wrapper's RevertOptimisticState relies on this for
+            // the non-observing-SQL path.
+            var snap = default(GucStateSnapshot);
+            snap.Restore();  // no exception, no owner to mutate.
+        }
+
+        [Fact]
+        public void SnapshotRestoreClearsOptimisticReset()
+        {
+            // RESET ALL on a populated state empties the map. If the
+            // command throws, restore must rebuild the original map.
+            var s = new ConnectionGucState();
+            s.ObserveSql("SET app.user_id = '1'");
+            s.ObserveSql("SET role = 'admin'");
+            var pre = s.StateHash;
+
+            var snap = s.SnapshotAndObserveSql("RESET ALL");
+            Assert.Equal(0L, s.StateHash);  // optimistically empty.
+
+            snap.Restore();
+            Assert.Equal(pre, s.StateHash);  // both unsafe GUCs back.
+        }
+    }
+
     // ── CachedCommand.DbConnection setter ─────────────────────
 
     public class CachedCommandConnectionSetterTest
@@ -1101,6 +1534,16 @@ namespace GoldLapel.Tests
         // closed connection" guard in VerifyAndClearDirty.
         public bool ForceClosed;
 
+        // Fault injection — when set, the matching execute path on the
+        // FakeCommand throws this exception. Used by the SET-actually-
+        // applied regression tests to simulate a DbException raised by
+        // the underlying driver after observation but before a result.
+        // Cleared after one throw so tests can sequence (throw on
+        // first call, succeed on second).
+        public Exception ThrowOnNextNonQuery;
+        public Exception ThrowOnNextReader;
+        public Exception ThrowOnNextScalar;
+
         public override string ConnectionString { get; set; } = "fake";
         public override string Database => "fake";
         public override string DataSource => "fake";
@@ -1153,6 +1596,12 @@ namespace GoldLapel.Tests
         protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior)
         {
             lock (_conn.ExecutedSql) _conn.ExecutedSql.Add(CommandText ?? "");
+            if (_conn.ThrowOnNextReader != null)
+            {
+                var ex = _conn.ThrowOnNextReader;
+                _conn.ThrowOnNextReader = null;
+                throw ex;
+            }
             if (CommandText != null && _conn.ReaderBySql.TryGetValue(CommandText, out var factory))
                 return factory();
             return _conn.NextReader ?? new FakeDataReader(new object[0][], new string[0]);
@@ -1161,11 +1610,23 @@ namespace GoldLapel.Tests
         public override int ExecuteNonQuery()
         {
             lock (_conn.ExecutedSql) _conn.ExecutedSql.Add(CommandText ?? "");
+            if (_conn.ThrowOnNextNonQuery != null)
+            {
+                var ex = _conn.ThrowOnNextNonQuery;
+                _conn.ThrowOnNextNonQuery = null;
+                throw ex;
+            }
             return _conn.NextNonQueryResult;
         }
         public override object ExecuteScalar()
         {
             lock (_conn.ExecutedSql) _conn.ExecutedSql.Add(CommandText ?? "");
+            if (_conn.ThrowOnNextScalar != null)
+            {
+                var ex = _conn.ThrowOnNextScalar;
+                _conn.ThrowOnNextScalar = null;
+                throw ex;
+            }
             return null;
         }
     }

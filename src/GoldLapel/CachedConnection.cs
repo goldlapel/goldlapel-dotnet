@@ -543,6 +543,7 @@ namespace GoldLapel
             // bypassing cache reads permanently after the body completed.
             // See NativeCache.DetectTxTransition.
             var txFinal = NativeCache.DetectTxTransition(sql);
+            bool txWasInTransaction = _conn.InTransaction;
             if (txFinal.HasValue) _conn.InTransaction = txFinal.Value;
 
             // GUC-RLS cache safety: observe every SQL for SET / RESET so
@@ -551,7 +552,13 @@ namespace GoldLapel
             // `SET app.user_id = '42'; SELECT ...`) update state on the
             // SET segment and the SELECT segment looks up against the
             // new state hash.
-            _conn.GucState.ObserveSql(sql);
+            //
+            // Snapshot-and-revert pattern: observation mutates state
+            // optimistically so the cache key folds in the post-SET
+            // hash, but if the inner DbCommand throws we Restore() to
+            // the pre-SET hash. Diverging from server-side state on a
+            // failed SET is the bug this guards — see Wave 2 fix doc.
+            var gucSnap = _conn.GucState.SnapshotAndObserveSql(sql);
 
             // Write detection — run per-segment so multi-statement bodies
             // like `SET app.user_id = '42'; INSERT INTO orders VALUES (1)`
@@ -564,7 +571,13 @@ namespace GoldLapel
                     cache.InvalidateAll();
                 else
                     foreach (var t in writes) cache.InvalidateTable(t);
-                var writerReader = _inner.ExecuteReader(behavior);
+                DbDataReader writerReader;
+                try { writerReader = _inner.ExecuteReader(behavior); }
+                catch
+                {
+                    RevertOptimisticState(gucSnap, txWasInTransaction, txFinal.HasValue);
+                    throw;
+                }
                 MaybeScheduleAsyncVerify(sql);
                 return writerReader;
             }
@@ -572,7 +585,13 @@ namespace GoldLapel
             // In transaction: bypass cache
             if (_conn.InTransaction)
             {
-                var txReader = _inner.ExecuteReader(behavior);
+                DbDataReader txReader;
+                try { txReader = _inner.ExecuteReader(behavior); }
+                catch
+                {
+                    RevertOptimisticState(gucSnap, txWasInTransaction, txFinal.HasValue);
+                    throw;
+                }
                 MaybeScheduleAsyncVerify(sql);
                 return txReader;
             }
@@ -587,7 +606,13 @@ namespace GoldLapel
                 return new CachedDataReader(entry.Rows, entry.Columns);
 
             // Cache miss
-            var reader = _inner.ExecuteReader(behavior);
+            DbDataReader reader;
+            try { reader = _inner.ExecuteReader(behavior); }
+            catch
+            {
+                RevertOptimisticState(gucSnap, txWasInTransaction, txFinal.HasValue);
+                throw;
+            }
             var result = CacheAndReturn(sql, parameters, reader, stateHash);
             MaybeScheduleAsyncVerify(sql);
             return result;
@@ -602,10 +627,11 @@ namespace GoldLapel
 
             // Multi-segment tx transition: see ExecuteDbDataReader.
             var txFinal = NativeCache.DetectTxTransition(sql);
+            bool txWasInTransaction = _conn.InTransaction;
             if (txFinal.HasValue) _conn.InTransaction = txFinal.Value;
 
             // GUC-RLS cache safety: see ExecuteDbDataReader.
-            _conn.GucState.ObserveSql(sql);
+            var gucSnap = _conn.GucState.SnapshotAndObserveSql(sql);
 
             // Multi-segment write detection: see ExecuteDbDataReader.
             var writes = NativeCache.DetectWritesMulti(sql);
@@ -616,7 +642,13 @@ namespace GoldLapel
                 else
                     foreach (var t in writes) cache.InvalidateTable(t);
             }
-            var rv = _inner.ExecuteNonQuery();
+            int rv;
+            try { rv = _inner.ExecuteNonQuery(); }
+            catch
+            {
+                RevertOptimisticState(gucSnap, txWasInTransaction, txFinal.HasValue);
+                throw;
+            }
             MaybeScheduleAsyncVerify(sql);
             return rv;
         }
@@ -630,10 +662,11 @@ namespace GoldLapel
 
             // Multi-segment tx transition: see ExecuteDbDataReader.
             var txFinal = NativeCache.DetectTxTransition(sql);
+            bool txWasInTransaction = _conn.InTransaction;
             if (txFinal.HasValue) _conn.InTransaction = txFinal.Value;
 
             // GUC-RLS cache safety: see ExecuteDbDataReader.
-            _conn.GucState.ObserveSql(sql);
+            var gucSnap = _conn.GucState.SnapshotAndObserveSql(sql);
 
             // Multi-segment write detection: see ExecuteDbDataReader.
             var writes = NativeCache.DetectWritesMulti(sql);
@@ -644,9 +677,42 @@ namespace GoldLapel
                 else
                     foreach (var t in writes) cache.InvalidateTable(t);
             }
-            var rv = _inner.ExecuteScalar();
+            object rv;
+            try { rv = _inner.ExecuteScalar(); }
+            catch
+            {
+                RevertOptimisticState(gucSnap, txWasInTransaction, txFinal.HasValue);
+                throw;
+            }
             MaybeScheduleAsyncVerify(sql);
             return rv;
+        }
+
+        // Roll back the optimistic GUC observation and InTransaction
+        // bookkeeping when the inner DbCommand throws.
+        //
+        // GUC handling: we restore to the pre-observation snapshot and
+        // MarkDirty(). The snapshot fixes the obvious case (single SET
+        // that fails outright); MarkDirty handles the awkward case of a
+        // multi-statement body where Postgres applied some prefix of the
+        // SETs before failing — without an explicit BEGIN, statements
+        // before the failure DO commit, so our restored snapshot might
+        // diverge from server-truth. The next checkout's
+        // VerifyAndClearDirty reconciles via pg_settings.
+        //
+        // Tx handling: the SET-actually-applied principle generalises
+        // here. If we optimistically flipped InTransaction (BEGIN /
+        // COMMIT in the SQL) and the command then threw, we should
+        // restore the pre-call value — Pg won't have transitioned. The
+        // existing single-segment write detector already handled this
+        // implicitly (no flip on writes), but multi-statement bodies
+        // routed through DetectTxTransition can flip on parse, then
+        // throw. Same reasoning: don't lie about the connection state.
+        private void RevertOptimisticState(GucStateSnapshot gucSnap, bool txWasInTransaction, bool txFlipped)
+        {
+            try { gucSnap.Restore(); } catch { /* never block exception path */ }
+            try { _conn.GucState.MarkDirty(); } catch { }
+            if (txFlipped) _conn.InTransaction = txWasInTransaction;
         }
 
         // Schedule an async verify if the SQL is a top-level function
