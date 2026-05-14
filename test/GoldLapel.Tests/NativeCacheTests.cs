@@ -1943,6 +1943,128 @@ namespace GoldLapel.Tests
             Assert.Equal(0L, s.StateHash);
         }
 
+        // ── dml_seq counter ─────────────────────────────────────────
+
+        [Fact] public void BumpDmlSeqRollsHashFromBaseline()
+        {
+            // From the canonical fresh-connection state (no SETs, dml_seq=0)
+            // the hash is 0. The first BumpDmlSeq() must roll the hash to a
+            // non-zero value so any pre-DML cache slot for this connection
+            // is invalidated by the bump.
+            var s = new ConnectionGucState();
+            Assert.Equal(0L, s.StateHash);
+            s.BumpDmlSeq();
+            Assert.Equal(1L, s.DmlSeq);
+            Assert.NotEqual(0L, s.StateHash);
+        }
+
+        [Fact] public void EachBumpDmlSeqYieldsDistinctHash()
+        {
+            var s = new ConnectionGucState();
+            var hashes = new HashSet<long>();
+            for (int i = 0; i < 8; i++)
+            {
+                s.BumpDmlSeq();
+                Assert.True(hashes.Add(s.StateHash),
+                    $"hash repeated after {i + 1} bumps: {s.StateHash}");
+            }
+        }
+
+        [Fact] public void BumpDmlSeqCombinesWithUnsafeSet()
+        {
+            // Two states with the same unsafe SET but different dml_seq
+            // values must hash to different slots — peer connections with
+            // distinct write history can't accidentally share a cache slot.
+            var a = new ConnectionGucState();
+            a.ObserveSql("SET app.user_id = '42'");
+            a.BumpDmlSeq();
+
+            var b = new ConnectionGucState();
+            b.ObserveSql("SET app.user_id = '42'");
+            // No bump on b.
+
+            Assert.NotEqual(a.StateHash, b.StateHash);
+        }
+
+        [Fact] public void ResetAllClearsDmlSeqAndState()
+        {
+            // RESET ALL is server-truth-restoring — both the values map
+            // and the dml_seq counter return to baseline.
+            var s = new ConnectionGucState();
+            s.ObserveSql("SET app.user_id = '42'");
+            s.BumpDmlSeq();
+            s.BumpDmlSeq();
+            Assert.Equal(2L, s.DmlSeq);
+
+            Assert.True(s.ObserveSql("RESET ALL"));
+            Assert.Equal(0L, s.DmlSeq);
+            Assert.Equal(0L, s.StateHash);
+        }
+
+        [Fact] public void DiscardAllClearsDmlSeqAndState()
+        {
+            var s = new ConnectionGucState();
+            s.BumpDmlSeq();
+            s.BumpDmlSeq();
+            s.BumpDmlSeq();
+            Assert.Equal(3L, s.DmlSeq);
+
+            Assert.True(s.ObserveSql("DISCARD ALL"));
+            Assert.Equal(0L, s.DmlSeq);
+            Assert.Equal(0L, s.StateHash);
+        }
+
+        [Fact] public void ResetNamedDoesNotClearDmlSeq()
+        {
+            // RESET <name> is a targeted reset of one GUC, not a
+            // server-truth reset — dml_seq stays put because the
+            // wrapper's overall view of session state is still
+            // potentially-tampered by intervening DML triggers.
+            var s = new ConnectionGucState();
+            s.ObserveSql("SET app.user_id = '42'");
+            s.BumpDmlSeq();
+            Assert.Equal(1L, s.DmlSeq);
+
+            s.ObserveSql("RESET app.user_id");
+            Assert.Equal(1L, s.DmlSeq);
+            // values are empty but dml_seq=1 means the hash is non-zero
+            // and distinct from the canonical baseline.
+            Assert.NotEqual(0L, s.StateHash);
+        }
+
+        [Fact] public void ApplyVerifiedStateClearsDmlSeq()
+        {
+            // Verified state from pg_settings IS server-truth — the
+            // dml_seq safety net can return to baseline because the
+            // wrapper now has authoritative state.
+            var s = new ConnectionGucState();
+            s.BumpDmlSeq();
+            s.BumpDmlSeq();
+            Assert.Equal(2L, s.DmlSeq);
+
+            s.ApplyVerifiedState(new Dictionary<string, string>
+            {
+                { "app.user_id", "42" },
+            });
+            Assert.Equal(0L, s.DmlSeq);
+        }
+
+        [Fact] public void SnapshotRestorePreservesDmlSeq()
+        {
+            var s = new ConnectionGucState();
+            s.BumpDmlSeq();
+            s.BumpDmlSeq();
+            var preHash = s.StateHash;
+            Assert.Equal(2L, s.DmlSeq);
+
+            var snap = s.SnapshotAndObserveSql("SET app.user_id = '42'");
+            Assert.NotEqual(preHash, s.StateHash);
+
+            snap.Restore();
+            Assert.Equal(preHash, s.StateHash);
+            Assert.Equal(2L, s.DmlSeq);
+        }
+
         // ── set_config function form ────────────────────────────────
 
         [Fact] public void SetConfigUnsafeMutatesHash()
