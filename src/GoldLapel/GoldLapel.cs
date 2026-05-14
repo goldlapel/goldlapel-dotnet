@@ -136,16 +136,18 @@ namespace GoldLapel
         public bool DisableAutoIndexes { get; set; }
 
         /// <summary>
-        /// Aggressive-verify override. <see cref="AggressiveVerifyMode.Auto"/>
-        /// (the default) probes for triggers that mutate session state on
-        /// first connection per upstream and caches the result. Pass
-        /// <see cref="AggressiveVerifyMode.On"/> to force the post-DML
-        /// async-verify safety net regardless of detection (paranoid mode
-        /// for legacy or third-party schemas), or
-        /// <see cref="AggressiveVerifyMode.Off"/> to suppress detection
-        /// entirely (no triggers mutate session state, you've audited).
-        /// HQ may force it on via the license payload's
-        /// <c>aggressive_verify_active</c> claim — see
+        /// Aggressive-verify override. The wrapper's safety net for
+        /// trigger-internal SETs (e.g. RLS triggers calling
+        /// <c>set_config()</c> during an INSERT): after every observed
+        /// DML the per-connection dml_seq counter is bumped, which
+        /// changes the L1 cache key and forces the next read to miss the
+        /// wrapper cache and route to the proxy. <see cref="AggressiveVerifyMode.Auto"/>
+        /// (the default) and <see cref="AggressiveVerifyMode.On"/> both
+        /// enable the bump. <see cref="AggressiveVerifyMode.Off"/> opts
+        /// out (audit your schema first; the wrapper emits a one-time
+        /// stderr warning at construction). HQ may force it on via the
+        /// license payload's <c>aggressive_verify_active</c> claim, but
+        /// the operator's explicit Off still wins. See
         /// <see cref="LicensePayload"/>.
         /// </summary>
         public AggressiveVerifyMode AggressiveVerify { get; set; } = AggressiveVerifyMode.Auto;
