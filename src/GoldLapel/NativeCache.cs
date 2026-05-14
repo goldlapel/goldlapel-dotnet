@@ -119,6 +119,20 @@ namespace GoldLapel
         // Interlocked.Exchange overload for bool).
         private int _dirty;
 
+        // Monotonic counter bumped by BumpDmlSeq() after every observed
+        // INSERT / UPDATE / DELETE / MERGE / TRUNCATE. Mixed into the
+        // RecomputeHashLocked output so any post-DML read keys against a
+        // fresh slot. Mirrors the proxy's `guc_state.rs::dml_seq` field
+        // (commit `f690644`). RESET ALL / DISCARD ALL / ApplyVerifiedState
+        // reset it to 0 along with the values map — those are
+        // server-truth-restoring events, after which the wrapper's view
+        // matches authoritatively and the counter can safely return to
+        // baseline. Stored as long with all reads/writes inside _lock or
+        // via Interlocked, mirroring _stateHash. Wrapping increment is
+        // fine — collision after 2^64 DMLs on one connection is not a
+        // real concern.
+        private long _dmlSeq;
+
         /// <summary>
         /// Current unsafe-GUC state hash. <c>0</c> for the empty baseline
         /// (fresh connection or after <c>RESET ALL</c> on an empty state).
@@ -150,6 +164,30 @@ namespace GoldLapel
         /// different path.
         /// </summary>
         public void ClearDirty() => Interlocked.Exchange(ref _dirty, 0);
+
+        /// <summary>
+        /// Current dml_seq counter — exposed for tests. Production code
+        /// reads the value indirectly via <see cref="StateHash"/>.
+        /// </summary>
+        internal long DmlSeq => Interlocked.Read(ref _dmlSeq);
+
+        /// <summary>
+        /// Bump the monotonic dml_seq counter and roll the cache-key
+        /// hash forward. Called by <see cref="CachedCommand"/> after every
+        /// observed DML (INSERT / UPDATE / DELETE / MERGE / TRUNCATE)
+        /// when aggressive-verify is enabled (the default). The next
+        /// L1-cache lookup on this connection will miss and route to the
+        /// proxy — which is the safety net for trigger-internal SETs the
+        /// wire-observation parser can't see.
+        /// </summary>
+        public void BumpDmlSeq()
+        {
+            lock (_lock)
+            {
+                _dmlSeq = unchecked(_dmlSeq + 1);
+                RecomputeHashLocked();
+            }
+        }
 
         /// <summary>
         /// Apply a parsed <see cref="SetCommand"/>. No-op for
@@ -192,12 +230,24 @@ namespace GoldLapel
                     return false;
                 case SetCommand.CommandKind.ResetAll:
                 case SetCommand.CommandKind.DiscardAll:
-                    if (_values.Count > 0)
+                    // RESET ALL / DISCARD ALL are server-truth-restoring:
+                    // they drop all session-scoped state, including
+                    // anything a trigger may have SET internally. The
+                    // wrapper's dml_seq counter exists to roll the cache
+                    // key past possibly-tampered state — once the server
+                    // is clean, we can return the counter to baseline and
+                    // re-share the empty-state cache slot with peer
+                    // connections. Returns true if either the values map
+                    // or dml_seq was non-baseline.
                     {
-                        _values.Clear();
-                        return true;
+                        bool had_state = _values.Count > 0 || _dmlSeq != 0;
+                        if (had_state)
+                        {
+                            _values.Clear();
+                            _dmlSeq = 0;
+                        }
+                        return had_state;
                     }
-                    return false;
             }
             return false;
         }
@@ -217,6 +267,13 @@ namespace GoldLapel
             lock (_lock)
             {
                 _values.Clear();
+                // Verified state from pg_settings IS server-truth — the
+                // wrapper now has authoritative state and the dml_seq
+                // safety-net counter can return to baseline. Without
+                // this reset, a verified-and-clean connection would
+                // still key against a stale dml_seq value and miss
+                // peer-shared cache slots indefinitely.
+                _dmlSeq = 0;
                 if (verified != null)
                 {
                     foreach (var kvp in verified)
@@ -287,9 +344,10 @@ namespace GoldLapel
                     ? Array.Empty<KeyValuePair<string, string>>()
                     : _values.ToArray();
                 var snapHash = Interlocked.Read(ref _stateHash);
+                var snapDmlSeq = _dmlSeq;
                 if (!string.IsNullOrEmpty(sql))
                     ObserveSqlLocked(sql);
-                return new GucStateSnapshot(this, snapHash, snapValues);
+                return new GucStateSnapshot(this, snapHash, snapValues, snapDmlSeq);
             }
         }
 
@@ -354,7 +412,7 @@ namespace GoldLapel
         // throws. Bypasses RecomputeHashLocked because the snapshotted hash is
         // the canonical hash for the snapshotted values — recomputing would
         // burn cycles for the same answer.
-        internal void RestoreFromSnapshotLocked(long snapHash, KeyValuePair<string, string>[] snapValues)
+        internal void RestoreFromSnapshotLocked(long snapHash, KeyValuePair<string, string>[] snapValues, long snapDmlSeq)
         {
             _values.Clear();
             if (snapValues != null)
@@ -362,6 +420,7 @@ namespace GoldLapel
                 foreach (var kv in snapValues)
                     _values[kv.Key] = kv.Value;
             }
+            _dmlSeq = snapDmlSeq;
             Interlocked.Exchange(ref _stateHash, snapHash);
         }
 
@@ -374,7 +433,13 @@ namespace GoldLapel
         // — matches the proxy's BTreeMap-empty -> 0 invariant.
         private void RecomputeHashLocked()
         {
-            if (_values.Count == 0)
+            // Empty values + zero dml_seq is the canonical "fresh
+            // connection" hash — matches the proxy's `0` baseline so a
+            // wrapper with no SETs and no observed DML shares cache
+            // slots with peer connections in the same shape. Any
+            // BumpDmlSeq() call pushes us off this slot until the next
+            // RESET ALL / DISCARD ALL / ApplyVerifiedState reconciles.
+            if (_values.Count == 0 && _dmlSeq == 0)
             {
                 Interlocked.Exchange(ref _stateHash, 0);
                 return;
@@ -405,6 +470,21 @@ namespace GoldLapel
                 h ^= 1;
                 h *= FnvPrime;
             }
+            // Mix dml_seq in last — 8 little-endian bytes followed by a
+            // 0x02 terminator so the counter contributes to the hash
+            // distinctly from the values payload (an empty values map
+            // with dml_seq=1 must still produce a unique hash, not just
+            // FnvOffset). Mirrors the proxy's `dml_seq.hash(&mut hasher)`
+            // tail-mix in guc_state.rs.
+            var seq = unchecked((ulong)_dmlSeq);
+            for (int i = 0; i < 8; i++)
+            {
+                h ^= (byte)(seq & 0xFF);
+                h *= FnvPrime;
+                seq >>= 8;
+            }
+            h ^= 2;
+            h *= FnvPrime;
             // Avoid hashing to 0 by accident — 0 is reserved for "empty".
             // Probability is ~1/2^64, but we'd rather be deterministic.
             if (h == 0) h = 1;
@@ -435,12 +515,14 @@ namespace GoldLapel
         private readonly ConnectionGucState _owner;
         private readonly long _stateHash;
         private readonly KeyValuePair<string, string>[] _values;
+        private readonly long _dmlSeq;
 
-        internal GucStateSnapshot(ConnectionGucState owner, long stateHash, KeyValuePair<string, string>[] values)
+        internal GucStateSnapshot(ConnectionGucState owner, long stateHash, KeyValuePair<string, string>[] values, long dmlSeq)
         {
             _owner = owner;
             _stateHash = stateHash;
             _values = values;
+            _dmlSeq = dmlSeq;
         }
 
         /// <summary>
@@ -453,7 +535,7 @@ namespace GoldLapel
             if (_owner == null) return;
             lock (_owner.SyncRoot)
             {
-                _owner.RestoreFromSnapshotLocked(_stateHash, _values);
+                _owner.RestoreFromSnapshotLocked(_stateHash, _values, _dmlSeq);
             }
         }
     }
