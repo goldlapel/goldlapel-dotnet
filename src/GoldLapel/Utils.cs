@@ -95,9 +95,8 @@ namespace GoldLapel
 
         private static DbConnection CreateListenConnection(DbConnection conn)
         {
-            var inner = conn is CachedConnection cached ? cached.Inner : conn;
-            var connString = inner.ConnectionString;
-            var listenConn = (DbConnection)Activator.CreateInstance(inner.GetType(), connString);
+            var connString = conn.ConnectionString;
+            var listenConn = (DbConnection)Activator.CreateInstance(conn.GetType(), connString);
             listenConn.Open();
             return listenConn;
         }

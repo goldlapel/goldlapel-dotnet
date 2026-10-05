@@ -73,12 +73,30 @@ namespace GoldLapel.Tests
         }
     }
 
+    // ── UrlToNpgsqlConnectionString ───────────────────────────
+
+    public class UrlToNpgsqlConnectionStringTest
+    {
+        [Fact]
+        public void ApplicationNameIsAcceptedByNpgsql()
+        {
+            // The proxy URL always carries application_name; Npgsql must
+            // accept the converted keyword or StartAsync can't connect.
+            var cs = GL.UrlToNpgsqlConnectionString(
+                "postgresql://user:p%40ss@localhost:7932/mydb?sslmode=disable&application_name=goldlapel:dotnet:1.0");
+            var builder = new Npgsql.NpgsqlConnectionStringBuilder(cs);
+            Assert.Equal("goldlapel:dotnet:1.0", builder.ApplicationName);
+            Assert.Equal("p@ss", builder.Password);
+            Assert.Equal(7932, builder.Port);
+            Assert.Equal(Npgsql.SslMode.Disable, builder.SslMode);
+        }
+    }
+
     // ── MakeProxyUrl ──────────────────────────────────────────
     //
     // The wrapper appends `application_name=goldlapel:dotnet:<version>` to
-    // every rewritten URL so the proxy can classify wrapper-vs-raw traffic
-    // and skip the proxy-cache for wrappers (they have their own native
-    // cache). PGAPPNAME is cleared per test for deterministic URLs.
+    // every rewritten URL so the connection is recognisable in
+    // pg_stat_activity. PGAPPNAME is cleared per test for deterministic URLs.
 
     [Collection("EnvVarTests")]
     public class MakeProxyUrlTest : IDisposable
@@ -223,8 +241,8 @@ namespace GoldLapel.Tests
 
     // ── ApplicationNameMarker ────────────────────────────────
     //
-    // Proxy-cache router: wrappers identify themselves to the proxy via
-    // PG `application_name` so the proxy can gate the proxy-cache.
+    // Wrappers tag their connections via PG `application_name`. The proxy
+    // caches them like any other client; the tag is for pg_stat_activity.
 
     [Collection("EnvVarTests")]
     public class ApplicationNameMarkerTest : IDisposable
@@ -521,37 +539,10 @@ namespace GoldLapel.Tests
             Assert.Throws<ArgumentException>(() => GL.ConfigToArgs(tagCfg));
         }
 
-        // ─── DisableNativeCache startup option ─────────────────────────
-
-        [Fact]
-        public void DisableNativeCacheDefaultsToFalse()
-        {
-            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb");
-            Assert.False(gl.IsDisableNativeCache);
-        }
-
-        [Fact]
-        public void DisableNativeCacheOptionStored()
-        {
-            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
-                new GoldLapelOptions { DisableNativeCache = true });
-            Assert.True(gl.IsDisableNativeCache);
-        }
-
-        [Fact]
-        public void DisableNativeCacheInConfigMapIsRejected()
-        {
-            // Regression guard: DisableNativeCache is a top-level
-            // canonical-surface option, never valid inside the structured
-            // config map.
-            var cfg = new Dictionary<string, object> { { "disableNativeCache", true } };
-            Assert.Throws<ArgumentException>(() => GL.ConfigToArgs(cfg));
-        }
-
         // ─── Promoted disable flags (Model B) ──────────────────────────
         //
-        // DisableProxyCache, DisableMatviews, DisableSqloptimize, and
-        // DisableAutoIndexes are top-level options. Each maps 1:1 to a
+        // DisableProxyCache, DisableSqloptimize, and DisableAutoIndexes
+        // are top-level options. Each maps 1:1 to a
         // proxy CLI flag. Atomic break — they used to live (or could
         // have lived) in the structured Config map; promoting them out
         // makes the canonical surface a single boolean per concern.
@@ -578,28 +569,6 @@ namespace GoldLapel.Tests
             // top-level is a hard break — old config-map usage now
             // throws.
             var cfg = new Dictionary<string, object> { { "disableProxyCache", true } };
-            Assert.Throws<ArgumentException>(() => GL.ConfigToArgs(cfg));
-        }
-
-        [Fact]
-        public void DisableMatviewsDefaultsToFalse()
-        {
-            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb");
-            Assert.False(gl.IsDisableMatviews);
-        }
-
-        [Fact]
-        public void DisableMatviewsOptionStored()
-        {
-            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
-                new GoldLapelOptions { DisableMatviews = true });
-            Assert.True(gl.IsDisableMatviews);
-        }
-
-        [Fact]
-        public void DisableMatviewsInConfigMapIsRejected()
-        {
-            var cfg = new Dictionary<string, object> { { "disableMatviews", true } };
             Assert.Throws<ArgumentException>(() => GL.ConfigToArgs(cfg));
         }
 
@@ -750,14 +719,14 @@ namespace GoldLapel.Tests
             // promoted disable flags, etc.) do not.
             var keys = GL.ConfigKeys();
             Assert.Contains("poolSize", keys);
-            Assert.Contains("disableConsolidation", keys);
+            Assert.Contains("disableCoalescing", keys);
             Assert.Contains("replica", keys);
         }
 
         [Fact]
         public void DoesNotContainPromotedTopLevelKeys()
         {
-            // Canonical surface: logLevel, dashboardPort, invalidationPort,
+            // Canonical surface: logLevel, dashboardPort,
             // mode, client, config, license are top-level options on
             // GoldLapelOptions, not structured-config keys. ConfigKeys()
             // reports only the tuning knobs that remain inside the `Config`
@@ -765,16 +734,14 @@ namespace GoldLapel.Tests
             var keys = GL.ConfigKeys();
             Assert.DoesNotContain("logLevel", keys);
             Assert.DoesNotContain("dashboardPort", keys);
-            Assert.DoesNotContain("invalidationPort", keys);
             Assert.DoesNotContain("mode", keys);
             Assert.DoesNotContain("client", keys);
             Assert.DoesNotContain("config", keys);
             Assert.DoesNotContain("license", keys);
-            // The four disable flags promoted in this commit must no
+            // The promoted disable flags must no
             // longer appear in the Config map's valid-key list. Atomic
             // break — old config-map callers fail loudly.
             Assert.DoesNotContain("disableProxyCache", keys);
-            Assert.DoesNotContain("disableMatviews", keys);
             Assert.DoesNotContain("disableSqloptimize", keys);
             Assert.DoesNotContain("disableAutoIndexes", keys);
         }
@@ -955,6 +922,29 @@ namespace GoldLapel.Tests
             Assert.Contains("Unknown config key: notARealKey", ex.Message);
         }
 
+        [Theory]
+        [InlineData("refreshIntervalSecs")]
+        [InlineData("patternTtlSecs")]
+        [InlineData("maxTablesPerView")]
+        [InlineData("maxColumnsPerView")]
+        [InlineData("disableConsolidation")]
+        [InlineData("disableRewrite")]
+        [InlineData("disableShadowMode")]
+        [InlineData("enableCoalescing")]
+        public void ConfigToArgs_RemovedKeyThrows(string key)
+        {
+            // Matview keys and enableCoalescing are gone from the proxy.
+            var config = new Dictionary<string, object> { { key, true } };
+            Assert.Throws<ArgumentException>(() => GL.ConfigToArgs(config));
+        }
+
+        [Fact]
+        public void ConfigToArgs_DisableCoalescing()
+        {
+            var config = new Dictionary<string, object> { { "disableCoalescing", true } };
+            Assert.Equal(new List<string> { "--disable-coalescing" }, GL.ConfigToArgs(config));
+        }
+
         [Fact]
         public void ConfigToArgs_MultipleKeys()
         {
@@ -962,14 +952,14 @@ namespace GoldLapel.Tests
             {
                 { "poolMode", "transaction" },
                 { "poolSize", 10 },
-                { "disableRewrite", true }
+                { "disableRewritePreparedCache", true }
             };
             var args = GL.ConfigToArgs(config);
             Assert.Contains("--pool-mode", args);
             Assert.Contains("transaction", args);
             Assert.Contains("--pool-size", args);
             Assert.Contains("10", args);
-            Assert.Contains("--disable-rewrite", args);
+            Assert.Contains("--disable-rewrite-prepared-cache", args);
             Assert.Equal(5, args.Count);
         }
 
@@ -1079,7 +1069,6 @@ namespace GoldLapel.Tests
             Assert.Equal(4, args.Count);
             // Defensive — none of the optional flags should appear.
             Assert.DoesNotContain("--dashboard-port", args);
-            Assert.DoesNotContain("--invalidation-port", args);
             Assert.DoesNotContain("--mode", args);
             Assert.DoesNotContain("--license", args);
             Assert.DoesNotContain("--client", args);
@@ -1091,12 +1080,8 @@ namespace GoldLapel.Tests
             Assert.DoesNotContain("-vvv", args);
             // Silent intentionally never emits a flag (see SilentDoesNotEmitFlag).
             Assert.DoesNotContain("--silent", args);
-            // DisableNativeCache is wrapper-only — no CLI translation
-            // (see DisableNativeCacheDoesNotEmitFlag).
-            Assert.DoesNotContain("--disable-native-cache", args);
-            // The four promoted disable flags emit nothing when unset.
+            // The promoted disable flags emit nothing when unset.
             Assert.DoesNotContain("--disable-proxy-cache", args);
-            Assert.DoesNotContain("--disable-matviews", args);
             Assert.DoesNotContain("--disable-sqloptimize", args);
             Assert.DoesNotContain("--disable-auto-indexes", args);
         }
@@ -1129,23 +1114,6 @@ namespace GoldLapel.Tests
             var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
                 new GoldLapelOptions { DashboardPort = 0 });
             Assert.Equal("0", ValueAfter(gl.BuildSpawnArgs(), "--dashboard-port"));
-        }
-
-        // ─── InvalidationPort ───────────────────────────────────────────
-
-        [Fact]
-        public void InvalidationPortNotEmittedByDefault()
-        {
-            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb");
-            Assert.DoesNotContain("--invalidation-port", gl.BuildSpawnArgs());
-        }
-
-        [Fact]
-        public void InvalidationPortEmittedWhenExplicit()
-        {
-            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
-                new GoldLapelOptions { InvalidationPort = 9091 });
-            Assert.Equal("9091", ValueAfter(gl.BuildSpawnArgs(), "--invalidation-port"));
         }
 
         // ─── LogLevel ───────────────────────────────────────────────────
@@ -1350,9 +1318,9 @@ namespace GoldLapel.Tests
             Assert.DoesNotContain("--mesh-tag", gl.BuildSpawnArgs());
         }
 
-        // ─── DisableProxyCache / DisableMatviews / DisableSqloptimize / DisableAutoIndexes ───
+        // ─── DisableProxyCache / DisableSqloptimize / DisableAutoIndexes ───
         //
-        // Each of the four promoted top-level disable flags emits its
+        // Each of the three promoted top-level disable flags emits its
         // proxy CLI flag 1:1 when set; nothing when unset. Argv-emission
         // tests guard the wire format so refactors don't silently drop a
         // flag.
@@ -1370,21 +1338,6 @@ namespace GoldLapel.Tests
             var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
                 new GoldLapelOptions { DisableProxyCache = true });
             Assert.Contains("--disable-proxy-cache", gl.BuildSpawnArgs());
-        }
-
-        [Fact]
-        public void DisableMatviewsNotEmittedByDefault()
-        {
-            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb");
-            Assert.DoesNotContain("--disable-matviews", gl.BuildSpawnArgs());
-        }
-
-        [Fact]
-        public void DisableMatviewsEmittedWhenTrue()
-        {
-            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
-                new GoldLapelOptions { DisableMatviews = true });
-            Assert.Contains("--disable-matviews", gl.BuildSpawnArgs());
         }
 
         [Fact]
@@ -1421,58 +1374,26 @@ namespace GoldLapel.Tests
         public void PromotedDisableFlagsEmitInAlphabeticalOrder()
         {
             // BuildSpawnArgs commits to alphabetical emission order for the
-            // four promoted disable flags (matches the proxy's main.rs
+            // three promoted disable flags (matches the proxy's main.rs
             // declaration order). Locking this in lets downstream argv-diff
             // tooling rely on a stable shape.
             var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
                 new GoldLapelOptions
                 {
                     DisableProxyCache = true,
-                    DisableMatviews = true,
                     DisableSqloptimize = true,
                     DisableAutoIndexes = true,
                 });
             var args = gl.BuildSpawnArgs();
             var ai = args.IndexOf("--disable-auto-indexes");
-            var mv = args.IndexOf("--disable-matviews");
             var pc = args.IndexOf("--disable-proxy-cache");
             var so = args.IndexOf("--disable-sqloptimize");
-            Assert.True(ai >= 0 && mv >= 0 && pc >= 0 && so >= 0,
-                "all four promoted disable flags must appear in argv");
-            Assert.True(ai < mv,
-                $"--disable-auto-indexes (index {ai}) should precede --disable-matviews (index {mv})");
-            Assert.True(mv < pc,
-                $"--disable-matviews (index {mv}) should precede --disable-proxy-cache (index {pc})");
+            Assert.True(ai >= 0 && pc >= 0 && so >= 0,
+                "all three promoted disable flags must appear in argv");
+            Assert.True(ai < pc,
+                $"--disable-auto-indexes (index {ai}) should precede --disable-proxy-cache (index {pc})");
             Assert.True(pc < so,
                 $"--disable-proxy-cache (index {pc}) should precede --disable-sqloptimize (index {so})");
-        }
-
-        // ─── DisableNativeCache ─────────────────────────────────────────
-        //
-        // DisableNativeCache is a wrapper-only knob — there is no
-        // --disable-native-cache flag on the proxy binary. The flag toggles
-        // the wrapper's in-process NativeCache only; the proxy stays
-        // oblivious. Argv must not gain any new tokens regardless of the
-        // option's value.
-
-        [Fact]
-        public void DisableNativeCacheDoesNotEmitFlag()
-        {
-            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
-                new GoldLapelOptions { DisableNativeCache = true });
-            var args = gl.BuildSpawnArgs();
-            Assert.DoesNotContain("--disable-native-cache", args);
-            // Belt-and-suspenders: with no other options set, argv stays at
-            // the four required tokens (--upstream <url> --proxy-port <n>).
-            Assert.Equal(4, args.Count);
-        }
-
-        [Fact]
-        public void DisableNativeCacheFalseDoesNotEmitFlag()
-        {
-            var gl = GL.CreateForTest("postgresql://localhost:5432/mydb",
-                new GoldLapelOptions { DisableNativeCache = false });
-            Assert.DoesNotContain("--disable-native-cache", gl.BuildSpawnArgs());
         }
 
         // ─── Silent ─────────────────────────────────────────────────────
@@ -1562,7 +1483,6 @@ namespace GoldLapel.Tests
                 {
                     ProxyPort = 17932,
                     DashboardPort = 9090,
-                    InvalidationPort = 9091,
                     LogLevel = "debug",
                     Mode = "waiter",
                     License = "/tmp/lic",
@@ -1570,16 +1490,13 @@ namespace GoldLapel.Tests
                     ConfigFile = "/tmp/cfg.toml",
                     Mesh = true,
                     MeshTag = "east",
-                    DisableNativeCache = true,
                     DisableProxyCache = true,
-                    DisableMatviews = true,
                     DisableSqloptimize = true,
                     DisableAutoIndexes = true,
                 });
             var args = gl.BuildSpawnArgs();
             Assert.Equal("17932", ValueAfter(args, "--proxy-port"));
             Assert.Equal("9090", ValueAfter(args, "--dashboard-port"));
-            Assert.Equal("9091", ValueAfter(args, "--invalidation-port"));
             Assert.Contains("-vv", args);
             Assert.Equal("waiter", ValueAfter(args, "--mode"));
             Assert.Equal("/tmp/lic", ValueAfter(args, "--license"));
@@ -1588,12 +1505,8 @@ namespace GoldLapel.Tests
             Assert.Contains("--mesh", args);
             Assert.Equal("east", ValueAfter(args, "--mesh-tag"));
             Assert.Contains("--disable-proxy-cache", args);
-            Assert.Contains("--disable-matviews", args);
             Assert.Contains("--disable-sqloptimize", args);
             Assert.Contains("--disable-auto-indexes", args);
-            // DisableNativeCache is wrapper-only — must not leak into argv
-            // even when every other option is set.
-            Assert.DoesNotContain("--disable-native-cache", args);
         }
     }
 }

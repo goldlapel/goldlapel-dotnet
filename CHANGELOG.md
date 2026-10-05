@@ -4,6 +4,36 @@
 
 ### Breaking changes
 
+**The in-process cache (L1) is gone.** The proxy's result cache now serves
+every client the same way, so the wrapper no longer carries its own. Deleted
+with it: `NativeCache` (with `CacheEntry`, `SetCommand` and the
+session-settings tracker `ConnectionGucState`), `CachedConnection` and
+`CachedDataReader`, aggressive post-DML verify (`AggressiveVerifyMode`), the
+invalidation-socket client and its stats reporting. `gl.Connection` and the
+connections you open against `gl.Url` were never wrapped and are unchanged.
+
+**Removed options, no aliases:** `GoldLapelOptions.InvalidationPort`,
+`DisableNativeCache`, `AggressiveVerify`, `DisableMatviews` and
+`LicensePayload`, the `gl.InvalidationPort` property, and
+`GoldLapel.ParseLicensePayload` (it only fed the cache's aggressive-verify
+claim). The `GOLDLAPEL_NATIVE_CACHE`, `GOLDLAPEL_NATIVE_CACHE_SIZE` and
+`GOLDLAPEL_REPORT_STATS` env vars are no longer read. The proxy now uses two
+ports: proxy and dashboard (proxy + 1).
+
+**Removed `Config` keys** for materialized views, which the proxy no longer
+has: `refreshIntervalSecs`, `patternTtlSecs`, `maxTablesPerView`,
+`maxColumnsPerView`, `disableConsolidation`, `disableRewrite`,
+`disableShadowMode`. `enableCoalescing` is replaced by `disableCoalescing`,
+matching the proxy (coalescing is on by default). Passing a removed key
+throws `ArgumentException` at `StartAsync`.
+
+**Fixed:** `StartAsync` and `gl.Url` failed with "Couldn't set
+application_name" — the connection string carried the libpq spelling
+`application_name`, which Npgsql rejects. URL query params now map to Npgsql
+keywords without underscores (`ApplicationName`).
+
+---
+
 **Doc-store and stream methods moved under nested namespaces.** The flat
 `gl.Doc*Async` and `gl.Stream*Async` methods are gone; document and stream
 operations now live under `gl.Documents.<Verb>Async` and

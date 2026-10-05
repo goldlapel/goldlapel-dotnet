@@ -2,7 +2,9 @@
 
 [![Tests](https://github.com/goldlapel/goldlapel-dotnet/actions/workflows/test.yml/badge.svg)](https://github.com/goldlapel/goldlapel-dotnet/actions/workflows/test.yml)
 
-The .NET wrapper for [Gold Lapel](https://goldlapel.com) — a self-optimizing Postgres proxy that watches query patterns and creates materialized views + indexes automatically. Zero code changes beyond the connection string.
+The .NET wrapper for [Gold Lapel](https://goldlapel.com) — a self-optimizing Postgres proxy that caches query results, creates indexes from your query patterns, and keeps the cache correct as your data changes. Zero code changes beyond the connection string.
+
+The wrapper runs the proxy as a managed subprocess: it finds the bundled binary, starts it with your app and stops it when the instance is disposed, translates options into proxy flags, generates the dashboard token, and hands back an Npgsql-ready connection string. It also provides Postgres-backed helpers — search and percolator, a document store, streams, counters, sorted sets, hashes, queues, geo, and pub/sub. Caching happens in the proxy, which serves every client the same way; `gl.Connection` and the connections you open against `gl.Url` are plain `NpgsqlConnection`s.
 
 ## Install
 
@@ -32,7 +34,9 @@ await using var reader = await cmd.ExecuteReaderAsync();
 // `await using` disposes the instance: stops the proxy and closes the internal connection.
 ```
 
-Point Npgsql at `gl.Url`. Gold Lapel sits between your app and your DB, watching query patterns and creating materialized views + indexes automatically. Zero code changes beyond the connection string.
+Point Npgsql at `gl.Url`. Gold Lapel sits between your app and your DB, caching results and creating indexes from your query patterns. Connections are tagged `application_name=goldlapel:dotnet:<version>` so they're recognisable in `pg_stat_activity`.
+
+The proxy listens on two ports: the proxy itself (`opts.ProxyPort`, default 7932) and the dashboard (`opts.DashboardPort`, default proxy port + 1; `0` disables it).
 
 Scoped transactions via `gl.UsingAsync(conn, ...)`, per-call `connection:` overrides, and the full wrapper surface (`gl.Documents.<Verb>Async`, `gl.Streams.<Verb>Async`, search, Redis replacement) are in the docs.
 
@@ -55,7 +59,7 @@ Full API reference, configuration, async patterns, upgrading from v0.1, and prod
 
 ## Uninstalling
 
-Before removing the package, drop Gold Lapel's helper schema and cached matviews from your Postgres:
+Before removing the package, drop Gold Lapel's helper schema and indexes from your Postgres:
 
 ```bash
 goldlapel clean
@@ -69,7 +73,7 @@ rm -rf ~/.goldlapel
 rm -f goldlapel.toml     # only if you wrote one
 ```
 
-Cancelling your subscription does not delete your data — only Gold Lapel's helper schema and cached matviews go away.
+Cancelling your subscription does not delete your data — only Gold Lapel's helper schema and indexes go away.
 
 ## License
 

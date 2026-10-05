@@ -153,7 +153,7 @@ namespace GoldLapel.Tests
             // Cleanup.
             await using var clean = new NpgsqlConnection(gl.Url);
             await clean.OpenAsync();
-            await using var drop = new NpgsqlCommand($"DROP TABLE {collection}", clean);
+            await using var drop = new NpgsqlCommand($"DROP TABLE IF EXISTS _goldlapel.doc_{collection}", clean);
             await drop.ExecuteNonQueryAsync();
         }
 
@@ -305,7 +305,7 @@ namespace GoldLapel.Tests
             // Cleanup.
             await using var clean = new NpgsqlConnection(gl.Url);
             await clean.OpenAsync();
-            await using var drop = new NpgsqlCommand($"DROP TABLE {collection}", clean);
+            await using var drop = new NpgsqlCommand($"DROP TABLE IF EXISTS _goldlapel.doc_{collection}", clean);
             await drop.ExecuteNonQueryAsync();
         }
 

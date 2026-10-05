@@ -927,4 +927,104 @@ namespace GoldLapel.Tests
             throw new KeyNotFoundException("Parameter not found: " + name);
         }
     }
+
+    internal class FakeTransaction : DbTransaction
+    {
+        public override IsolationLevel IsolationLevel => IsolationLevel.ReadCommitted;
+        protected override DbConnection DbConnection => null;
+        public override void Commit() { }
+        public override void Rollback() { }
+    }
+
+    internal class FakeParameter : DbParameter
+    {
+        public override DbType DbType { get; set; }
+        public override ParameterDirection Direction { get; set; }
+        public override bool IsNullable { get; set; }
+        public override string ParameterName { get; set; }
+        public override int Size { get; set; }
+        public override string SourceColumn { get; set; }
+        public override bool SourceColumnNullMapping { get; set; }
+        public override object Value { get; set; }
+        public override void ResetDbType() { }
+    }
+
+    internal class FakeParameterCollection : DbParameterCollection
+    {
+        private readonly List<DbParameter> _list = new List<DbParameter>();
+        public override int Count => _list.Count;
+        public override object SyncRoot => _list;
+        public override int Add(object value) { _list.Add((DbParameter)value); return _list.Count - 1; }
+        public override void AddRange(Array values) { foreach (var v in values) Add(v); }
+        public override void Clear() => _list.Clear();
+        public override bool Contains(object value) => _list.Contains((DbParameter)value);
+        public override bool Contains(string value) => _list.Exists(p => p.ParameterName == value);
+        public override void CopyTo(Array array, int index) { }
+        public override System.Collections.IEnumerator GetEnumerator() => _list.GetEnumerator();
+        public override int IndexOf(object value) => _list.IndexOf((DbParameter)value);
+        public override int IndexOf(string parameterName) => _list.FindIndex(p => p.ParameterName == parameterName);
+        public override void Insert(int index, object value) => _list.Insert(index, (DbParameter)value);
+        public override void Remove(object value) => _list.Remove((DbParameter)value);
+        public override void RemoveAt(int index) => _list.RemoveAt(index);
+        public override void RemoveAt(string parameterName) => _list.RemoveAt(IndexOf(parameterName));
+        protected override DbParameter GetParameter(int index) => _list[index];
+        protected override DbParameter GetParameter(string parameterName) => _list.Find(p => p.ParameterName == parameterName);
+        protected override void SetParameter(int index, DbParameter value) => _list[index] = value;
+        protected override void SetParameter(string parameterName, DbParameter value) => _list[IndexOf(parameterName)] = value;
+    }
+
+    internal class FakeDataReader : DbDataReader
+    {
+        private readonly object[][] _rows;
+        private readonly string[] _columns;
+        private int _cursor = -1;
+        private bool _closed;
+
+        public FakeDataReader(object[][] rows, string[] columns) { _rows = rows; _columns = columns; }
+
+        public override bool Read() { _cursor++; return _cursor < _rows.Length; }
+        public override bool NextResult() => false;
+        public override void Close() { _closed = true; }
+        public override int FieldCount => _columns.Length;
+        public override int RecordsAffected => -1;
+        public override bool HasRows => _rows.Length > 0;
+        public override bool IsClosed => _closed;
+        public override int Depth => 0;
+
+        public override object this[int ordinal] => GetValue(ordinal);
+        public override object this[string name] => GetValue(GetOrdinal(name));
+        public override string GetName(int ordinal) => _columns[ordinal];
+        public override int GetOrdinal(string name)
+        {
+            for (int i = 0; i < _columns.Length; i++)
+                if (_columns[i].Equals(name, StringComparison.OrdinalIgnoreCase)) return i;
+            throw new IndexOutOfRangeException(name);
+        }
+        public override object GetValue(int ordinal) => _rows[_cursor][ordinal];
+        public override int GetValues(object[] values)
+        {
+            var row = _rows[_cursor];
+            var count = Math.Min(values.Length, row.Length);
+            Array.Copy(row, values, count);
+            return count;
+        }
+        public override bool IsDBNull(int ordinal) => _rows[_cursor][ordinal] == null;
+        public override string GetString(int ordinal) => GetValue(ordinal)?.ToString();
+        public override int GetInt32(int ordinal) => Convert.ToInt32(GetValue(ordinal));
+        public override long GetInt64(int ordinal) => Convert.ToInt64(GetValue(ordinal));
+        public override double GetDouble(int ordinal) => Convert.ToDouble(GetValue(ordinal));
+        public override float GetFloat(int ordinal) => Convert.ToSingle(GetValue(ordinal));
+        public override bool GetBoolean(int ordinal) => Convert.ToBoolean(GetValue(ordinal));
+        public override byte GetByte(int ordinal) => Convert.ToByte(GetValue(ordinal));
+        public override short GetInt16(int ordinal) => Convert.ToInt16(GetValue(ordinal));
+        public override decimal GetDecimal(int ordinal) => Convert.ToDecimal(GetValue(ordinal));
+        public override char GetChar(int ordinal) => Convert.ToChar(GetValue(ordinal));
+        public override DateTime GetDateTime(int ordinal) => Convert.ToDateTime(GetValue(ordinal));
+        public override Guid GetGuid(int ordinal) => Guid.Parse(GetValue(ordinal).ToString());
+        public override long GetBytes(int ordinal, long dataOffset, byte[] buffer, int bufferOffset, int length) => 0;
+        public override long GetChars(int ordinal, long dataOffset, char[] buffer, int bufferOffset, int length) => 0;
+        public override string GetDataTypeName(int ordinal) => "object";
+        public override Type GetFieldType(int ordinal) => typeof(object);
+        public override System.Collections.IEnumerator GetEnumerator() => throw new NotSupportedException();
+    }
 }

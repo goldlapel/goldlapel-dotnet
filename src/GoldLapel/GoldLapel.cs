@@ -33,12 +33,6 @@ namespace GoldLapel
         public int? DashboardPort { get; set; }
 
         /// <summary>
-        /// Cache-invalidation listen port. When null (default), the port is derived
-        /// as <see cref="ProxyPort"/> + 2.
-        /// </summary>
-        public int? InvalidationPort { get; set; }
-
-        /// <summary>
         /// Log level for the proxy. Accepted values: <c>"trace"</c>, <c>"debug"</c>,
         /// <c>"info"</c>, <c>"warn"</c>, <c>"error"</c>. Only trace/debug/info produce
         /// visible output; warn/error are the binary's default level. Translated to
@@ -94,18 +88,6 @@ namespace GoldLapel
         public string MeshTag { get; set; }
 
         /// <summary>
-        /// When <c>true</c>, the wrapper's in-process native cache is
-        /// bypassed — <see cref="NativeCache.Get"/> returns null (ticking
-        /// misses) and <see cref="NativeCache.Put"/> is a silent no-op.
-        /// The invalidation socket still runs so telemetry continues to
-        /// flow (Manor/HQ see the wrapper's native-cache state via the
-        /// <c>disabled</c> snapshot field). Orthogonal to cache size:
-        /// keeps a tuned <c>proxyCacheSize</c> intact while toggling the
-        /// layer off. Wrapper-only — no equivalent CLI flag on the proxy.
-        /// </summary>
-        public bool DisableNativeCache { get; set; }
-
-        /// <summary>
         /// When <c>true</c>, disable the proxy's result cache (the
         /// origin-side L2 cache). Maps 1:1 to the proxy's
         /// <c>--disable-proxy-cache</c> CLI flag. Promoted to a top-level
@@ -115,15 +97,8 @@ namespace GoldLapel
         public bool DisableProxyCache { get; set; }
 
         /// <summary>
-        /// When <c>true</c>, disable the proxy's materialized-view layer
-        /// (no auto-discovery, no MV-rewrite). Maps 1:1 to
-        /// <c>--disable-matviews</c>.
-        /// </summary>
-        public bool DisableMatviews { get; set; }
-
-        /// <summary>
         /// When <c>true</c>, disable the proxy's SQL-optimization master
-        /// switch (rewrite, shadow-mode, coalescing). Maps 1:1 to
+        /// switch (copy-rewrite, expression-rewrite, N+1, coalescing). Maps 1:1 to
         /// <c>--disable-sqloptimize</c>.
         /// </summary>
         public bool DisableSqloptimize { get; set; }
@@ -134,34 +109,6 @@ namespace GoldLapel
         /// <c>--disable-auto-indexes</c>.
         /// </summary>
         public bool DisableAutoIndexes { get; set; }
-
-        /// <summary>
-        /// Aggressive-verify override. The wrapper's safety net for
-        /// trigger-internal SETs (e.g. RLS triggers calling
-        /// <c>set_config()</c> during an INSERT): after every observed
-        /// DML the per-connection dml_seq counter is bumped, which
-        /// changes the L1 cache key and forces the next read to miss the
-        /// wrapper cache and route to the proxy. <see cref="AggressiveVerifyMode.Auto"/>
-        /// (the default) and <see cref="AggressiveVerifyMode.On"/> both
-        /// enable the bump. <see cref="AggressiveVerifyMode.Off"/> opts
-        /// out (audit your schema first; the wrapper emits a one-time
-        /// stderr warning at construction). HQ may force it on via the
-        /// license payload's <c>aggressive_verify_active</c> claim, but
-        /// the operator's explicit Off still wins. See
-        /// <see cref="LicensePayload"/>.
-        /// </summary>
-        public AggressiveVerifyMode AggressiveVerify { get; set; } = AggressiveVerifyMode.Auto;
-
-        /// <summary>
-        /// Optional license-payload dictionary parsed from the on-disk
-        /// license file. When the dictionary contains a truthy
-        /// <c>aggressive_verify_active</c> key, aggressive verify is
-        /// forced on (subject to an explicit
-        /// <see cref="AggressiveVerifyMode.Off"/> override winning).
-        /// Use <see cref="GoldLapel.ParseLicensePayload"/> to parse a JSON
-        /// license file into the right shape.
-        /// </summary>
-        public IReadOnlyDictionary<string, object> LicensePayload { get; set; }
     }
 
     /// <summary>
@@ -178,34 +125,33 @@ namespace GoldLapel
         private const int GracefulTimeoutMs = 5000;
 
         // Keys that are valid inside the structured `Config` map. Top-level
-        // concepts (proxyPort, dashboardPort, invalidationPort, logLevel, mode,
+        // concepts (proxyPort, dashboardPort, logLevel, mode,
         // license, client, configFile) live on GoldLapelOptions directly and
         // are NOT accepted here — passing them through Config raises.
         private static readonly HashSet<string> ValidConfigKeys = new HashSet<string>(new[]
         {
-            "minPatternCount", "refreshIntervalSecs", "patternTtlSecs",
-            "maxTablesPerView", "maxColumnsPerView", "deepPaginationThreshold",
+            "minPatternCount", "deepPaginationThreshold",
             "reportIntervalSecs", "proxyCacheSize", "batchCacheSize",
             "batchCacheTtlSecs", "poolSize", "poolTimeoutSecs",
             "poolMode", "mgmtIdleTimeout", "fallback", "readAfterWriteSecs",
             "n1Threshold", "n1WindowMs", "n1CrossThreshold",
             "tlsCert", "tlsKey", "tlsClientCa",
-            "disableConsolidation", "disableBtreeIndexes",
+            "disableBtreeIndexes",
             "disableTrigramIndexes", "disableExpressionIndexes",
-            "disablePartialIndexes", "disableRewrite", "disableRewritePreparedCache",
+            "disablePartialIndexes", "disableRewritePreparedCache",
             "disablePool",
-            "disableN1", "disableN1CrossConnection", "disableShadowMode",
-            "enableCoalescing", "replica", "excludeTables"
+            "disableN1", "disableN1CrossConnection",
+            "disableCoalescing", "replica", "excludeTables"
         });
 
         private static readonly HashSet<string> BooleanKeys = new HashSet<string>(new[]
         {
-            "disableConsolidation", "disableBtreeIndexes",
+            "disableBtreeIndexes",
             "disableTrigramIndexes", "disableExpressionIndexes",
-            "disablePartialIndexes", "disableRewrite", "disableRewritePreparedCache",
+            "disablePartialIndexes", "disableRewritePreparedCache",
             "disablePool",
-            "disableN1", "disableN1CrossConnection", "disableShadowMode",
-            "enableCoalescing"
+            "disableN1", "disableN1CrossConnection",
+            "disableCoalescing"
         });
 
         private static readonly HashSet<string> ListKeys = new HashSet<string>(new[]
@@ -223,14 +169,12 @@ namespace GoldLapel
         private readonly string _upstream;
         private readonly int _proxyPort;
         private readonly int _dashboardPort;
-        private readonly int _invalidationPort;
-        // True only when the user passed a non-null DashboardPort/InvalidationPort.
+        // True only when the user passed a non-null DashboardPort.
         // Used at spawn time to decide whether to emit the flag explicitly (vs
         // letting the Rust binary apply its own default). Keeping this separate
         // from the resolved port lets `DashboardPort` expose the effective
         // value unambiguously.
         private readonly bool _dashboardPortExplicit;
-        private readonly bool _invalidationPortExplicit;
         private readonly string _logLevel;
         private readonly string _mode;
         private readonly string _license;
@@ -241,9 +185,7 @@ namespace GoldLapel
         private readonly bool _silent;
         private readonly bool _mesh;
         private readonly string _meshTag;
-        private readonly bool _disableNativeCache;
         private readonly bool _disableProxyCache;
-        private readonly bool _disableMatviews;
         private readonly bool _disableSqloptimize;
         private readonly bool _disableAutoIndexes;
         private Process _process;
@@ -287,19 +229,12 @@ namespace GoldLapel
             // Mesh membership — startup intent (HQ enforces license).
             _mesh = options.Mesh;
             _meshTag = string.IsNullOrEmpty(options.MeshTag) ? null : options.MeshTag;
-            // Native-cache (wrapper-side) explicit disable. Wrapper-only knob —
-            // the proxy has no equivalent CLI flag. The flag is pushed onto
-            // the NativeCache singleton in SpawnAsync so it's set before the
-            // invalidation socket connects (the very first wrapper_connected
-            // snapshot then carries the correct `disabled` field).
-            _disableNativeCache = options.DisableNativeCache;
             // Promoted disable flags (Model B). Each maps 1:1 to a proxy
             // CLI flag. Top-level so the canonical-surface caller flips a
             // single boolean instead of stuffing a boolean into the
             // structured `Config` map. Removed from ValidConfigKeys/BooleanKeys
             // simultaneously — atomic break, no aliases.
             _disableProxyCache = options.DisableProxyCache;
-            _disableMatviews = options.DisableMatviews;
             _disableSqloptimize = options.DisableSqloptimize;
             _disableAutoIndexes = options.DisableAutoIndexes;
             // Dashboard defaults to proxy port + 1 (matches what the Rust binary
@@ -308,8 +243,6 @@ namespace GoldLapel
             // DashboardPort=0 means "disable dashboard".
             _dashboardPortExplicit = options.DashboardPort.HasValue;
             _dashboardPort = options.DashboardPort ?? _proxyPort + 1;
-            _invalidationPortExplicit = options.InvalidationPort.HasValue;
-            _invalidationPort = options.InvalidationPort ?? _proxyPort + 2;
 
             // Nested namespaces — canonical schema-to-core sub-API instances.
             // Each holds a back-reference to this client for shared state
@@ -376,9 +309,7 @@ namespace GoldLapel
         // Test-only accessors for mesh wiring.
         internal bool IsMesh => _mesh;
         internal string MeshTag => _meshTag;
-        internal bool IsDisableNativeCache => _disableNativeCache;
         internal bool IsDisableProxyCache => _disableProxyCache;
-        internal bool IsDisableMatviews => _disableMatviews;
         internal bool IsDisableSqloptimize => _disableSqloptimize;
         internal bool IsDisableAutoIndexes => _disableAutoIndexes;
 
@@ -474,12 +405,6 @@ namespace GoldLapel
         public int DashboardPort => _dashboardPort;
 
         /// <summary>
-        /// Cache-invalidation port (always proxy port + 2 unless overridden
-        /// via the top-level <c>InvalidationPort</c> option).
-        /// </summary>
-        public int InvalidationPort => _invalidationPort;
-
-        /// <summary>
         /// Dashboard token this instance provisioned for the proxy subprocess.
         /// Returns null when the proxy was launched externally — in that case
         /// <see cref="Ddl.TokenFromEnvOrFile"/> falls back to env / file.
@@ -550,15 +475,6 @@ namespace GoldLapel
             if (_disposed) return;
             _disposed = true;
 
-            // Native-cache telemetry: emit a final wrapper_disconnected
-            // snapshot BEFORE closing the proxy connection. The
-            // invalidation socket piggybacks on the proxy lifecycle; once
-            // the proxy goes away, the recv thread will tear down its
-            // socket and the emit becomes a no-op. Latched in NativeCache
-            // so the ProcessExit hook (registered for ungraceful
-            // shutdowns) doesn't double-emit.
-            try { NativeCache.GetInstance().EmitWrapperDisconnected(); } catch { }
-
             // Drop cached DDL patterns — they're tied to the proxy we're
             // about to terminate.
             _ddlCache.Clear();
@@ -577,9 +493,6 @@ namespace GoldLapel
         {
             if (_disposed) return;
             _disposed = true;
-
-            // Native-cache telemetry: see DisposeAsync — same rationale.
-            try { NativeCache.GetInstance().EmitWrapperDisconnected(); } catch { }
 
             _ddlCache.Clear();
             _dashboardToken = null;
@@ -626,17 +539,12 @@ namespace GoldLapel
             var args = new List<string> { "--upstream", _upstream, "--proxy-port", _proxyPort.ToString() };
             // Top-level options emit their own CLI flags before the structured
             // config map — keeps the argv order predictable for argv-diffing
-            // tests. An explicit (non-zero) dashboard/invalidation port
-            // overrides the binary's derived default.
+            // tests. An explicit dashboard port overrides the binary's
+            // derived default.
             if (_dashboardPortExplicit)
             {
                 args.Add("--dashboard-port");
                 args.Add(_dashboardPort.ToString());
-            }
-            if (_invalidationPortExplicit)
-            {
-                args.Add("--invalidation-port");
-                args.Add(_invalidationPort.ToString());
             }
             if (!string.IsNullOrEmpty(_logLevel))
             {
@@ -680,10 +588,6 @@ namespace GoldLapel
             {
                 args.Add("--disable-auto-indexes");
             }
-            if (_disableMatviews)
-            {
-                args.Add("--disable-matviews");
-            }
             if (_disableProxyCache)
             {
                 args.Add("--disable-proxy-cache");
@@ -701,14 +605,6 @@ namespace GoldLapel
         {
             var binary = FindBinary();
             var args = BuildSpawnArgs();
-
-            // Push DisableNativeCache onto the NativeCache singleton BEFORE
-            // the invalidation socket connects so the very first
-            // wrapper_connected snapshot carries the correct `disabled`
-            // field. The flag is wrapper-only (no CLI translation); see
-            // BuildSpawnArgs and the DisableNativeCache doc on
-            // GoldLapelOptions.
-            try { NativeCache.GetInstance().DisableNativeCache = _disableNativeCache; } catch { }
 
             var psi = new ProcessStartInfo
             {
@@ -993,9 +889,9 @@ namespace GoldLapel
         /// <summary>
         /// Append <c>application_name=goldlapel:dotnet:&lt;version&gt;</c> to
         /// the URL unless one is already present (or <c>PGAPPNAME</c> is set
-        /// in the env). Tells the proxy this is wrapper traffic so it can
-        /// skip the proxy-cache (the wrapper has its own native-cache). Idempotent and
-        /// override-respecting.
+        /// in the env), so the connection is recognisable in
+        /// <c>pg_stat_activity</c>. The proxy caches it like any other client.
+        /// Idempotent and override-respecting.
         /// </summary>
         internal static string InjectApplicationName(string url)
         {
@@ -1123,7 +1019,9 @@ namespace GoldLapel
             if (!string.IsNullOrEmpty(password)) sb.Append("Password=").Append(password).Append(';');
             if (!string.IsNullOrEmpty(database)) sb.Append("Database=").Append(database).Append(';');
 
-            // Query params map 1:1 to Npgsql keywords (sslmode -> SslMode, etc.).
+            // Query params map to Npgsql keywords, which are case-insensitive
+            // but have no underscores: sslmode -> SslMode, application_name ->
+            // ApplicationName. Npgsql rejects the underscored libpq spelling.
             if (!string.IsNullOrEmpty(query))
             {
                 foreach (var pair in query.Split('&'))
@@ -1136,7 +1034,7 @@ namespace GoldLapel
                     }
                     else
                     {
-                        var k = pair.Substring(0, eq);
+                        var k = pair.Substring(0, eq).Replace("_", "");
                         var v = Uri.UnescapeDataString(pair.Substring(eq + 1));
                         sb.Append(k).Append('=').Append(v).Append(';');
                     }
@@ -1144,24 +1042,6 @@ namespace GoldLapel
             }
 
             return sb.ToString();
-        }
-
-        /// <summary>
-        /// Parse a license payload (JSON object) into the dictionary
-        /// shape accepted by <see cref="GoldLapelOptions.LicensePayload"/>.
-        /// Returns null on parse failure — the caller can then default to
-        /// no license claim. Convenience wrapper around
-        /// <c>System.Text.Json</c>; uses no third-party deps.
-        /// </summary>
-        /// <example>
-        /// <code>
-        /// var payload = GoldLapel.ParseLicensePayload(File.ReadAllText("license.json"));
-        /// var gl = await GoldLapel.StartAsync(url, opts =&gt; opts.LicensePayload = payload);
-        /// </code>
-        /// </example>
-        public static IReadOnlyDictionary<string, object> ParseLicensePayload(string json)
-        {
-            return AggressiveVerify.ParseLicensePayload(json);
         }
 
         internal static bool WaitForPort(string host, int port, long timeoutMs)
