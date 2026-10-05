@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Data.Common;
 using System.Diagnostics;
 using System.IO;
+using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -23,12 +24,19 @@ namespace GoldLapel
     /// </summary>
     public class GoldLapelOptions
     {
-        /// <summary>Proxy listen port (default: 7932).</summary>
-        public int ProxyPort { get; set; } = GoldLapel.DefaultProxyPort;
+        /// <summary>
+        /// Proxy listen port. When null (default), the lowest port from 7932
+        /// up is chosen whose dashboard port (port + 1) is free too, skipping
+        /// ports held by this process's other proxies or by any other program.
+        /// An explicit port that another proxy of this process holds is
+        /// refused with an error; one held by another program makes the proxy
+        /// refuse to start, and its message is in the exception.
+        /// </summary>
+        public int? ProxyPort { get; set; }
 
         /// <summary>
         /// Dashboard listen port. When null (default), the port is derived as
-        /// <see cref="ProxyPort"/> + 1. Set to 0 to disable the dashboard entirely.
+        /// the proxy port + 1. Set to 0 to disable the dashboard entirely.
         /// </summary>
         public int? DashboardPort { get; set; }
 
@@ -123,6 +131,8 @@ namespace GoldLapel
         internal const long StartupTimeoutMs = 10000;
         internal const long StartupPollIntervalMs = 50;
         private const int GracefulTimeoutMs = 5000;
+        private const int BusyPortGraceMs = 2000;
+        private const int StderrTailChars = 4000;
 
         // Keys that are valid inside the structured `Config` map. Top-level
         // concepts (proxyPort, dashboardPort, logLevel, mode,
@@ -143,6 +153,26 @@ namespace GoldLapel
             "disableN1", "disableN1CrossConnection",
             "disableCoalescing", "replica", "excludeTables"
         });
+
+        // Config keys that used to exist, with why they are gone, so a stale
+        // caller gets a reason instead of a bare "unknown key".
+        private static readonly Dictionary<string, string> RemovedConfigKeys = new Dictionary<string, string>
+        {
+            { "invalidationPort", "it was removed with the in-process cache" },
+            { "disableNativeCache", "it was removed with the in-process cache" },
+            { "nativeCacheSize", "it was removed with the in-process cache" },
+            { "aggressiveVerify", "it was removed with the in-process cache" },
+            { "licensePayload", "it was removed with the in-process cache" },
+            { "refreshIntervalSecs", "it was removed with materialized views" },
+            { "patternTtlSecs", "it was removed with materialized views" },
+            { "maxTablesPerView", "it was removed with materialized views" },
+            { "maxColumnsPerView", "it was removed with materialized views" },
+            { "disableConsolidation", "it was removed with materialized views" },
+            { "disableRewrite", "it was removed with materialized views" },
+            { "disableShadowMode", "it was removed with materialized views" },
+            { "disableMatviews", "it was removed with materialized views" },
+            { "enableCoalescing", "coalescing is on by default; use disableCoalescing to turn it off" },
+        };
 
         private static readonly HashSet<string> BooleanKeys = new HashSet<string>(new[]
         {
@@ -167,14 +197,18 @@ namespace GoldLapel
         private readonly AsyncLocal<DbConnection> _scopedConnection = new AsyncLocal<DbConnection>();
 
         private readonly string _upstream;
-        private readonly int _proxyPort;
-        private readonly int _dashboardPort;
+        // Resolved when the proxy is registered: explicit, auto-assigned, or
+        // (on reuse) the running proxy's.
+        private int _proxyPort;
+        private int _dashboardPort;
+        private readonly bool _proxyPortExplicit;
         // True only when the user passed a non-null DashboardPort.
         // Used at spawn time to decide whether to emit the flag explicitly (vs
         // letting the Rust binary apply its own default). Keeping this separate
         // from the resolved port lets `DashboardPort` expose the effective
         // value unambiguously.
         private readonly bool _dashboardPortExplicit;
+        private readonly bool _clientTls;
         private readonly string _logLevel;
         private readonly string _mode;
         private readonly string _license;
@@ -189,6 +223,7 @@ namespace GoldLapel
         private readonly bool _disableSqloptimize;
         private readonly bool _disableAutoIndexes;
         private Process _process;
+        private ProxyEntry _entry;
         private string _proxyUrl;
         private bool _disposed;
         private NpgsqlConnection _conn;  // eagerly opened internal connection
@@ -210,8 +245,10 @@ namespace GoldLapel
         {
             if (upstream == null) throw new ArgumentNullException(nameof(upstream));
             _upstream = upstream;
-            _proxyPort = options.ProxyPort;
+            _proxyPortExplicit = options.ProxyPort.HasValue;
+            _proxyPort = options.ProxyPort ?? DefaultProxyPort;
             _logLevel = options.LogLevel;
+            LogLevelToVerboseFlag(_logLevel);
             _mode = options.Mode;
             _license = options.License;
             _client = options.Client;
@@ -243,6 +280,7 @@ namespace GoldLapel
             // DashboardPort=0 means "disable dashboard".
             _dashboardPortExplicit = options.DashboardPort.HasValue;
             _dashboardPort = options.DashboardPort ?? _proxyPort + 1;
+            _clientTls = ClientTlsConfigured(_config, _extraArgs);
 
             // Nested namespaces — canonical schema-to-core sub-API instances.
             // Each holds a back-reference to this client for shared state
@@ -312,6 +350,7 @@ namespace GoldLapel
         internal bool IsDisableProxyCache => _disableProxyCache;
         internal bool IsDisableSqloptimize => _disableSqloptimize;
         internal bool IsDisableAutoIndexes => _disableAutoIndexes;
+        internal bool ClientTls => _clientTls;
 
         // ── Factory ─────────────────────────────────────────────────
 
@@ -320,6 +359,12 @@ namespace GoldLapel
         /// connections, eagerly open an internal <see cref="NpgsqlConnection"/> against
         /// the proxy, and return a ready <see cref="GoldLapel"/> handle.
         /// </summary>
+        /// <remarks>
+        /// One proxy runs per upstream URL in a process. Starting an upstream that
+        /// is already running returns a new handle on that proxy (its own internal
+        /// connection, the running proxy's ports and options); the proxy stops when
+        /// the last handle is disposed.
+        /// </remarks>
         /// <example>
         /// <code>
         /// await using var gl = await GoldLapel.StartAsync(
@@ -341,13 +386,38 @@ namespace GoldLapel
             configure?.Invoke(options);
 
             var gl = new GoldLapel(upstream, options);
+            var owner = gl.Register();
+            var entry = gl._entry;
             try
             {
-                await gl.SpawnAsync().ConfigureAwait(false);
+                if (owner)
+                {
+                    try
+                    {
+                        await gl.SpawnAsync().ConfigureAwait(false);
+                        entry.Ready.TrySetResult(true);
+                    }
+                    catch (Exception e)
+                    {
+                        entry.Ready.TrySetException(e);
+                        throw;
+                    }
+                }
+                else
+                {
+                    await entry.Ready.Task.ConfigureAwait(false);
+                }
+                gl.Attach();
+                await gl.OpenAsync(owner).ConfigureAwait(false);
             }
             catch
             {
-                gl.StopProcessInternal();
+                if (gl._conn != null)
+                {
+                    try { gl._conn.Dispose(); } catch { }
+                    gl._conn = null;
+                }
+                gl.ReleaseProxy();
                 throw;
             }
             return gl;
@@ -357,10 +427,248 @@ namespace GoldLapel
         {
             if (config == null) return;
             foreach (var key in config.Keys)
+                CheckConfigKey(key);
+        }
+
+        private static void CheckConfigKey(string key)
+        {
+            if (ValidConfigKeys.Contains(key)) return;
+            if (RemovedConfigKeys.TryGetValue(key, out var why))
+                throw new ArgumentException("Config key '" + key + "' is no longer supported: " + why + ".");
+            throw new ArgumentException("Unknown config key: " + key);
+        }
+
+        // ── Proxy registry ──────────────────────────────────────────
+        //
+        // One proxy per upstream per process, shared by every handle started
+        // for it and stopped when the last one is disposed. The registry is
+        // also the record of which ports this process's proxies hold, so a
+        // new proxy never lands on another's proxy or dashboard port.
+
+        internal sealed class ProxyEntry
+        {
+            internal string Upstream;
+            internal int ProxyPort;
+            internal int DashboardPort;
+            internal Process Process;
+            internal string ProxyUrl;
+            internal string DashboardToken;
+            internal int RefCount;
+            internal readonly TaskCompletionSource<bool> Ready =
+                new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            internal ProxyEntry()
             {
-                if (!ValidConfigKeys.Contains(key))
-                    throw new ArgumentException("Unknown config key: " + key);
+                // A failed start nobody else waited on must not surface as an
+                // unobserved task exception.
+                Ready.Task.ContinueWith(t => { var _ = t.Exception; }, TaskContinuationOptions.OnlyOnFaulted);
             }
+
+            // Starting (no process yet) or running. A proxy whose start failed
+            // or whose process has exited holds nothing.
+            internal bool Live
+            {
+                get
+                {
+                    if (Ready.Task.IsFaulted) return false;
+                    try { return Process == null || !Process.HasExited; }
+                    catch (InvalidOperationException) { return false; }
+                }
+            }
+        }
+
+        private static readonly object RegistryLock = new object();
+        private static readonly Dictionary<string, ProxyEntry> Registry = new Dictionary<string, ProxyEntry>();
+
+        // Join the running proxy for this upstream, or claim ports for a new
+        // one. Returns true when this handle must spawn it.
+        private bool Register()
+        {
+            lock (RegistryLock)
+            {
+                if (Registry.TryGetValue(_upstream, out var existing) && existing.Live)
+                {
+                    existing.RefCount++;
+                    _entry = existing;
+                    return false;
+                }
+                Registry.Remove(_upstream);
+
+                if (!_proxyPortExplicit)
+                    _proxyPort = PickProxyPort(_dashboardPortExplicit ? _dashboardPort : (int?)null);
+                if (!_dashboardPortExplicit)
+                    _dashboardPort = _proxyPort + 1;
+                CheckPortsUnclaimed(_proxyPort, _dashboardPort);
+
+                _entry = new ProxyEntry
+                {
+                    Upstream = _upstream,
+                    ProxyPort = _proxyPort,
+                    DashboardPort = _dashboardPort,
+                    RefCount = 1,
+                };
+                Registry[_upstream] = _entry;
+                return true;
+            }
+        }
+
+        // Take on the (now ready) proxy's state.
+        private void Attach()
+        {
+            _proxyPort = _entry.ProxyPort;
+            _dashboardPort = _entry.DashboardPort;
+            _process = _entry.Process;
+            _proxyUrl = _entry.ProxyUrl;
+            _dashboardToken = _entry.DashboardToken;
+        }
+
+        // Drop this handle's hold on its proxy; the last holder stops it.
+        private void ReleaseProxy()
+        {
+            var entry = _entry;
+            _entry = null;
+            _process = null;
+            _proxyUrl = null;
+            if (entry == null) return;
+            lock (RegistryLock)
+            {
+                if (--entry.RefCount > 0) return;
+                if (Registry.TryGetValue(entry.Upstream, out var current) && current == entry)
+                    Registry.Remove(entry.Upstream);
+            }
+            // Npgsql pools by connection string. A proxy started later on the
+            // same port gets the same string, and would be handed this one's
+            // dead pooled connections.
+            if (entry.ProxyUrl != null)
+            {
+                try
+                {
+                    using (var pooled = new NpgsqlConnection(UrlToNpgsqlConnectionString(entry.ProxyUrl)))
+                        NpgsqlConnection.ClearPool(pooled);
+                }
+                catch { }
+            }
+            StopProcess(entry.Process);
+        }
+
+        // Ports held by this process's live proxies: port -> (upstream, role).
+        private static Dictionary<int, KeyValuePair<string, string>> ClaimedPorts()
+        {
+            var claimed = new Dictionary<int, KeyValuePair<string, string>>();
+            foreach (var entry in Registry.Values)
+            {
+                if (!entry.Live) continue;
+                claimed[entry.ProxyPort] = new KeyValuePair<string, string>(entry.Upstream, "proxy");
+                if (entry.DashboardPort > 0)
+                    claimed[entry.DashboardPort] = new KeyValuePair<string, string>(entry.Upstream, "dashboard");
+            }
+            return claimed;
+        }
+
+        // The smallest port from 7932 whose pair (the port and its dashboard
+        // port, port + 1 unless given) no proxy of this process holds and
+        // nothing else has bound. An explicit dashboard port is the caller's
+        // choice, so only the proxy port is checked then.
+        internal static int PickProxyPort(int? dashboardPort)
+        {
+            lock (RegistryLock)
+            {
+                var claimed = ClaimedPorts();
+                for (var port = DefaultProxyPort; port < 65535; port++)
+                {
+                    if (claimed.ContainsKey(port)) continue;
+                    if (dashboardPort.HasValue)
+                    {
+                        if (port == dashboardPort.Value || !CanBind(port)) continue;
+                    }
+                    else if (claimed.ContainsKey(port + 1) || !CanBind(port) || !CanBind(port + 1))
+                    {
+                        continue;
+                    }
+                    return port;
+                }
+            }
+            throw new InvalidOperationException("Gold Lapel could not find a free proxy port");
+        }
+
+        // True when nothing is listening on the port: bind 0.0.0.0:port the way
+        // the proxy's own start-up check does (no SO_REUSEPORT), then release it.
+        internal static bool CanBind(int port)
+        {
+            var listener = new TcpListener(IPAddress.Any, port);
+            try
+            {
+                listener.Start();
+                return true;
+            }
+            catch (SocketException)
+            {
+                return false;
+            }
+            finally
+            {
+                listener.Stop();
+            }
+        }
+
+        // Without this, an explicit port would hand the caller another
+        // upstream's proxy (or the proxy would refuse it with a less useful
+        // message).
+        private static void CheckPortsUnclaimed(int proxyPort, int dashboardPort)
+        {
+            var claimed = ClaimedPorts();
+            foreach (var (port, role) in new[] { (proxyPort, "proxy"), (dashboardPort, "dashboard") })
+            {
+                if (port > 0 && claimed.TryGetValue(port, out var held))
+                {
+                    throw new InvalidOperationException(
+                        "Gold Lapel cannot use port " + port + " as the " + role + " port: this " +
+                        "process's proxy for " + RedactPassword(held.Key) + " already holds it as its " +
+                        held.Value + " port. Choose another port, or leave ProxyPort and DashboardPort " +
+                        "unset to have a free pair assigned.");
+                }
+            }
+        }
+
+        // The URL with its password replaced by ***, for error messages. The
+        // userinfo ends at the last @ before the query, as in
+        // UrlToNpgsqlConnectionString.
+        internal static string RedactPassword(string url)
+        {
+            var scheme = url.IndexOf("://", StringComparison.Ordinal);
+            if (scheme < 0) return url;
+            var start = scheme + 3;
+            var query = url.IndexOf('?', start);
+            var at = url.LastIndexOf('@', query < 0 ? url.Length - 1 : query - 1);
+            if (at < start) return url;
+            var colon = url.IndexOf(':', start, at - start);
+            if (colon < 0) return url;
+            return url.Substring(0, colon + 1) + "***" + url.Substring(at);
+        }
+
+        internal static void ClaimForTest(string upstream, int proxyPort, int dashboardPort, Process process = null)
+        {
+            lock (RegistryLock)
+            {
+                Registry[upstream] = new ProxyEntry
+                {
+                    Upstream = upstream,
+                    ProxyPort = proxyPort,
+                    DashboardPort = dashboardPort,
+                    Process = process,
+                    RefCount = 1,
+                };
+            }
+        }
+
+        internal static void ForgetForTest(string upstream)
+        {
+            lock (RegistryLock) Registry.Remove(upstream);
+        }
+
+        internal static bool IsRegistered(string upstream)
+        {
+            lock (RegistryLock) return Registry.ContainsKey(upstream);
         }
 
         // ── Properties ──────────────────────────────────────────────
@@ -486,7 +794,7 @@ namespace GoldLapel
                 try { await _conn.DisposeAsync().ConfigureAwait(false); } catch { }
                 _conn = null;
             }
-            StopProcessInternal();
+            ReleaseProxy();
         }
 
         public void Dispose()
@@ -503,19 +811,18 @@ namespace GoldLapel
                 try { _conn.Dispose(); } catch { }
                 _conn = null;
             }
-            StopProcessInternal();
+            ReleaseProxy();
         }
 
-        private void StopProcessInternal()
+        private static void StopProcess(Process proc)
         {
-            var proc = _process;
-            _process = null;
-            _proxyUrl = null;
-            if (proc != null)
+            if (proc == null) return;
+            try
             {
                 if (!proc.HasExited) GracefulStop(proc);
-                try { proc.Dispose(); } catch { }
             }
+            catch { }
+            try { proc.Dispose(); } catch { }
         }
 
         // ── Process spawn ───────────────────────────────────────────
@@ -601,8 +908,11 @@ namespace GoldLapel
             return args;
         }
 
+        // Spawn the proxy for this handle's (registered) entry and wait until
+        // it serves its port.
         private async Task SpawnAsync()
         {
+            var entry = _entry;
             var binary = FindBinary();
             var args = BuildSpawnArgs();
 
@@ -630,7 +940,7 @@ namespace GoldLapel
                 : null;
             if (!string.IsNullOrEmpty(envToken))
             {
-                _dashboardToken = envToken;
+                entry.DashboardToken = envToken;
             }
             else
             {
@@ -639,21 +949,28 @@ namespace GoldLapel
                 {
                     rng.GetBytes(buf);
                 }
-                _dashboardToken = BitConverter.ToString(buf).Replace("-", "").ToLowerInvariant();
-                psi.EnvironmentVariables["GOLDLAPEL_DASHBOARD_TOKEN"] = _dashboardToken;
+                entry.DashboardToken = BitConverter.ToString(buf).Replace("-", "").ToLowerInvariant();
+                psi.EnvironmentVariables["GOLDLAPEL_DASHBOARD_TOKEN"] = entry.DashboardToken;
             }
 
+            // Something already listening on an explicit proxy port would
+            // answer the readiness connect on the proxy's behalf.
+            var portWasBusy = !CanBind(_proxyPort);
+
+            Process proc;
             try
             {
-                _process = Process.Start(psi);
-                _process.StandardInput.Close();
+                proc = Process.Start(psi);
+                entry.Process = proc;
+                proc.StandardInput.Close();
             }
             catch (Exception e)
             {
                 throw new InvalidOperationException("Failed to start Gold Lapel process", e);
             }
 
-            // Drain stderr to prevent pipe-buffer deadlock.
+            // Drain stderr to prevent pipe-buffer deadlock, keeping a bounded
+            // tail for start-up errors.
             var stderrBuf = new StringBuilder();
             var stderrThread = new Thread(() =>
             {
@@ -661,8 +978,15 @@ namespace GoldLapel
                 {
                     var buffer = new char[1024];
                     int n;
-                    while ((n = _process.StandardError.Read(buffer, 0, buffer.Length)) > 0)
-                        stderrBuf.Append(buffer, 0, n);
+                    while ((n = proc.StandardError.Read(buffer, 0, buffer.Length)) > 0)
+                    {
+                        lock (stderrBuf)
+                        {
+                            stderrBuf.Append(buffer, 0, n);
+                            if (stderrBuf.Length > 2 * StderrTailChars)
+                                stderrBuf.Remove(0, stderrBuf.Length - StderrTailChars);
+                        }
+                    }
                 }
                 catch { }
             })
@@ -675,45 +999,60 @@ namespace GoldLapel
                 try
                 {
                     var buffer = new char[1024];
-                    while (_process.StandardOutput.Read(buffer, 0, buffer.Length) > 0) { }
+                    while (proc.StandardOutput.Read(buffer, 0, buffer.Length) > 0) { }
                 }
                 catch { }
             })
             { IsBackground = true };
             stdoutThread.Start();
 
-            // Poll for port readiness within a single StartupTimeoutMs budget.
-            // Earlier versions wrapped a looping WaitForPortAsync in this loop,
-            // which double-budgeted the timeout (each outer iteration consumed
-            // up to 500ms of inner retries inside a 500ms per-attempt budget,
-            // so total elapsed could exceed StartupTimeoutMs).
-            var ready = await PollForPortAsync(
-                "127.0.0.1", _proxyPort, StartupTimeoutMs,
-                () => _process.HasExited).ConfigureAwait(false);
+            // The proxy refuses a port in use and exits at once; let it,
+            // rather than trust a connect the other listener answers.
+            if (portWasBusy)
+                await Task.Run(() => proc.WaitForExit(BusyPortGraceMs)).ConfigureAwait(false);
 
-            if (!ready)
+            // Poll for port readiness within a single StartupTimeoutMs budget.
+            // Ready means the port answers AND our child is still alive then.
+            var ready = !proc.HasExited && await PollForPortAsync(
+                "127.0.0.1", _proxyPort, StartupTimeoutMs,
+                () => proc.HasExited).ConfigureAwait(false);
+
+            if (!ready || proc.HasExited)
             {
-                try { _process.Kill(); } catch { }
-                try { _process.WaitForExit(5000); } catch { }
-                try { _process.Dispose(); } catch { }
-                _process = null;
+                string reason;
+                if (proc.HasExited)
+                {
+                    reason = "Gold Lapel exited with status " + proc.ExitCode +
+                             " before it was ready on port " + _proxyPort + ".";
+                }
+                else
+                {
+                    try { proc.Kill(); } catch { }
+                    try { proc.WaitForExit(5000); } catch { }
+                    reason = "Gold Lapel failed to start on port " + _proxyPort +
+                             " within " + (StartupTimeoutMs / 1000) + "s.";
+                }
                 try { stderrThread.Join(2000); } catch { }
-                throw new InvalidOperationException(
-                    "Gold Lapel failed to start on port " + _proxyPort +
-                    " within " + (StartupTimeoutMs / 1000) + "s.\nstderr: " + stderrBuf);
+                string stderr;
+                lock (stderrBuf) stderr = stderrBuf.ToString().Trim();
+                throw new InvalidOperationException(reason + "\nstderr: " + stderr);
             }
 
-            _proxyUrl = MakeProxyUrl(_upstream, _proxyPort);
+            entry.ProxyUrl = MakeProxyUrl(_upstream, _proxyPort, _clientTls);
+        }
 
-            // Eagerly open the internal Npgsql connection. Npgsql does not accept
-            // URL-style connection strings, so convert to key-value form.
+        // Eagerly open this handle's internal Npgsql connection. Npgsql does
+        // not accept URL-style connection strings, so convert to key-value form.
+        private async Task OpenAsync(bool announce)
+        {
             _conn = new NpgsqlConnection(UrlToNpgsqlConnectionString(_proxyUrl));
             await _conn.OpenAsync().ConfigureAwait(false);
 
             // Write the startup banner to stderr (not stdout) so it doesn't pollute
             // application stdout — ASP.NET Core logs, CLI app output, shells that
             // redirect stdout, etc. Opt out entirely via GoldLapelOptions.Silent.
-            if (!_silent)
+            // Only the start that spawned the proxy announces it.
+            if (announce && !_silent)
             {
                 if (_dashboardPort > 0)
                     Console.Error.WriteLine($"goldlapel \u2192 :{_proxyPort} (proxy) | http://127.0.0.1:{_dashboardPort} (dashboard)");
@@ -766,8 +1105,7 @@ namespace GoldLapel
                 var key = kvp.Key;
                 var value = kvp.Value;
 
-                if (!ValidConfigKeys.Contains(key))
-                    throw new ArgumentException("Unknown config key: " + key);
+                CheckConfigKey(key);
 
                 var flag = "--" + CamelToKebab(key);
 
@@ -923,17 +1261,69 @@ namespace GoldLapel
                 "install the NuGet package with bundled binaries, or ensure 'goldlapel' is on PATH.");
         }
 
-        internal static string MakeProxyUrl(string upstream, int port)
+        // TLS/GSS parameters for the upstream hop. The proxy keeps using them
+        // upstream, but declines client TLS unless started with
+        // --tls-cert/--tls-key, so in the app's URL they made every
+        // connection to the proxy fail (sslmode=require on Neon, Supabase, RDS).
+        private static readonly HashSet<string> UpstreamOnlyParams = new HashSet<string>(new[]
+        {
+            "sslmode", "sslcert", "sslkey", "sslrootcert", "sslcrl", "sslcrldir",
+            "sslpassword", "sslsni", "sslnegotiation", "ssl_min_protocol_version",
+            "ssl_max_protocol_version", "requiressl", "channel_binding",
+            "gssencmode", "krbsrvname", "gsslib"
+        }, StringComparer.OrdinalIgnoreCase);
+
+        // Client-facing TLS is on when the wrapper passes --tls-cert/--tls-key
+        // (Config or ExtraArgs) or the proxy inherits GOLDLAPEL_TLS_CERT/KEY.
+        private static bool ClientTlsConfigured(Dictionary<string, object> config, string[] extraArgs)
+        {
+            if (config != null && (config.ContainsKey("tlsCert") || config.ContainsKey("tlsKey")))
+                return true;
+            foreach (var arg in extraArgs)
+            {
+                if (arg.StartsWith("--tls-cert", StringComparison.Ordinal) ||
+                    arg.StartsWith("--tls-key", StringComparison.Ordinal))
+                    return true;
+            }
+            return !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("GOLDLAPEL_TLS_CERT")) ||
+                   !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("GOLDLAPEL_TLS_KEY"));
+        }
+
+        // Drop UpstreamOnlyParams from the query of a URL tail ("/db?a=1&b=2").
+        private static string StripUpstreamOnlyParams(string tail)
+        {
+            var q = tail.IndexOf('?');
+            if (q < 0) return tail;
+            var kept = new List<string>();
+            foreach (var pair in tail.Substring(q + 1).Split('&'))
+            {
+                if (pair.Length == 0) continue;
+                var eq = pair.IndexOf('=');
+                var key = Uri.UnescapeDataString(eq < 0 ? pair : pair.Substring(0, eq));
+                if (!UpstreamOnlyParams.Contains(key)) kept.Add(pair);
+            }
+            return kept.Count == 0
+                ? tail.Substring(0, q)
+                : tail.Substring(0, q + 1) + string.Join("&", kept);
+        }
+
+        internal static string MakeProxyUrl(string upstream, int port, bool clientTls = false)
         {
             // Use regex not System.Uri to preserve percent-encoded characters in passwords
             // (e.g. %40 for @), which Uri would decode and corrupt the URL.
             var m = WithPort.Match(upstream);
             if (m.Success)
-                return InjectApplicationName(m.Groups[1].Value + "localhost:" + port + m.Groups[4].Value);
+            {
+                var tail = clientTls ? m.Groups[4].Value : StripUpstreamOnlyParams(m.Groups[4].Value);
+                return InjectApplicationName(m.Groups[1].Value + "localhost:" + port + tail);
+            }
 
             m = NoPort.Match(upstream);
             if (m.Success)
-                return InjectApplicationName(m.Groups[1].Value + "localhost:" + port + m.Groups[3].Value);
+            {
+                var tail = clientTls ? m.Groups[3].Value : StripUpstreamOnlyParams(m.Groups[3].Value);
+                return InjectApplicationName(m.Groups[1].Value + "localhost:" + port + tail);
+            }
 
             // Bare-host form skips the marker — atypical caller path.
             if (!upstream.Contains("://") && upstream.Contains(":"))
@@ -944,9 +1334,16 @@ namespace GoldLapel
 
         /// <summary>
         /// Convert a postgres URL (e.g. <c>postgresql://user:pass@host:port/db?sslmode=require</c>)
-        /// into the key-value form Npgsql expects (<c>Host=host;Port=port;Username=user;Password=pass;Database=db;SslMode=Require</c>).
-        /// If the input is already key-value form (contains <c>=</c>) it is returned unchanged.
+        /// into the key-value form Npgsql expects (<c>Host=host;Port=port;Username=user;Password=pass;Database=db;SSL Mode=Require;...</c>).
+        /// If the input is already key-value form it is returned unchanged.
         /// </summary>
+        /// <remarks>
+        /// Query parameters use their libpq names and map to the Npgsql keyword with the
+        /// same meaning (<c>connect_timeout</c> to <c>Timeout</c>, <c>sslrootcert</c> to
+        /// <c>Root Certificate</c>, ...). libpq parameters Npgsql has no counterpart for,
+        /// such as <c>channel_binding</c> or <c>gssencmode</c>, are dropped; any other
+        /// parameter throws <see cref="ArgumentException"/> naming it.
+        /// </remarks>
         public static string UrlToNpgsqlConnectionString(string url)
         {
             if (string.IsNullOrEmpty(url)) return url;
@@ -959,6 +1356,9 @@ namespace GoldLapel
             // Strip scheme.
             var schemeIdx = url.IndexOf("://", StringComparison.Ordinal);
             var rest = url.Substring(schemeIdx + 3);
+
+            var hashIdx = rest.IndexOf('#');
+            if (hashIdx >= 0) rest = rest.Substring(0, hashIdx);
 
             // Split query string off.
             string query = null;
@@ -978,7 +1378,7 @@ namespace GoldLapel
                 rest = rest.Substring(atIdx + 1);
             }
 
-            // host[:port][/database]
+            // host[:port][,host[:port]...][/database]
             string database = null;
             var slashIdx = rest.IndexOf('/');
             if (slashIdx >= 0)
@@ -987,61 +1387,134 @@ namespace GoldLapel
                 rest = rest.Substring(0, slashIdx);
             }
 
-            string host = rest;
-            string port = null;
-            var colonIdx = rest.LastIndexOf(':');
-            if (colonIdx >= 0)
+            var builder = new NpgsqlConnectionStringBuilder();
+            var multiHost = rest.IndexOf(',') >= 0;
+            if (multiHost)
             {
-                host = rest.Substring(0, colonIdx);
-                port = rest.Substring(colonIdx + 1);
+                // Npgsql takes the same comma-separated host:port list.
+                builder.Host = Uri.UnescapeDataString(rest);
             }
-
-            string user = null;
-            string password = null;
-            if (userinfo != null)
+            else
             {
-                var uColon = userinfo.IndexOf(':');
-                if (uColon >= 0)
+                string host = rest;
+                string port = null;
+                if (rest.StartsWith("[", StringComparison.Ordinal))
                 {
-                    user = Uri.UnescapeDataString(userinfo.Substring(0, uColon));
-                    password = Uri.UnescapeDataString(userinfo.Substring(uColon + 1));
+                    var close = rest.IndexOf(']');
+                    if (close < 0) throw new ArgumentException("Invalid IPv6 host in URL: " + rest);
+                    host = rest.Substring(1, close - 1);
+                    if (close + 1 < rest.Length && rest[close + 1] == ':')
+                        port = rest.Substring(close + 2);
                 }
                 else
                 {
-                    user = Uri.UnescapeDataString(userinfo);
+                    var colonIdx = rest.LastIndexOf(':');
+                    if (colonIdx >= 0)
+                    {
+                        host = rest.Substring(0, colonIdx);
+                        port = rest.Substring(colonIdx + 1);
+                    }
                 }
+                if (!string.IsNullOrEmpty(host)) builder.Host = Uri.UnescapeDataString(host);
+                if (!string.IsNullOrEmpty(port)) SetUrlParam(builder, "port", port, false);
             }
 
-            var sb = new StringBuilder();
-            sb.Append("Host=").Append(host).Append(';');
-            if (!string.IsNullOrEmpty(port)) sb.Append("Port=").Append(port).Append(';');
-            if (!string.IsNullOrEmpty(user)) sb.Append("Username=").Append(user).Append(';');
-            if (!string.IsNullOrEmpty(password)) sb.Append("Password=").Append(password).Append(';');
-            if (!string.IsNullOrEmpty(database)) sb.Append("Database=").Append(database).Append(';');
+            if (userinfo != null)
+            {
+                var uColon = userinfo.IndexOf(':');
+                var user = uColon >= 0 ? userinfo.Substring(0, uColon) : userinfo;
+                if (user.Length > 0) builder.Username = Uri.UnescapeDataString(user);
+                if (uColon >= 0) builder.Password = Uri.UnescapeDataString(userinfo.Substring(uColon + 1));
+            }
+            if (!string.IsNullOrEmpty(database)) builder.Database = Uri.UnescapeDataString(database);
 
-            // Query params map to Npgsql keywords, which are case-insensitive
-            // but have no underscores: sslmode -> SslMode, application_name ->
-            // ApplicationName. Npgsql rejects the underscored libpq spelling.
+            string fallbackApplicationName = null;
             if (!string.IsNullOrEmpty(query))
             {
                 foreach (var pair in query.Split('&'))
                 {
                     if (string.IsNullOrEmpty(pair)) continue;
                     var eq = pair.IndexOf('=');
-                    if (eq < 0)
-                    {
-                        sb.Append(pair).Append(';');
-                    }
+                    var key = Uri.UnescapeDataString(eq < 0 ? pair : pair.Substring(0, eq));
+                    var value = eq < 0 ? "" : Uri.UnescapeDataString(pair.Substring(eq + 1));
+                    if (key.Equals("fallback_application_name", StringComparison.OrdinalIgnoreCase))
+                        fallbackApplicationName = value;
                     else
-                    {
-                        var k = pair.Substring(0, eq).Replace("_", "");
-                        var v = Uri.UnescapeDataString(pair.Substring(eq + 1));
-                        sb.Append(k).Append('=').Append(v).Append(';');
-                    }
+                        SetUrlParam(builder, key, value, multiHost);
                 }
             }
+            if (fallbackApplicationName != null && string.IsNullOrEmpty(builder.ApplicationName))
+                builder.ApplicationName = fallbackApplicationName;
 
-            return sb.ToString();
+            return builder.ConnectionString;
+        }
+
+        // libpq parameters with no Npgsql counterpart that are safe to leave
+        // out client-side: they tune TLS/GSS negotiation or TCP keepalives
+        // that Npgsql handles its own way.
+        private static readonly HashSet<string> LibpqParamsWithoutNpgsqlMeaning = new HashSet<string>(new[]
+        {
+            "channel_binding", "gssencmode", "gsslib", "gssdelegation",
+            "sslcrl", "sslcrldir", "sslsni", "sslnegotiation", "sslcompression",
+            "sslcertmode", "ssl_min_protocol_version", "ssl_max_protocol_version",
+            "requiressl", "keepalives", "keepalives_idle", "keepalives_interval",
+            "keepalives_count", "tcp_user_timeout", "min_protocol_version",
+            "max_protocol_version", "sslkeylogfile"
+        }, StringComparer.OrdinalIgnoreCase);
+
+        private static void SetUrlParam(NpgsqlConnectionStringBuilder builder, string key, string value, bool multiHost)
+        {
+            var known = true;
+            try
+            {
+                switch (key.ToLowerInvariant())
+                {
+                    case "host": builder.Host = value; break;
+                    case "port": builder.Port = int.Parse(value, System.Globalization.CultureInfo.InvariantCulture); break;
+                    case "dbname": builder.Database = value; break;
+                    case "user": builder.Username = value; break;
+                    case "password": builder.Password = value; break;
+                    case "application_name": builder.ApplicationName = value; break;
+                    case "options": builder.Options = value; break;
+                    case "search_path": builder.SearchPath = value; break;
+                    case "client_encoding": builder.ClientEncoding = value; break;
+                    case "passfile": builder.Passfile = value; break;
+                    case "connect_timeout":
+                        builder.Timeout = int.Parse(value, System.Globalization.CultureInfo.InvariantCulture);
+                        break;
+                    case "target_session_attrs":
+                        // Npgsql only accepts it with several hosts. With one,
+                        // libpq merely checks the server's role; nothing to map.
+                        if (multiHost) builder["Target Session Attributes"] = value;
+                        break;
+                    case "sslmode":
+                        if (!Enum.TryParse<SslMode>(value.Replace("-", ""), true, out var mode) ||
+                            !Enum.IsDefined(typeof(SslMode), mode))
+                            throw new FormatException("expected disable, allow, prefer, require, verify-ca or verify-full");
+                        builder.SslMode = mode;
+                        // libpq verifies the certificate only in verify-ca/verify-full;
+                        // Npgsql 6 refuses Require without saying so explicitly.
+                        if (mode == SslMode.Allow || mode == SslMode.Prefer || mode == SslMode.Require)
+                            builder.TrustServerCertificate = true;
+                        break;
+                    case "sslrootcert": builder.RootCertificate = value; break;
+                    case "sslcert": builder.SslCertificate = value; break;
+                    case "sslkey": builder.SslKey = value; break;
+                    case "sslpassword": builder.SslPassword = value; break;
+                    case "krbsrvname": builder.KerberosServiceName = value; break;
+                    default:
+                        known = LibpqParamsWithoutNpgsqlMeaning.Contains(key);
+                        break;
+                }
+            }
+            catch (Exception e) when (e is FormatException || e is OverflowException || e is ArgumentException)
+            {
+                throw new ArgumentException(
+                    "Invalid value for connection URL parameter '" + key + "': " + e.Message, e);
+            }
+            if (!known)
+                throw new ArgumentException(
+                    "Connection URL parameter '" + key + "' is not supported: it has no Npgsql equivalent.");
         }
 
         internal static bool WaitForPort(string host, int port, long timeoutMs)

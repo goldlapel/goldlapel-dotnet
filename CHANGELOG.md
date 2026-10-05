@@ -6,9 +6,10 @@
 
 **The in-process cache (L1) is gone.** The proxy's result cache now serves
 every client the same way, so the wrapper no longer carries its own. Deleted
-with it: `NativeCache` (with `CacheEntry`, `SetCommand` and the
-session-settings tracker `ConnectionGucState`), `CachedConnection` and
-`CachedDataReader`, aggressive post-DML verify (`AggressiveVerifyMode`), the
+with it: `NativeCache` (with `CacheEntry`, `SetCommand` and its
+`SetCommand.CommandKind` enum, the session-settings tracker
+`ConnectionGucState` and its `GucStateSnapshot` struct), `CachedConnection`
+and `CachedDataReader`, aggressive post-DML verify (`AggressiveVerifyMode`), the
 invalidation-socket client and its stats reporting. `gl.Connection` and the
 connections you open against `gl.Url` were never wrapped and are unchanged.
 
@@ -29,8 +30,57 @@ throws `ArgumentException` at `StartAsync`.
 
 **Fixed:** `StartAsync` and `gl.Url` failed with "Couldn't set
 application_name" — the connection string carried the libpq spelling
-`application_name`, which Npgsql rejects. URL query params now map to Npgsql
-keywords without underscores (`ApplicationName`).
+`application_name`, which Npgsql rejects (see the URL conversion entry below).
+
+**One proxy per upstream, and ports that never collide.** Several
+databases in one process used to share port 7932, so their proxies split
+each other's connections. Now:
+
+- `GoldLapelOptions.ProxyPort` is `int?` and defaults to null: the wrapper
+  picks the lowest port from 7932 up whose dashboard port (port + 1) is free
+  too, skipping ports held by this process's other proxies or by any other
+  program. Read the result from `gl.ProxyPort` / `gl.DashboardPort`.
+- `StartAsync` on an upstream that is already running returns another handle
+  on the same proxy (with its own internal connection); the proxy stops when
+  the last handle is disposed. Concurrent starts share one spawn.
+- An explicit `ProxyPort` or `DashboardPort` held by another proxy of this
+  process throws `InvalidOperationException` naming the port and that
+  proxy's upstream (password masked). One held by another program makes the
+  proxy refuse to start; its message is in the exception.
+- A start only succeeds if the proxy process is still alive when its port
+  answers. If it exited, the exception gives its exit status and the tail of
+  its stderr.
+- Stopping a proxy clears Npgsql's pool for its connection string, so a proxy
+  restarted on the same port isn't handed the old one's dead connections.
+
+**`gl.Url` and `gl.ProxyUrl` no longer carry upstream TLS settings.**
+`sslmode`, `sslrootcert`, `sslcert`, `sslkey`, `channel_binding`,
+`gssencmode` and the other TLS/GSS parameters are for the proxy's hop to
+your database; the proxy declines client TLS unless started with
+`tlsCert`/`tlsKey`, so a `?sslmode=require` URL (every Neon, Supabase and RDS
+URL) made the app's connection fail. They are kept when `tlsCert`/`tlsKey`
+is configured.
+
+**`UrlToNpgsqlConnectionString` rebuilt on `NpgsqlConnectionStringBuilder`.**
+Values were concatenated unquoted, so a password containing `;` broke the
+string, and the database name was not URL-decoded. libpq parameters now map
+to the Npgsql keyword with the same meaning (`connect_timeout` -> `Timeout`,
+`sslrootcert` -> `Root Certificate`, `sslcert`/`sslkey`/`sslpassword`,
+`krbsrvname`, `options`, `client_encoding`, `passfile`,
+`target_session_attrs` for multi-host URLs, `search_path`); before, they
+threw "Keyword not supported" and a Neon URL failed `StartAsync`.
+`sslmode=require`/`prefer`/`allow` also set `Trust Server Certificate`,
+matching libpq (Npgsql 6 refuses `Require` otherwise). libpq parameters with
+no Npgsql counterpart (`channel_binding`, `gssencmode`, keepalive tuning,
+...) are dropped; anything else throws `ArgumentException` naming the
+parameter. IPv6 (`[::1]:5432`) and multi-host URLs are parsed.
+
+**Removed `Config` keys say why.** Passing `invalidationPort`,
+`disableNativeCache`, `nativeCacheSize`, `aggressiveVerify`, a matview key or
+`enableCoalescing` in `Config` throws an `ArgumentException` that says it was
+removed with the in-process cache or materialized views (or points to
+`disableCoalescing`). Top-level options are typed properties, so the removed
+ones are compile errors.
 
 ---
 

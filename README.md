@@ -36,7 +36,9 @@ await using var reader = await cmd.ExecuteReaderAsync();
 
 Point Npgsql at `gl.Url`. Gold Lapel sits between your app and your DB, caching results and creating indexes from your query patterns. Connections are tagged `application_name=goldlapel:dotnet:<version>` so they're recognisable in `pg_stat_activity`.
 
-The proxy listens on two ports: the proxy itself (`opts.ProxyPort`, default 7932) and the dashboard (`opts.DashboardPort`, default proxy port + 1; `0` disables it).
+The proxy listens on two ports: the proxy itself (`opts.ProxyPort`) and the dashboard (`opts.DashboardPort`, default proxy port + 1; `0` disables it). Leave `ProxyPort` unset and the wrapper picks the lowest free pair from 7932 up, so several databases can each have a proxy in one process; `gl.ProxyPort` and `gl.DashboardPort` report what was chosen. Starting an upstream that is already running in the process returns another handle on the same proxy, which stops when the last handle is disposed. An explicit port that another of your proxies, or another program, already holds is refused with an error naming it.
+
+TLS settings in your URL (`sslmode`, `sslrootcert`, `channel_binding`, ...) apply to the proxy's connection to your database. `gl.Url` and `gl.ProxyUrl` leave them out, because the proxy speaks plain TCP to your app on localhost unless you give it a certificate (`tlsCert`/`tlsKey` in `Config`).
 
 Scoped transactions via `gl.UsingAsync(conn, ...)`, per-call `connection:` overrides, and the full wrapper surface (`gl.Documents.<Verb>Async`, `gl.Streams.<Verb>Async`, search, Redis replacement) are in the docs.
 

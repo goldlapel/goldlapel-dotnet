@@ -345,6 +345,138 @@ namespace GoldLapel.Tests
             Assert.DoesNotContain("goldlapel", stdout);
         }
 
+        private static string SecondUpstream() =>
+            Upstream + (Upstream.Contains('?') ? "&" : "?") + "application_name=gl-second";
+
+        private static async Task<int> SelectOne(GL gl)
+        {
+            await using var conn = new NpgsqlConnection(gl.Url);
+            await conn.OpenAsync();
+            await using var cmd = new NpgsqlCommand("SELECT 1", conn);
+            return Convert.ToInt32(await cmd.ExecuteScalarAsync());
+        }
+
+        // R1: one proxy per upstream, shared until the last handle stops.
+        [Fact]
+        public async Task SameUpstreamReusesTheProxyUntilTheLastHolderStops()
+        {
+            if (!CanRunIntegration()) return;
+
+            var a = await GL.StartAsync(Upstream, opts => { opts.Silent = true; });
+            var b = await GL.StartAsync(Upstream, opts => { opts.Silent = true; });
+            try
+            {
+                Assert.Equal(a.ProxyPort, b.ProxyPort);
+                Assert.Equal(a.DashboardToken, b.DashboardToken);
+                Assert.NotSame(a.Connection, b.Connection);
+                await a.DisposeAsync();
+                Assert.True(b.IsRunning);
+                Assert.Equal(1, await SelectOne(b));
+                await using var cmd = new NpgsqlCommand("SELECT 1", b.Connection);
+                Assert.Equal(1, Convert.ToInt32(await cmd.ExecuteScalarAsync()));
+            }
+            finally
+            {
+                await a.DisposeAsync();
+                await b.DisposeAsync();
+            }
+            Assert.False(b.IsRunning);
+            Assert.False(GL.IsRegistered(Upstream));
+        }
+
+        // A restarted proxy gets the same port and so the same connection
+        // string; Npgsql must not hand out the stopped proxy's pooled
+        // connections.
+        [Fact]
+        public async Task RestartOnTheSamePortDoesNotReuseDeadPooledConnections()
+        {
+            if (!CanRunIntegration()) return;
+
+            int port;
+            await using (var first = await GL.StartAsync(Upstream, opts => { opts.Silent = true; }))
+            {
+                port = first.ProxyPort;
+                Assert.Equal(1, await SelectOne(first));
+            }
+            await using var second = await GL.StartAsync(Upstream, opts => { opts.Silent = true; });
+            Assert.Equal(port, second.ProxyPort);
+            Assert.Equal(1, await SelectOne(second));
+        }
+
+        [Fact]
+        public async Task ConcurrentStartsOfOneUpstreamShareOneProxy()
+        {
+            if (!CanRunIntegration()) return;
+
+            var starts = new[]
+            {
+                GL.StartAsync(Upstream, opts => { opts.Silent = true; }),
+                GL.StartAsync(Upstream, opts => { opts.Silent = true; }),
+                GL.StartAsync(Upstream, opts => { opts.Silent = true; }),
+            };
+            var gls = await Task.WhenAll(starts);
+            try
+            {
+                Assert.All(gls, g => Assert.Equal(gls[0].ProxyPort, g.ProxyPort));
+                foreach (var g in gls) Assert.Equal(1, await SelectOne(g));
+            }
+            finally
+            {
+                foreach (var g in gls) await g.DisposeAsync();
+            }
+            Assert.False(GL.IsRegistered(Upstream));
+        }
+
+        [Fact]
+        public async Task TwoUpstreamsWithoutPortsGetNonOverlappingPairs()
+        {
+            if (!CanRunIntegration()) return;
+
+            await using var a = await GL.StartAsync(Upstream, opts => { opts.Silent = true; });
+            await using var b = await GL.StartAsync(SecondUpstream(), opts => { opts.Silent = true; });
+            var aPorts = new[] { a.ProxyPort, a.DashboardPort };
+            Assert.DoesNotContain(b.ProxyPort, aPorts);
+            Assert.DoesNotContain(b.DashboardPort, aPorts);
+            Assert.Equal(1, await SelectOne(a));
+            Assert.Equal(1, await SelectOne(b));
+        }
+
+        [Fact]
+        public async Task ExplicitPortHeldByThisProcessesOtherProxyIsRefused()
+        {
+            if (!CanRunIntegration()) return;
+
+            await using var a = await GL.StartAsync(Upstream, opts => { opts.Silent = true; });
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                GL.StartAsync(SecondUpstream(), opts => { opts.ProxyPort = a.DashboardPort; opts.Silent = true; }));
+            Assert.Contains(a.DashboardPort.ToString(), ex.Message);
+            Assert.True(a.IsRunning);
+            Assert.Equal(1, await SelectOne(a));
+        }
+
+        // R2: a port another process holds is refused by the proxy, and its
+        // message reaches the caller instead of a readiness false-positive.
+        [Fact]
+        public async Task PortHeldByAnotherProcessSurfacesTheProxysRefusal()
+        {
+            if (!CanRunIntegration()) return;
+
+            var port = GL.PickProxyPort(null);
+            var held = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Any, port);
+            held.Start();
+            try
+            {
+                var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                    GL.StartAsync(Upstream, opts => { opts.ProxyPort = port; opts.Silent = true; }));
+                Assert.Contains("already in use", ex.Message);
+                Assert.False(GL.IsRegistered(Upstream));
+            }
+            finally
+            {
+                held.Stop();
+            }
+        }
+
         // Silent=true must suppress the banner entirely — nothing on stdout OR
         // stderr. Useful for embedded/daemon scenarios where even stderr is
         // inspected (structured-log tooling, test runners, etc.).

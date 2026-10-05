@@ -90,6 +90,124 @@ namespace GoldLapel.Tests
             Assert.Equal(7932, builder.Port);
             Assert.Equal(Npgsql.SslMode.Disable, builder.SslMode);
         }
+
+        private static Npgsql.NpgsqlConnectionStringBuilder Convert(string url) =>
+            new Npgsql.NpgsqlConnectionStringBuilder(GL.UrlToNpgsqlConnectionString(url));
+
+        [Fact]
+        public void PasswordWithSemicolonAndEqualsSurvives()
+        {
+            // Values were concatenated unquoted, so `;` ended the password
+            // and the remainder parsed as a bogus keyword.
+            var b = Convert("postgresql://user:p%3Bw%3Dx%27y@db.example.com:5432/mydb");
+            Assert.Equal("p;w=x'y", b.Password);
+            Assert.Equal("db.example.com", b.Host);
+            Assert.Equal("mydb", b.Database);
+        }
+
+        [Fact]
+        public void DatabaseAndUserAreUrlDecoded()
+        {
+            var b = Convert("postgresql://my%20user@db/my%20db%3Bx");
+            Assert.Equal("my user", b.Username);
+            Assert.Equal("my db;x", b.Database);
+        }
+
+        [Fact]
+        public void LibpqParamsMapToNpgsqlKeywords()
+        {
+            var b = Convert(
+                "postgresql://u@db/app?connect_timeout=7&application_name=my%20app" +
+                "&options=-c%20statement_timeout%3D5000&search_path=a,b&client_encoding=UTF8");
+            Assert.Equal(7, b.Timeout);
+            Assert.Equal("my app", b.ApplicationName);
+            Assert.Equal("-c statement_timeout=5000", b.Options);
+            Assert.Equal("a,b", b.SearchPath);
+            Assert.Equal("UTF8", b.ClientEncoding);
+        }
+
+        [Fact]
+        public void TlsParamsMapToNpgsqlKeywords()
+        {
+            var b = Convert(
+                "postgresql://u@db/app?sslmode=verify-full&sslrootcert=/ca.pem" +
+                "&sslcert=/c.pem&sslkey=/k.pem&sslpassword=pw&krbsrvname=pg");
+            Assert.Equal(Npgsql.SslMode.VerifyFull, b.SslMode);
+            Assert.Equal("/ca.pem", b.RootCertificate);
+            Assert.Equal("/c.pem", b.SslCertificate);
+            Assert.Equal("/k.pem", b.SslKey);
+            Assert.Equal("pw", b.SslPassword);
+            Assert.Equal("pg", b.KerberosServiceName);
+            Assert.False(b.TrustServerCertificate);
+        }
+
+        [Fact]
+        public void SslModeRequireKeepsLibpqMeaning()
+        {
+            // libpq's require encrypts without verifying the certificate.
+            // Npgsql 6 refuses Require unless TrustServerCertificate is set.
+            var b = Convert("postgresql://u@db/app?sslmode=require");
+            Assert.Equal(Npgsql.SslMode.Require, b.SslMode);
+            Assert.True(b.TrustServerCertificate);
+        }
+
+        [Fact]
+        public void NeonStyleUrlConverts()
+        {
+            // Every Neon URL carries channel_binding, which has no Npgsql
+            // keyword; it threw "Keyword not supported" and broke StartAsync.
+            var b = Convert(
+                "postgresql://u:p@ep-cool-1.us-east-2.aws.neon.tech/neondb" +
+                "?sslmode=require&channel_binding=require&gssencmode=disable&target_session_attrs=any");
+            Assert.Equal("ep-cool-1.us-east-2.aws.neon.tech", b.Host);
+            Assert.Equal(Npgsql.SslMode.Require, b.SslMode);
+        }
+
+        [Fact]
+        public void TargetSessionAttrsAppliesToMultiHost()
+        {
+            var b = Convert("postgresql://u@h1:5432,h2:5433/app?target_session_attrs=read-write");
+            Assert.Equal("h1:5432,h2:5433", b.Host);
+            Assert.Equal("read-write", b["Target Session Attributes"]?.ToString());
+        }
+
+        [Fact]
+        public void Ipv6HostAndPort()
+        {
+            var b = Convert("postgresql://u@[::1]:5433/app");
+            Assert.Equal("::1", b.Host);
+            Assert.Equal(5433, b.Port);
+        }
+
+        [Fact]
+        public void HostFromQueryForUnixSocket()
+        {
+            var b = Convert("postgresql:///app?host=%2Fvar%2Frun%2Fpostgresql");
+            Assert.Equal("/var/run/postgresql", b.Host);
+            Assert.Equal("app", b.Database);
+        }
+
+        [Fact]
+        public void UnknownParamThrowsNamingIt()
+        {
+            var ex = Assert.Throws<ArgumentException>(
+                () => GL.UrlToNpgsqlConnectionString("postgresql://u@db/app?frobnicate=1"));
+            Assert.Contains("frobnicate", ex.Message);
+        }
+
+        [Fact]
+        public void BadValueThrowsNamingTheParam()
+        {
+            var ex = Assert.Throws<ArgumentException>(
+                () => GL.UrlToNpgsqlConnectionString("postgresql://u@db/app?sslmode=sometimes"));
+            Assert.Contains("sslmode", ex.Message);
+        }
+
+        [Fact]
+        public void KeywordFormPassesThrough()
+        {
+            Assert.Equal("Host=h;Port=1", GL.UrlToNpgsqlConnectionString("Host=h;Port=1"));
+        }
     }
 
     // ── MakeProxyUrl ──────────────────────────────────────────
@@ -169,9 +287,81 @@ namespace GoldLapel.Tests
         public void PreservesQueryParams()
         {
             Assert.Equal(
-                "postgresql://user:pass@localhost:7932/mydb?sslmode=require&" + AppNameSuffix,
-                GL.MakeProxyUrl("postgresql://user:pass@remote:5432/mydb?sslmode=require", 7932)
+                "postgresql://user:pass@localhost:7932/mydb?connect_timeout=5&" + AppNameSuffix,
+                GL.MakeProxyUrl("postgresql://user:pass@remote:5432/mydb?connect_timeout=5", 7932)
             );
+        }
+
+        // The proxy declines client TLS unless started with --tls-cert/--tls-key,
+        // so TLS/GSS params meant for the upstream hop made the app's connection
+        // to the proxy fail. The proxy still uses them upstream.
+        [Fact]
+        public void StripsUpstreamTlsParams()
+        {
+            Assert.Equal(
+                "postgresql://user:pass@localhost:7932/mydb?application_name=app",
+                GL.MakeProxyUrl(
+                    "postgresql://user:pass@ep-1.neon.tech/mydb?sslmode=require&channel_binding=require&application_name=app",
+                    7932)
+            );
+        }
+
+        [Fact]
+        public void StripsEveryUpstreamOnlyParamCaseInsensitively()
+        {
+            var keys = new[]
+            {
+                "sslmode", "sslcert", "sslkey", "sslrootcert", "sslcrl", "sslcrldir",
+                "sslpassword", "sslsni", "sslnegotiation", "ssl_min_protocol_version",
+                "ssl_max_protocol_version", "requiressl", "channel_binding",
+                "gssencmode", "krbsrvname", "gsslib", "SSLMODE", "Channel_Binding"
+            };
+            var url = GL.MakeProxyUrl(
+                "postgresql://u@db/app?" + string.Join("&", keys.Select(k => k + "=x")) + "&search_path=s",
+                7932);
+            Assert.Equal("postgresql://u@localhost:7932/app?search_path=s&" + AppNameSuffix, url);
+        }
+
+        [Fact]
+        public void KeepsTlsParamsWhenClientTlsIsOn()
+        {
+            Assert.Equal(
+                "postgresql://u@localhost:7932/app?sslmode=require&" + AppNameSuffix,
+                GL.MakeProxyUrl("postgresql://u@db/app?sslmode=require", 7932, clientTls: true));
+        }
+
+        [Fact]
+        public void ClientTlsFollowsTlsCertConfigExtraArgsAndEnv()
+        {
+            Assert.False(GL.CreateForTest("postgresql://u@db/app").ClientTls);
+            Assert.True(GL.CreateForTest("postgresql://u@db/app", new GoldLapelOptions
+            {
+                Config = new Dictionary<string, object> { { "tlsCert", "/c.pem" }, { "tlsKey", "/k.pem" } }
+            }).ClientTls);
+            Assert.True(GL.CreateForTest("postgresql://u@db/app", new GoldLapelOptions
+            {
+                ExtraArgs = new[] { "--tls-cert", "/c.pem", "--tls-key", "/k.pem" }
+            }).ClientTls);
+            Environment.SetEnvironmentVariable("GOLDLAPEL_TLS_CERT", "/c.pem");
+            try
+            {
+                Assert.True(GL.CreateForTest("postgresql://u@db/app").ClientTls);
+            }
+            finally
+            {
+                Environment.SetEnvironmentVariable("GOLDLAPEL_TLS_CERT", null);
+            }
+        }
+
+        [Fact]
+        public void NeonUrlYieldsAPlainConnectionStringToTheProxy()
+        {
+            var cs = GL.UrlToNpgsqlConnectionString(GL.MakeProxyUrl(
+                "postgresql://u:p@ep-1.neon.tech/neondb?sslmode=require&channel_binding=require", 7932));
+            var b = new Npgsql.NpgsqlConnectionStringBuilder(cs);
+            Assert.Equal("localhost", b.Host);
+            Assert.Equal(7932, b.Port);
+            Assert.DoesNotContain("SSL Mode", cs, StringComparison.OrdinalIgnoreCase);
         }
 
         [Fact]
@@ -232,7 +422,7 @@ namespace GoldLapel.Tests
         public void AtSignInPasswordWithQueryParams()
         {
             Assert.Equal(
-                "postgresql://user:p@ss@localhost:7932/mydb?sslmode=require&param=val@ue&" + AppNameSuffix,
+                "postgresql://user:p@ss@localhost:7932/mydb?param=val@ue&" + AppNameSuffix,
                 GL.MakeProxyUrl("postgresql://user:p@ss@host:5432/mydb?sslmode=require&param=val@ue", 7932)
             );
         }
@@ -277,8 +467,8 @@ namespace GoldLapel.Tests
         [Fact]
         public void AppendsMarkerWithExistingQuery()
         {
-            var url = GL.MakeProxyUrl("postgresql://localhost:5432/mydb?sslmode=require", 7932);
-            Assert.Contains("sslmode=require", url);
+            var url = GL.MakeProxyUrl("postgresql://localhost:5432/mydb?connect_timeout=5", 7932);
+            Assert.Contains("connect_timeout=5", url);
             Assert.Contains("&application_name=goldlapel:dotnet:", url);
         }
 
@@ -923,19 +1113,30 @@ namespace GoldLapel.Tests
         }
 
         [Theory]
-        [InlineData("refreshIntervalSecs")]
-        [InlineData("patternTtlSecs")]
-        [InlineData("maxTablesPerView")]
-        [InlineData("maxColumnsPerView")]
-        [InlineData("disableConsolidation")]
-        [InlineData("disableRewrite")]
-        [InlineData("disableShadowMode")]
-        [InlineData("enableCoalescing")]
-        public void ConfigToArgs_RemovedKeyThrows(string key)
+        [InlineData("refreshIntervalSecs", "materialized views")]
+        [InlineData("patternTtlSecs", "materialized views")]
+        [InlineData("maxTablesPerView", "materialized views")]
+        [InlineData("maxColumnsPerView", "materialized views")]
+        [InlineData("disableConsolidation", "materialized views")]
+        [InlineData("disableRewrite", "materialized views")]
+        [InlineData("disableShadowMode", "materialized views")]
+        [InlineData("disableMatviews", "materialized views")]
+        [InlineData("enableCoalescing", "disableCoalescing")]
+        [InlineData("invalidationPort", "in-process cache")]
+        [InlineData("disableNativeCache", "in-process cache")]
+        [InlineData("nativeCacheSize", "in-process cache")]
+        [InlineData("aggressiveVerify", "in-process cache")]
+        [InlineData("licensePayload", "in-process cache")]
+        public void ConfigToArgs_RemovedKeyThrows(string key, string reason)
         {
-            // Matview keys and enableCoalescing are gone from the proxy.
+            // Removed keys say why, not just "unknown".
             var config = new Dictionary<string, object> { { key, true } };
-            Assert.Throws<ArgumentException>(() => GL.ConfigToArgs(config));
+            var ex = Assert.Throws<ArgumentException>(() => GL.ConfigToArgs(config));
+            Assert.Contains(key, ex.Message);
+            Assert.Contains(reason, ex.Message);
+            ex = Assert.Throws<ArgumentException>(() => GL.CreateForTest(
+                "postgresql://localhost:5432/mydb", new GoldLapelOptions { Config = config }));
+            Assert.Contains(reason, ex.Message);
         }
 
         [Fact]
