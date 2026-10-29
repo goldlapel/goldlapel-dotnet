@@ -141,7 +141,7 @@ namespace GoldLapel
         private static readonly HashSet<string> ValidConfigKeys = new HashSet<string>(new[]
         {
             "minPatternCount", "deepPaginationThreshold",
-            "reportIntervalSecs", "proxyCacheSize", "batchCacheSize",
+            "reportIntervalSecs", "proxyCacheSize", "proxyCacheMaxBytes", "proxyCacheMaxEntryBytes", "batchCacheSize",
             "batchCacheTtlSecs", "poolSize", "poolTimeoutSecs",
             "poolMode", "mgmtIdleTimeout", "fallback", "readAfterWriteSecs",
             "n1Threshold", "n1WindowMs", "n1CrossThreshold",
